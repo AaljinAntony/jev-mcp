@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets / environment
+.env
+
+# Keep the template
+!.env.example
+
+# OpenCode real config (contains live API keys) — never commit these
+opencode.json
+.opencode/
+config/opencode.local.json
+
+# Tooling
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "jev-engine": {
+      "type": "local",
+      "enabled": true,
+      "command": "<REPO_DIR>/.venv/Scripts/python.exe",
+      "args": [
+        "<REPO_DIR>/jev_mcp.py"
+      ],
+      "env": {
+        "TYPESAFE_API_KEY": "${TYPESAFE_API_KEY}"
+      }
+    }
+  },
+  "jev_settings": {
+    "enable_model_routing": false,
+    "models": {
+      "fast": "",
+      "balanced": "",
+      "frontier": ""
+    },
+    "scan_paths": []
+  }
+}
