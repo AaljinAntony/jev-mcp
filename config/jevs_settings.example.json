@@ -1,0 +1,9 @@
+{
+  "enable_model_routing": false,
+  "models": {
+    "fast": "",
+    "balanced": "",
+    "frontier": ""
+  },
+  "scan_paths": []
+}

@@ -23,6 +23,9 @@ opencode.json
 .opencode/
 config/opencode.local.json
 
+# Local reference clones (not part of this repo)
+reference/
+
 # Tooling
 .idea/
 .vscode/

@@ -30,3 +30,6 @@ typesafe-sdk==0.7.1
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.53.0
+
+# Dev / test only (offline unit + mock tool tests always run with pytest)
+pytest==9.1.1

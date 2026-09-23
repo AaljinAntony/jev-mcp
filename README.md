@@ -18,6 +18,11 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 
 > **Compatibility note:** The `mcp.server.fastmcp` module was **removed** in mcp 2.x (FastMCP renamed to `MCPServer`). `jev_mcp.py` therefore imports `MCPServer as FastMCP` directly. Do **not** pin `mcp<2` unless you intentionally move to the v1 line.
 
+> **Reference clones:** `reference/jkudish-jev-mcp` and
+> `reference/burnigtm-jev-mcp` are git submodule-style local clones used as
+> design references (validation/policy/limits/errors patterns borrowed under
+> MIT). They are git-ignored and not part of this server's runtime.
+
 ---
 
 ## File & Config Locations
@@ -26,16 +31,25 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 |---|---|
 | `D:\mcp\jev-typesafe-mcp\jev_engine.py` | Core decision logic, config loader, CLI entry point |
 | `D:\mcp\jev-typesafe-mcp\jev_mcp.py` | MCP server: registers the 4 tools, delegates to `jev_engine` |
+| `D:\mcp\jev-typesafe-mcp\jev_errors.py` | Typed errors + `error_details()` envelope mapping |
+| `D:\mcp\jev-typesafe-mcp\jev_validation.py` | Fail-closed response envelope validation |
+| `D:\mcp\jev-typesafe-mcp\policy.py` | Confidence, policy actions, escape hatches, thresholds |
+| `D:\mcp\jev-typesafe-mcp\limits.py` | Token budget estimation + state fitting/truncation |
+| `D:\mcp\jev-typesafe-mcp\config.py` | Env config parsing + validation (`JEV_MCP_*`) |
+| `D:\mcp\jev-typesafe-mcp\mock.py` | Deterministic offline judge for `JEV_MCP_MOCK=1` |
+| `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, mock tools, live smoke |
 | `D:\mcp\jev-typesafe-mcp\requirements.txt` | Pinned Python dependencies (UTF-8) |
 | `D:\mcp\jev-typesafe-mcp\.env` | Local secrets — holds `TYPESAFE_API_KEY` (never committed) |
-| `D:\mcp\jev-typesafe-mcp\.env.example` | Template showing the required key format |
+| `D:\mcp\jev-typesafe-mcp\.env.example` | Template showing required + optional env keys |
 | `D:\mcp\jev-typesafe-mcp\.venv\` | Isolated virtual environment (Python 3.14) |
 | `D:\mcp\jev-typesafe-mcp\README.md` | This document |
 | `D:\mcp\jev-typesafe-mcp\config\opencode.example.json` | Sanitized OpenCode config template (safe to commit — no secrets) |
+| `D:\mcp\jev-typesafe-mcp\config\jevs_settings.example.json` | Sanitized per-project settings template (safe to commit) |
 | `D:\mcp\jev-typesafe-mcp\config\jev-plugin.example.js` | Sanitized plugin template (safe to commit) |
 | `D:\mcp\jev-typesafe-mcp\config\README.md` | Install guide for deploying the examples |
-| `C:\Users\aalji\.config\opencode\opencode.json` | OpenCode MCP server registration + `jev_settings` |
-| `C:\Users\aalji\.config\opencode\plugins\jev-plugin.js` | Optional OpenCode plugin (hook-based Jev routing) |
+| `<project-root>\jevs_settings.json` | Per-project Jev settings (`enable_model_routing`, `models`, `scan_paths`) — never commit a copy containing keys |
+| `C:\Users\aalji\.config\opencode\opencode.json` | OpenCode MCP server registration only (no `jev_settings`) |
+| `C:\Users\aalji\.config\opencode\plugins\jev-plugin.js` | Optional OpenCode plugin (hook-based Jev routing + forced model switching) |
 
 ---
 
@@ -45,22 +59,48 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 OpenCode (or any MCP client)
    │  stdio JSON-RPC
    ▼
-jev_mcp.py  ── MCPServer("jev-engine") ── 4 tools
+jev_mcp.py  ── MCPServer("jev-engine") ── 4 tools (typed error envelopes)
    │  delegates
    ▼
-jev_engine.py  ── TypeSafeClient.system_one(state, questions)
+jev_engine.py  ── execute_system_one ── TypeSafeClient.system_one(state, questions)
+   │                │                       (mock branch when JEV_MCP_MOCK=1)
+   │                ├─ fit_state()            limits.py   (token budget → truncated)
+   │                ├─ validate_response()    jev_validation.py (fail-closed)
+   │                └─ policy                 policy.py   (confidence/action)
    │  reads
    ▼
-opencode.json → jev_settings  (enable_model_routing, models, scan_paths)
-.env → TYPESAFE_API_KEY
+jevs_settings.json  (enable_model_routing, models, scan_paths)
+.env → TYPESAFE_API_KEY, JEV_MCP_MODEL, JEV_MCP_TIMEOUT_MS, JEV_MCP_MOCK,
+       JEV_MCP_AUTO_ACCEPT, JEV_MCP_REVIEW_AT
 ```
 
 ### Decision flow
 
 1. A tool receives a prompt/task/command via MCP.
-2. `jev_engine` calls `TypeSafeClient.system_one(state=..., questions=...)` using `Noul` / `Choice` primitives.
-3. Answers are extracted with `get_answer()` / `get_val()` / `get_prob()` (safe against both SDK object and JSON-dict answer shapes).
-4. A JSON-serializable dict payload is returned to the caller.
+2. `jev_engine` fits `state` to the token budget (`limits.fit_state`), calls
+   `TypeSafeClient.system_one(state=..., questions=...)` (or the mock judge)
+   using `Noul` / `Choice` primitives.
+3. `jev_validation.validate_response` verifies the response against the
+   questions **before any policy number is read**. Malformed or
+   self-contradictory answers raise `JevResponseError` — they are never read
+   as `safe:true`.
+4. `policy.py` maps probabilities to `confidence` and an `action`
+   (`auto | review | escalate`); truncated context never yields `auto`.
+5. A JSON-serializable dict is returned with the legacy keys plus
+   `action/confidence/ranked/model/usage/truncated/coverage`.
+
+### Result envelope & typed errors
+
+Every live call adds `model` and `usage: {input_tokens, output_tokens}`. Tools
+that make a decision add `action`, `confidence`, and (where relevant) `ranked`
+and `truncated`. When anything fails — config, budget, timeout, invalid
+response — the tool returns a fail-closed envelope:
+
+```json
+{ "error": { "code": "INVALID_RESPONSE", "message": "...", "retryable": false } }
+```
+
+`errorDetails()` (`jev_errors.py`) maps SDK failures to `{code, message, retryable}`:
 
 ---
 
@@ -83,6 +123,11 @@ Copy-Item .env.example .env
 
 ```dotenv
 TYPESAFE_API_KEY=apikey_********************************
+# JEV_MCP_MODEL=jev-latest          # model for system_one (default: jev-latest)
+# JEV_MCP_TIMEOUT_MS=30000          # per-request timeout ms (default: 30000)
+# JEV_MCP_MOCK=0                    # 1 = offline deterministic judge (tests/demos)
+# JEV_MCP_AUTO_ACCEPT=0.8           # confidence to auto-accept (0..1)
+# JEV_MCP_REVIEW_AT=0.5             # confidence below which we escalate (0..1)
 ```
 
 Both `jev_engine.py` and `jev_mcp.py` load `.env` via `python-dotenv` with `override=True` (relative to the file's parent directory). Because the MCP config already injects `TYPESAFE_API_KEY`, the `.env` file acts as a reliable fallback.
@@ -105,10 +150,16 @@ Pre-execution audit for shell commands.
 
 - **Params:** `command` (string, required)
 - **Jev primitives:** `is_destructive` (`Noul`), `modifies_git` (`Noul`)
-- **Thresholds:** safe only if `destructive_prob < 0.20` **and** `git_modify_prob < 0.20`
+- **Thresholds:** `safe` only if `action == "auto"` **and** `destructive_prob < 0.20` **and** `git_modify_prob < 0.20`. A confident "destructive" judgment (`>= 0.5`) escalates; `>= 0.2` reviews.
 
 ```json
-{ "safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01 }
+{
+  "safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01,
+  "action": "auto", "confidence": 0.99, "reason_codes": [],
+  "truncated": false,
+  "coverage": { "complete": true, ... },
+  "model": "jev-latest", "usage": { "input_tokens": 120, "output_tokens": 12 }
+}
 ```
 
 ### 2. `search_agent_skills` — dynamic context pruning & skill routing
@@ -116,7 +167,7 @@ Pre-execution audit for shell commands.
 Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,000 chars per resource.
 
 - **Params:** `task` (required), `root_dir` (default `.`)
-- **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jev_settings.scan_paths`
+- **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jevs_settings.scan_paths`
 - **Jev primitives:** `primary` / `secondary` / `tertiary` (`Choice`, `criteria={path: description}`)
 - **Key capabilities:** probability matching (secondary picks ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`)
 
@@ -126,7 +177,12 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
   "count": 2,
   "primary": { "name": "godot-ui-theme", "file": ".agents/skills/godot-ui-theme/SKILL.md", "content": "..." },
   "resources": [...],
-  "summary": "Found 2 relevant agent resource(s): godot-ui-theme, godot-ui-layout"
+  "summary": "Found 2 relevant agent resource(s): godot-ui-theme, godot-ui-layout",
+  "primary_probability": 0.91,
+  "ranked": [ { "file": ".agents/skills/godot-ui-theme/SKILL.md", "probability": 0.91 }, ... ],
+  "action": "auto", "confidence": 0.87, "truncated": false,
+  "coverage": { "complete": true, ... },
+  "model": "jev-latest", "usage": { "input_tokens": 512, "output_tokens": 24 }
 }
 ```
 
@@ -139,15 +195,25 @@ Filters the repo tree down to task-relevant files.
 - **Jev primitive:** `target_file` (`Choice`, `criteria={path: description}`)
 
 ```json
-{ "matched": true, "files": ["src/core/player_controller.gd"] }
+{
+  "matched": true, "files": ["src/core/player_controller.gd"],
+  "exists": "answered", "probability": 0.94,
+  "ranked": [ { "file": "src/core/player_controller.gd", "probability": 0.94 }, ... ],
+  "action": "auto", "confidence": 0.9, "truncated": false,
+  "coverage": { "complete": true, ... },
+  "model": "jev-latest", "usage": { "input_tokens": 640, "output_tokens": 16 }
+}
 ```
+
+If no file fits, the model can pick the `none` escape hatch: `matched:false`,
+`files:[]`, and `exists` is `absent`/`partial`.
 
 ### 4. `select_model_tier` — dynamic model tier routing
 
-Analyzes task complexity and assigns a tier. **Gated by `jev_settings.enable_model_routing`** (default `false`).
+Analyzes task complexity and assigns a tier. **Gated by `jevs_settings.enable_model_routing`** (default `false`).
 
-- **When off:** returns immediately, disabled payload, **no Jev API call**, no model switching.
-- **When on:** runs a `Choice` over `fast` / `balanced` / `frontier`, then resolves the configured model for the chosen tier.
+- **When off:** returns immediately, disabled payload, **no Jev API call**, no model switching (opencode keeps its configured/window model).
+- **When on:** runs a `Choice` over `fast` / `balanced` / `frontier`, then resolves the configured model for the chosen tier. This tool returns a **recommendation**; the actual **forced switch** is applied by the `chat.message` plugin hook.
 
 ```json
 {
@@ -155,40 +221,40 @@ Analyzes task complexity and assigns a tier. **Gated by `jev_settings.enable_mod
   "task": "Refactor auth middleware to support OAuth2 refresh tokens",
   "recommended_tier": "frontier",
   "recommended_model": "<frontier model id>",
-  "model_map": { "fast": "...", "balanced": "...", "frontier": "..." }
+  "model_map": { "fast": "...", "balanced": "...", "frontier": "..." },
+  "action": "auto", "confidence": 0.93, "truncated": false,
+  "coverage": { "complete": true, ... },
+  "model": "jev-latest", "usage": { "input_tokens": 200, "output_tokens": 12 }
 }
 ```
 
 ```json
-{ "enabled": false, "task": "...", "recommended_tier": null, "recommended_model": null, "model_map": {} }
+{ "enabled": false, "task": "...", "recommended_tier": null, "recommended_model": null, "model_map": {}, "action": "review", "confidence": null, "truncated": false, "model": null, "usage": null }
 ```
+
+Low-confidence or truncated judgments report `action: "escalate"` while
+keeping `recommended_tier` unchanged.
 
 ---
 
-## Configuration — `jev_settings` in opencode.json
+## Configuration — `jevs_settings.json` (per project)
 
-File: `C:\Users\aalji\.config\opencode\opencode.json` (user-level). Project-level `opencode.json` / `.opencode/opencode.json` take priority when present. The MCP server reads these files itself at call time via `load_jev_settings()`.
+File: `<project-root>/jevs_settings.json`. Lookup order (first file that contains a Jev key wins):
+
+1. `<project>/jevs_settings.json`
+2. `<project>/.opencode/jevs_settings.json`
+3. `~/.config/opencode/jevs_settings.json`
+4. Legacy: `jev_settings` block in `opencode.json` (project > user)
 
 ```jsonc
 {
-  "mcp": {
-    "jev-engine": {
-      "type": "local",
-      "enabled": true,
-      "command": "D:/mcp/jev-typesafe-mcp/.venv/Scripts/python.exe",
-      "args": ["D:/mcp/jev-typesafe-mcp/jev_mcp.py"],
-      "env": { "TYPESAFE_API_KEY": "${TYPESAFE_API_KEY}" }
-    }
+  "enable_model_routing": false,
+  "models": {
+    "fast":     "",      // <-- "provider/model-id" used for FORCED switching
+    "balanced": "",
+    "frontier": ""
   },
-  "jev_settings": {
-    "enable_model_routing": false,
-    "models": {
-      "fast":     "",      // <-- fill with model IDs when routing is enabled
-      "balanced": "",
-      "frontier": ""
-    },
-    "scan_paths": []        // <-- extra skill dirs, appended to the defaults
-  }
+  "scan_paths": []        // <-- extra skill dirs, appended to the defaults
 }
 ```
 
@@ -196,11 +262,15 @@ File: `C:\Users\aalji\.config\opencode\opencode.json` (user-level). Project-leve
 
 | Key | Type | Meaning |
 |---|---|---|
-| `enable_model_routing` | bool | Master switch for `select_model_tier`. Off = no Jev call / no model switching. |
-| `models` | `{fast, balanced, frontier}` | Tier → model ID mapping returned via `recommended_model` + `model_map`. Empty entries are ignored. |
+| `enable_model_routing` | bool | Master switch. **Off** (default) = no Jev model call, opencode uses its `"model"` config / window-selected model. **On** = the plugin asks Jev the tier and **forces** the switch per task. |
+| `models` | `{fast, balanced, frontier}` | Tier → `"provider/model-id"` mapping applied by the plugin. Empty entries are ignored. |
 | `scan_paths` | `[relative path]` | **Additive** extras to the default skill dirs. Deduplicated on load. |
 
-The first config file that contains a `jev_settings` block wins (project > user). Malformed JSON never breaks the server — it logs to stderr and falls back to defaults.
+Everything is optional; a missing/invalid file falls back to defaults (routing off,
+empty models, built-in scan dirs `.agents/skills`, `.agents/workflows`,
+`.agents/memory`, `.opencode/skills`, `skills`, `.agents`). Malformed JSON never
+breaks the server — it logs to stderr and falls back. The resolved `source` file is
+exposed in `load_jev_settings()["source"]`.
 
 ---
 
@@ -208,35 +278,34 @@ The first config file that contains a `jev_settings` block wins (project > user)
 
 Location: `C:\Users\aalji\.config\opencode\plugins\jev-plugin.js`
 
-An auxiliary OpenCode hook (`chat.message`) that, when it finds Markdown skill/workflow/memory files in the workspace, uses Jev to pick the single most relevant file and **injects its content** directly into the conversation context (`[Active Capability / Skill: <path>]`).
+An auxiliary OpenCode hook (`chat.message`) that does two things per user message:
+
+1. **Forced model routing** — when `jevs_settings.json` has `enable_model_routing: true`
+   **and** all tiers have model IDs, it asks Jev for the task tier
+   (`fast` / `balanced` / `frontier`), maps it through `models`, and **forces** the
+   switch by mutating `output.message.model = { providerID, modelID }`. opencode
+   persists the user message *after* the `chat.message` hook fires and routes the
+   next reply from `lastUser.model`, so this is a real, forced switch — not a
+   recommendation. When routing is off, the message model is left untouched and
+   opencode uses its `"model"` config / window-selected model.
+2. **Skill routing** — scans the configured skill dirs for Markdown, asks Jev which
+   single file is most relevant, and **injects its content** into the conversation
+   context (`[Active Capability / Skill: <path>]`).
 
 ### How it works
 
-1. Discovers config via the same candidate paths as the MCP server:
-   - `./opencode.json`, `./.opencode/opencode.json`, `~/.config/opencode/opencode.json`
-2. Extracts the Python interpreter from `mcp["jev-engine"].command` (falls back to `D:\mcp\jev-typesafe-mcp\.venv\Scripts\python.exe`).
+1. Reads settings from `jevs_settings.json` (project → `.opencode/jevs_settings.json`
+   → user `~/.config/opencode/jevs_settings.json`), with a legacy fallback to the
+   `jev_settings` block in `opencode.json`.
+2. Extracts the Python interpreter from `mcp["jev-engine"].command` (falls back to
+   `D:\mcp\jev-typesafe-mcp\.venv\Scripts\python.exe`).
 3. Loads `TYPESAFE_API_KEY` from the process env, else from `D:\mcp\jev-typesafe-mcp\.env`.
-4. Uses `jev_settings.scan_paths` (default `[".agents/skills", ".agents/workflows", ".agents/memory", ".opencode/skills"]`).
-5. Recursively scans the resolved dirs for `*.md`, spawns Python via `spawnSync` to query Jev, and injects the winning file's content.
+4. Uses `scan_paths` (defaults + configured extras).
+5. Spawns Python via `spawnSync` with the current `TypeSafeClient.system_one(...)`
+   API and either forces the model switch, injects the winning skill, or both.
 
-### ⚠️ Known limitation
-
-The plugin's inline Python currently targets the **legacy** `JevClient` / `Choice(options=...)` / `client.decide(...)` API, which **does not exist in `typesafe-sdk==0.7.1`**. The plugin fails gracefully (never crashes OpenCode — "Execution bypassed safely"), but the hook currently performs no routing.
-
-If you want the plugin to actually route, the embedded script must be migrated to:
-
-```python
-from typesafe_sdk import TypeSafeClient, Choice
-
-client = TypeSafeClient(api_key=os.getenv("TYPESAFE_API_KEY"))
-res = client.system_one(
-    state="User Task: ...",
-    questions={"target": Choice(criteria={path: "Agent resource" for path in ...})},
-)
-# selected = res.answers["target"].choice
-```
-
-The MCP-based `search_agent_skills` tool is the fully-working, supported path for the same capability.
+All errors are caught and logged ("Execution bypassed safely") — the hook never
+crashes OpenCode.
 
 ---
 
@@ -259,11 +328,15 @@ cd D:\mcp\jev-typesafe-mcp
 # Syntax check
 & .\.venv\Scripts\python.exe -m py_compile jev_engine.py jev_mcp.py
 
+# Offline test suite (no API key needed — mock mode covers the tools)
+& .\.venv\Scripts\python.exe -m pytest tests -q
+
 # Import check
 & .\.venv\Scripts\python.exe -c "import jev_mcp; print('MCP import successful!')"
 
-# Engine CLI smoke test (live Jev API call)
+# Engine CLI smoke test — live (default) or offline with JEV_MCP_MOCK=1
 & .\.venv\Scripts\python.exe jev_engine.py verify "git status"
+$env:JEV_MCP_MOCK="1"; & .\.venv\Scripts\python.exe jev_engine.py verify "git status"
 
 # Print resolved jev_settings + scan dirs
 & .\.venv\Scripts\python.exe -c "from jev_engine import load_jev_settings, get_scan_paths; from pathlib import Path; print(load_jev_settings()); print([str(p) for p in get_scan_paths(Path('.'))])"
@@ -276,12 +349,32 @@ Expected outputs:
 
 ```
 py_compile OK
+58 passed
 MCP import successful!  (server: MCPServer)
-{"safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01}
+{"safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01, "action": "auto", ...}
 ```
 
 A `tools/list` handshake against a running `jev_mcp.py` returns exactly four tools:
 `guardrail_command`, `search_agent_skills`, `search_target_files`, `select_model_tier`.
+
+### Mock mode (`JEV_MCP_MOCK=1`)
+
+Runs the same tools end-to-end through a **deterministic offline judge**
+(`mock.py`) that returns plausible `Noul`/`Choice` answers from keyword/overlap
+heuristics. Earlier telemetry says the mock exercises the **full validation and
+policy pipeline** with the exact SDK object shapes. It exists for tests, demos,
+and development without an API key — never as a production decision engine.
+
+### Tests
+
+`pytest` in `tests/`:
+
+- `test_policy.py` — confidence formula, actions, thresholds, escape hatches.
+- `test_validation.py` — fail-closed response validation (structure + failures).
+- `test_limits.py` — token estimation, truncation, budget errors.
+- `test_mock_tools.py` — offline tool runs (no key): backward-compat keys,
+  new envelope keys, malformed→`INVALID_RESPONSE`, `none` escape hatch.
+- `test_live_smoke.py` — skipped unless `TYPESAFE_API_KEY` or `JEV_MCP_LIVE=1`.
 
 ---
 
@@ -293,6 +386,7 @@ repo carries **sanitized example copies** under `config/`:
 | Example (committed) | Real install location |
 |---|---|
 | `config/opencode.example.json` | `C:\Users\<you>\.config\opencode\opencode.json` |
+| `config/jevs_settings.example.json` | `<project-root>\jevs_settings.json` |
 | `config/jev-plugin.example.js` | `C:\Users\<you>\.config\opencode\plugins\jev-plugin.js` |
 
 See [`config/README.md`](config/README.md) for the full install guide.
