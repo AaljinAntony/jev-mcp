@@ -322,6 +322,38 @@ function splitModelId(modelId) {
   return { providerID: modelId, modelID: modelId };
 }
 
+/**
+ * Append the skill notice to the USER's existing text part instead of pushing a
+ * new part.
+ *
+ * opencode 2.x validates every message part against PartV2 at save time
+ * (id / sessionID / messageID required). Pushing a bare `{type:"text", text}`
+ * crashes `SessionPrompt.createUserMessage` ("invalid user part before save" ->
+ * EventV2.InvalidDurableEvent -> popup + task auto-stop). Editing the existing
+ * text part's `text` field keeps the object opencode already owns, so saving
+ * still succeeds. If we cannot mutate safely, we skip injection (never crash).
+ */
+function injectIntoUserMessage(output, notice) {
+  if (Array.isArray(output?.parts)) {
+    const textPart = output.parts.find(
+      (p) => p && p.type === "text" && typeof p.text === "string"
+    );
+    if (textPart) {
+      const suffix = textPart.text.endsWith("\n") ? "" : "\n";
+      textPart.text = textPart.text + suffix + notice;
+      return true;
+    }
+    pluginLog("inject: no text part found; skipped (safe)");
+    return false;
+  }
+  if (output?.message && typeof output.message.text === "string") {
+    output.message.text = output.message.text + notice;
+    return true;
+  }
+  pluginLog("inject: no supported message shape; skipped (safe)");
+  return false;
+}
+
 export const JevPlugin = async () => ({
   "chat.message": async (input, output) => {
     try {
@@ -367,7 +399,7 @@ export const JevPlugin = async () => ({
         }
       }
 
-      // 2. Skill injection
+      // 2. Skill injection — schema-safe (see injectIntoUserMessage)
       const selectedRel = result?.target;
       if (selectedRel && fileMap.has(selectedRel)) {
         const fullPath = fileMap.get(selectedRel);
@@ -378,11 +410,12 @@ export const JevPlugin = async () => ({
 
         const injectedNotice = `\n\n[Active Capability / Skill: ${selectedRel}]\n${content}\n`;
 
-        if (Array.isArray(output?.parts)) {
-          output.parts.push({ type: "text", text: injectedNotice });
-        } else if (output?.message) {
-          output.message.text = (output.message.text || "") + injectedNotice;
-        }
+        const injected = injectIntoUserMessage(output, injectedNotice);
+        pluginLog(
+          `inject ${injected ? "ok" : "skipped"}; parts=${JSON.stringify(
+            (output?.parts || []).map((p) => p && p.type)
+          )}`
+        );
       }
     } catch (err) {
       pluginLog(`hook errored (bypassed safely): ${err.message}`);
