@@ -14,7 +14,8 @@
         "JEV_MCP_TIMEOUT_MS": "30000",
         "JEV_MCP_MOCK": "0",
         "JEV_MCP_AUTO_ACCEPT": "0.8",
-        "JEV_MCP_REVIEW_AT": "0.5"
+        "JEV_MCP_REVIEW_AT": "0.5",
+        "JEV_MCP_LOG_FILE": "<REPO_DIR>/logs/jev_engine.log"
       }
     }
   }

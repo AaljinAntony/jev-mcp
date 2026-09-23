@@ -56,6 +56,7 @@ values are read from `TYPESAFE_API_KEY` interpolation plus:
 | `JEV_MCP_MOCK` | `0` | `1` = offline deterministic judge (tests/demos only). |
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
+| `JEV_MCP_LOG_FILE` | `<repo>/logs/jev_engine.log` | Absolute path to the server log; each tool call and provider round is recorded (always written cwd-independently). |
 
 Thresholds must satisfy `0 <= review_at <= auto_accept <= 1` (invalid values
 fail fast with a `CONFIG_ERROR` envelope instead of silently mis-routing).
@@ -66,9 +67,30 @@ fail fast with a `CONFIG_ERROR` envelope instead of silently mis-routing).
 
 5. **(Optional) plugin:** copy `config\jev-plugin.example.js` to
    `$env:USERPROFILE\.config\opencode\plugins\jev-plugin.js`.
+   The plugin never writes to the conversation; it logs diagnostics to
+   `~\.config\opencode\logs\jev-plugin.log`.
 
 6. **Restart OpenCode** so the MCP server and settings are re-read, then run the
    verification commands from the main `README.md`.
+
+## Troubleshooting
+
+"Unexpected error occurred" while sending a prompt in a project that has a
+`.agents/` folder? The fix below is already applied to the installed plugin
+(`C:\Users\<you>\.config\opencode\plugins\jev-plugin.js`):
+
+- The `chat.message` hook must **never** block the opencode process. The plugin's
+  Jev query is now an **async** `spawn` + `await` (4 s cap), not a synchronous
+  `spawnSync`. A blocking call inside the hook is what trips opencode into the
+  error popup and task auto-stop.
+- Check the traces to see who failed:
+  - `~\.config\opencode\logs\jev-plugin.log` — hook fired? candidates found? spawn result?
+  - `<repo>\logs\jev_engine.log` — was the tool even invoked? current tool call, duration, envelope.
+- Reproduce a tool failure over the real transport (same as opencode) with:
+
+  ```powershell
+  &.venv\Scripts\python.exe scripts\diag_mcp.py --tool search_agent_skills --task "fix ui bug" --root_dir D:\Godot_projects\flux-wall
+  ```
 
 ### Default model (optional)
 

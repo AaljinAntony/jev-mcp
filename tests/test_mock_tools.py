@@ -72,7 +72,7 @@ class TestGuardrailTool:
             "execute_system_one",
             lambda *a, **k: _fake_response({"is_destructive": NoulAnswer(noul=0.1)}),
         )
-        envelope = jev_mcp._run(lambda: jev_engine.verify_command("x"))
+        envelope = jev_mcp._run("guardrail_command", lambda: jev_engine.verify_command("x"))
         assert "error" in envelope
         assert envelope["error"]["code"] == "INVALID_RESPONSE"
         assert "safe" not in envelope

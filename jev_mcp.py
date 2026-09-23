@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 
 # Load environment variables
@@ -27,45 +28,54 @@ from jev_engine import (
     load_jev_settings,
 )
 from jev_errors import error_details
+from jev_logging import log_tool_call, log_event, log_exception, log_path
 
 mcp = FastMCP("jev-engine")
 
+log_event("server_start", pid=os.getpid(), log_file=str(log_path()))
 
-def _run(fn):
+
+def _run(tool: str, fn, **args):
     """Run a tool body, mapping typed errors to a fail-closed JSON envelope.
 
     Invalid responses never read as `safe:true`: validation raises before any
     policy number is produced, so the caller only ever sees the error envelope
     (plus the MCP text for debugging).
     """
+    start = time.perf_counter()
     try:
-        return fn()
+        result = fn()
+        log_tool_call(tool, (time.perf_counter() - start) * 1000, args=args, result=result)
+        return result
     except Exception as err:
-        return {"error": error_details(err)}
+        envelope = {"error": error_details(err)}
+        log_tool_call(tool, (time.perf_counter() - start) * 1000, args=args, error=envelope)
+        log_exception("tool_error", err, tool=tool, args=args)
+        return envelope
 
 
 @mcp.tool()
 def guardrail_command(command: str) -> dict:
     """Check whether a terminal shell command is safe to execute or potentially destructive."""
-    return _run(lambda: verify_command(command))
+    return _run("guardrail_command", lambda: verify_command(command), command=command)
 
 
 @mcp.tool()
 def search_agent_skills(task: str, root_dir: str = ".") -> dict:
     """Find and retrieve relevant agent skills, workflows, and memory markdown files for a given task."""
-    return _run(lambda: find_agent_resources(task=task, root_dir=root_dir))
+    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
 
 
 @mcp.tool()
 def search_target_files(task: str, root_dir: str = ".") -> dict:
     """Identify which workspace files are relevant to a task using Jev AI evaluation."""
-    return _run(lambda: select_target_files(task=task, root_dir=root_dir))
+    return _run("search_target_files", lambda: select_target_files(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
 
 
 @mcp.tool()
 def select_model_tier(task: str) -> dict:
     """Select the optimal LLM model tier (fast, balanced, or frontier) based on task complexity."""
-    return _run(lambda: _engine_select_model_tier(task))
+    return _run("select_model_tier", lambda: _engine_select_model_tier(task), task=task)
 
 
 if __name__ == "__main__":

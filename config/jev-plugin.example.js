@@ -19,7 +19,7 @@
  * fallback to the `jev_settings` block in opencode.json. All errors are swallowed:
  * the hook never crashes OpenCode.
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -32,6 +32,20 @@ const DEFAULT_SCAN_PATHS = [
   "skills",
   ".agents",
 ];
+
+// Dedicated plugin log (opencode may swallow console output). Best effort only.
+function pluginLog(msg) {
+  try {
+    const dir = path.join(os.homedir(), ".config", "opencode", "logs");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, "jev-plugin.log"),
+      `${new Date().toISOString()} ${msg}\n`
+    );
+  } catch (err) {
+    console.warn(`[jev-plugin] pluginLog failed:`, err.message);
+  }
+}
 
 function readJson(file) {
   try {
@@ -179,6 +193,10 @@ function extractUserPrompt(input, output) {
 /**
  * Query Jev via the configured Python environment using the current
  * TypeSafeClient.system_one(...) API. Returns { tier?, target? }.
+ *
+ * Async: spawns a child and awaits its exit so the hook NEVER blocks the
+ * opencode process (a blocking spawnSync here is what trips opencode's task
+ * loop into "Unexpected error occurred" + auto-stop). Capped at 4s.
  */
 function queryJev(pythonPath, apiKey, task, candidates, wantTier) {
   const pythonScript = `
@@ -239,26 +257,57 @@ except Exception as e:
     sys.stderr.write(f"QUERY_ERROR: {e}")
     sys.exit(1)
 `;
-
   const childEnv = { ...process.env };
   if (apiKey) childEnv.TYPESAFE_API_KEY = apiKey;
 
-  try {
-    const proc = spawnSync(pythonPath, ["-c", pythonScript], {
-      input: JSON.stringify({ task, candidates, want_tier: Boolean(wantTier) }),
-      encoding: "utf-8",
-      timeout: 4000,
-      env: childEnv,
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn(pythonPath, ["-c", pythonScript], {
+        env: childEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (err) {
+      pluginLog(`queryJev spawn threw: ${err.message}`);
+      resolve(null);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      pluginLog("queryJev timed out (4s), killing child");
+      proc.kill();
+    }, 4000);
+
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => (stdout += d));
+    proc.stderr.on("data", (d) => (stderr += d));
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      pluginLog(`queryJev child error: ${err.message}`);
+      resolve(null);
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout) {
+        try {
+          resolve(JSON.parse(stdout.trim()));
+          return;
+        } catch (err) {
+          pluginLog(`queryJev JSON parse failed: ${err.message}`);
+        }
+      }
+      pluginLog(`queryJev failed (status ${code}): ${String(stderr).trim().slice(0, 300)}`);
+      resolve(null);
     });
 
-    if (proc.status === 0 && proc.stdout) {
-      return JSON.parse(proc.stdout.trim());
+    try {
+      proc.stdin.write(JSON.stringify({ task, candidates, want_tier: Boolean(wantTier) }));
+      proc.stdin.end();
+    } catch (err) {
+      pluginLog(`queryJev stdin write failed: ${err.message}`);
     }
-    console.warn(`[jev-plugin] Query failed (status ${proc.status}):`, proc.stderr?.trim());
-  } catch (err) {
-    console.warn(`[jev-plugin] Execution failed with binary "${pythonPath}":`, err.message);
-  }
-  return null;
+  });
 }
 
 /**
@@ -298,9 +347,12 @@ export const JevPlugin = async () => ({
 
       if (!wantTier && candidates.length === 0) return;
 
+      pluginLog(`chat.message fired: prompt="${promptText.slice(0, 80)}" wantTier=${wantTier} candidates=${candidates.length} cwd=${cwd}`);
+
       const startTime = Date.now();
-      const result = queryJev(settings.pythonPath, settings.apiKey, promptText, candidates, wantTier);
+      const result = await queryJev(settings.pythonPath, settings.apiKey, promptText, candidates, wantTier);
       const elapsed = Date.now() - startTime;
+      pluginLog(`queryJev returned in ${elapsed}ms tier=${result?.tier} target=${result?.target}`);
 
       // 1. Forced model switch (only when routing is enabled)
       if (wantTier && result?.tier) {
@@ -308,6 +360,7 @@ export const JevPlugin = async () => ({
         if (modelId && output?.message?.model) {
           const parts = splitModelId(modelId);
           output.message.model = parts;
+          pluginLog(`Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID}`);
           console.log(
             `[jev-plugin] ⚡ Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID} in ${elapsed}ms`
           );
@@ -321,6 +374,7 @@ export const JevPlugin = async () => ({
         const content = fs.readFileSync(fullPath, "utf-8");
 
         console.log(`[jev-plugin] ⚡ Selected ${selectedRel} in ${elapsed}ms`);
+        pluginLog(`Injecting skill ${selectedRel} (${content.length} chars)`);
 
         const injectedNotice = `\n\n[Active Capability / Skill: ${selectedRel}]\n${content}\n`;
 
@@ -331,6 +385,7 @@ export const JevPlugin = async () => ({
         }
       }
     } catch (err) {
+      pluginLog(`hook errored (bypassed safely): ${err.message}`);
       console.warn("[jev-plugin] Execution bypassed safely:", err.message);
     }
   },

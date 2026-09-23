@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -25,6 +26,7 @@ from typesafe_sdk import (
 
 from config import get_config
 from jev_errors import JevConfigError, JevResponseError, JevTimeoutError, error_details
+from jev_logging import log_round
 from jev_validation import validate_response
 from limits import fit_state, MAX_CHOICE_OPTIONS, MAX_CONTENT_CHARS
 from mock import mock_system_one
@@ -280,10 +282,25 @@ def _risk_action(prob: float, cfg) -> str:
 def _request(state_text: str, questions: dict):
     """Fit + execute + validate one Jev round. Returns (res, fitted)."""
     cfg = get_config()
-    fitted = fit_state(state_text, questions)
-    res = execute_system_one(get_client(), state=fitted["state"], questions=questions)
-    validate_response(res, questions)
-    return res, fitted, cfg
+    started = time.perf_counter()
+    try:
+        fitted = fit_state(state_text, questions)
+        res = execute_system_one(get_client(), state=fitted["state"], questions=questions)
+        validate_response(res, questions)
+        log_round(
+            (time.perf_counter() - started) * 1000,
+            question_keys=questions.keys(),
+            state_len=len(fitted["state"]),
+        )
+        return res, fitted, cfg
+    except Exception as err:
+        log_round(
+            (time.perf_counter() - started) * 1000,
+            question_keys=questions.keys(),
+            state_len=len(state_text),
+            error=err,
+        )
+        raise
 
 
 # ----------------------------------------------------------------------

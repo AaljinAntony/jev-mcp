@@ -37,6 +37,8 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | `D:\mcp\jev-typesafe-mcp\limits.py` | Token budget estimation + state fitting/truncation |
 | `D:\mcp\jev-typesafe-mcp\config.py` | Env config parsing + validation (`JEV_MCP_*`) |
 | `D:\mcp\jev-typesafe-mcp\mock.py` | Deterministic offline judge for `JEV_MCP_MOCK=1` |
+| `D:\mcp\jev-typesafe-mcp\jev_logging.py` | Filesystem logging (tool calls, provider rounds, tracebacks) |
+| `D:\mcp\jev-typesafe-mcp\scripts\diag_mcp.py` | Transport-level MCP repro client for any workspace + prompt |
 | `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, mock tools, live smoke |
 | `D:\mcp\jev-typesafe-mcp\requirements.txt` | Pinned Python dependencies (UTF-8) |
 | `D:\mcp\jev-typesafe-mcp\.env` | Local secrets — holds `TYPESAFE_API_KEY` (never committed) |
@@ -341,6 +343,9 @@ $env:JEV_MCP_MOCK="1"; & .\.venv\Scripts\python.exe jev_engine.py verify "git st
 # Print resolved jev_settings + scan dirs
 & .\.venv\Scripts\python.exe -c "from jev_engine import load_jev_settings, get_scan_paths; from pathlib import Path; print(load_jev_settings()); print([str(p) for p in get_scan_paths(Path('.'))])"
 
+# Reproduce a tool call over the real MCP transport (same as opencode):
+& .\.venv\Scripts\python.exe scripts\diag_mcp.py --tool search_agent_skills --task "fix ui bug" --root_dir D:\Godot_projects\flux-wall
+
 # Start the server (blocks on stdio, waits for an MCP client)
 & .\.venv\Scripts\python.exe jev_mcp.py
 ```
@@ -356,6 +361,19 @@ MCP import successful!  (server: MCPServer)
 
 A `tools/list` handshake against a running `jev_mcp.py` returns exactly four tools:
 `guardrail_command`, `search_agent_skills`, `search_target_files`, `select_model_tier`.
+
+### Diagnostics & logging
+
+- Server log (JSON lines): `<repo>\logs\jev_engine.log` (override with
+  `JEV_MCP_LOG_FILE`). Records each tool call (args, duration, result size),
+  each provider round, and full tracebacks on failure. Written from an absolute,
+  workspace-independent path.
+- Plugin log: `~\.config\opencode\logs\jev-plugin.log` (hook fired, candidates,
+  spawn result, skill injection). The installed plugin's Jev query is **async**
+  so the `chat.message` hook never blocks opencode.
+- `scripts\diag_mcp.py` reproduces a single tool call over stdio (identical to
+  opencode's transport) against any `root_dir` + task; exit 0 = clean, 1 = error
+  envelope or transport failure.
 
 ### Mock mode (`JEV_MCP_MOCK=1`)
 
