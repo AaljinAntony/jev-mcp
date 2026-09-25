@@ -6,12 +6,42 @@ function reads a number. Invalid responses raise `JevResponseError`; they are
 never read as `safe:true`.
 """
 
+import math
+
 from typesafe_sdk import Answer, Choice, Noul, Score
 
 from jev_errors import JevResponseError
-from policy import PROBABILITY_SUM_TOLERANCE, SCORE_MEAN_TOLERANCE
+from policy import PROBABILITY_SUM_TOLERANCE, score_mean_tolerance
 
 _ANSWER_TYPES = {"noul", "choice", "score"}
+
+
+def _is_finite_number(value) -> bool:
+    """True only for a real, non-bool int/float. NaN/Inf are rejected."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _assert_finite_json(value, path="result") -> None:
+    """Walk the envelope and reject any non-finite float before serialization."""
+    if isinstance(value, bool) or value is None or isinstance(value, (int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise JevResponseError(f"non-finite number at {path}")
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _assert_finite_json(v, f"{path}.{k}")
+        return
+    if isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            _assert_finite_json(v, f"{path}[{i}]")
+        return
+    if hasattr(value, "__dict__"):
+        for k, v in vars(value).items():
+            if not k.startswith("_"):
+                _assert_finite_json(v, f"{path}.{k}")
+        return
 
 
 def _attr(obj, name):
@@ -30,7 +60,7 @@ def _int_key(key) -> int:
 
 
 def _non_negative_number(value, what: str) -> None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if not _is_finite_number(value):
         raise JevResponseError(f"invalid {what}: expected a number")
     if value < 0:
         raise JevResponseError(f"invalid {what}: must be non-negative")
@@ -38,7 +68,7 @@ def _non_negative_number(value, what: str) -> None:
 
 def _validate_noul(answer, name: str) -> None:
     value = _attr(answer, "noul")
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if not _is_finite_number(value):
         raise JevResponseError(f"answer '{name}' noul must be a number")
     if value < 0 or value > 1:
         raise JevResponseError(f"answer '{name}' noul must be in [0, 1]")
@@ -56,13 +86,15 @@ def _validate_probabilities(probabilities, keys_expected, name: str, kind: str) 
         if prob > 1:
             raise JevResponseError(f"answer '{name}' probability for '{option}' exceeds 1")
         total += prob
+    if not math.isfinite(total):
+        raise JevResponseError(f"answer '{name}' probabilities sum is not finite")
     if abs(total - 1.0) > PROBABILITY_SUM_TOLERANCE:
         raise JevResponseError(f"answer '{name}' probabilities sum {total:.4f}, expected ~1")
 
 
 def _validate_confidence(answer, name: str) -> float:
     confidence = _attr(answer, "confidence")
-    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+    if not _is_finite_number(confidence):
         raise JevResponseError(f"answer '{name}' confidence must be a number")
     if confidence < 0 or confidence > 1:
         raise JevResponseError(f"answer '{name}' confidence must be in [0, 1]")
@@ -91,7 +123,7 @@ def _validate_score(answer, criteria, name: str) -> None:
         raise JevResponseError(f"question '{name}' has an empty score rubric")
     levels = [str(i) for i in range(n)]
     score = _attr(answer, "score")
-    if not isinstance(score, (int, float)) or isinstance(score, bool):
+    if not _is_finite_number(score):
         raise JevResponseError(f"answer '{name}' score must be a number")
     if score < 0 or score > n - 1 + 1e-9:
         raise JevResponseError(f"answer '{name}' score must be within the rubric levels [0, {n - 1}]")
@@ -117,9 +149,13 @@ def _validate_score(answer, criteria, name: str) -> None:
     if sorted(legend_keys) != expected_int:
         raise JevResponseError(f"answer '{name}' legend must cover exactly the score levels 0..{n - 1}")
     expected_mean = sum(float(i) * p for i, p in numeric_probs.items())
-    if abs(float(score) - expected_mean) > SCORE_MEAN_TOLERANCE:
+    if not math.isfinite(expected_mean):
+        raise JevResponseError(f"answer '{name}' expected mean is not finite")
+    tolerance = score_mean_tolerance(n)
+    if abs(float(score) - expected_mean) > tolerance:
         raise JevResponseError(
-            f"answer '{name}' score {score:.4f} contradicts its distribution mean {expected_mean:.4f}"
+            f"answer '{name}' score {score:.4f} contradicts its distribution mean "
+            f"{expected_mean:.4f} (tolerance {tolerance:.4f})"
         )
     _validate_confidence(answer, name)
 

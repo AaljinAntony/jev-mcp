@@ -19,9 +19,26 @@ DEFAULT_ESCALATE_THRESHOLD = 0.50
 
 #: Float-safe sum tolerance: an exact 0.01 delta can exceed 0.01 in IEEE-754.
 PROBABILITY_SUM_TOLERANCE = 0.01 + 1e-12
-#: Covers two-decimal score and probability reporting: 0.005 drift on the
-#: score itself plus 0.005 * (0 + 1 + 2) = 0.015 on the distribution mean.
-SCORE_MEAN_TOLERANCE = 0.02 + 1e-12
+#: Per-level drift allowed between a reported score and its distribution mean.
+#: Two-decimal reporting gives 0.005 on the score and 0.005 on each level's
+#: probability, so the total drifts by 0.005 * (1 + sum of levels).
+SCORE_MEAN_PER_LEVEL_TOLERANCE = 0.01
+
+
+def score_mean_tolerance(levels: int) -> float:
+    """Absolute tolerance between `score` and its distribution mean.
+
+    Scaled by rubric size: a 7-level rubric accumulates more rounding drift than
+    a 2-level one, and an absolute cap rejects valid long-rubric responses.
+    Mirrors reference/burnigtm-jev-mcp/src/responses.ts:39.
+    """
+    if levels <= 0:
+        return 0.0
+    return SCORE_MEAN_PER_LEVEL_TOLERANCE * (levels - 1) + 1e-12
+
+
+#: Backwards-compatibility alias for 3-level rubrics.
+SCORE_MEAN_TOLERANCE = score_mean_tolerance(3)
 
 #: Escape-hatch options appended to Choice criteria so the model can decline
 #: to pick a supplied candidate (jkudish `DECIDE_ESCAPE_HATCHES`).

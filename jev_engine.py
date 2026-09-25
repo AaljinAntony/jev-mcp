@@ -331,6 +331,7 @@ def execute_system_one(client, state: Any, questions: dict) -> Any:
         raise JevTimeoutError("Could not connect to TypeSafe.") from e
     except TypeSafeAPIResponseValidationError as e:
         raise JevResponseError() from e
+    # HTTP status errors map in error_details()
 
 
 def get_answer(response: Any, key: str) -> Any:
@@ -398,6 +399,19 @@ def _response_meta(res: Any, cfg) -> dict:
     return {
         "model": getattr(res, "model", None) or cfg.model or None,
         "usage": _usage_dict(_attr_opt(res, "usage")),
+    }
+
+
+def _coverage_envelope(fitted: Optional[dict]) -> dict:
+    """A coverage block for paths where no Jev request was made."""
+    if fitted is not None:
+        return fitted["coverage"]
+    return {
+        "complete": True,
+        "original_chars": 0,
+        "evaluated_chars": 0,
+        "estimated_tokens": {"state": 0, "questions": 0, "longest_question": 0},
+        "estimator": "chars/4",
     }
 
 
@@ -542,12 +556,24 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
                 candidate_files[rel] = p
 
     if not candidate_files:
-        return {
+        result = {
             "matched": False,
             "count": 0,
             "resources": [],
-            "summary": "No Markdown resources or skills found in candidate directories."
+            "summary": "No Markdown resources or skills found in candidate directories.",
+            "primary": None,
+            "file": None,
+            "content": None,
+            "primary_probability": None,
+            "ranked": [],
+            "action": "auto",          # nothing to decide; see note below
+            "confidence": None,
+            "truncated": False,
+            "coverage": _coverage_envelope(None),
+            "model": None,
+            "usage": None,
         }
+        return result
 
     options = list(candidate_files.keys())[:MAX_CHOICE_OPTIONS]
 
@@ -583,11 +609,10 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
     if primary_val and primary_val in candidate_files:
         selected_keys.append(primary_val)
 
-    probs = getattr(primary_ans, "probabilities", {}) or {}
-    if isinstance(probs, dict):
-        for opt, p in probs.items():
-            if opt in candidate_files and opt not in selected_keys and p >= 0.12:
-                selected_keys.append(opt)
+    probs = _answer_probs(res, "primary")
+    for opt, p in probs.items():
+        if opt in candidate_files and opt not in selected_keys and p >= 0.12:
+            selected_keys.append(opt)
 
     for slot in ["secondary", "tertiary"]:
         val = get_val(get_answer(res, slot))
@@ -752,7 +777,20 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
                 break
 
     if not candidates:
-        return {"matched": False, "files": [], "exists": "absent"}
+        result = {
+            "matched": False,
+            "files": [],
+            "exists": "no_candidates",     # was "absent" — see note
+            "probability": 0.0,
+            "ranked": [],
+            "action": "auto",
+            "confidence": None,
+            "truncated": False,
+            "coverage": _coverage_envelope(None),
+            "model": None,
+            "usage": None,
+        }
+        return result
 
     criteria = {cand: "Candidate workspace file relevant to the task" for cand in candidates}
     criteria["none"] = "None of the supplied workspace files is relevant to the task"
@@ -826,6 +864,7 @@ def select_model_tier(task: str) -> dict:
         "action": "review",
         "confidence": None,
         "truncated": False,
+        "coverage": _coverage_envelope(None),
         "model": None,
         "usage": None,
     }

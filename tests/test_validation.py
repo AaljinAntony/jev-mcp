@@ -180,6 +180,71 @@ class TestFailures:
         with pytest.raises(JevResponseError):
             validate_response(_response(answers), questions)
 
+    def test_score_3_level_tolerance_boundary(self):
+        # 3-level rubric: tolerance is 0.01 * (3 - 1) = 0.02
+        questions = {"q": Score(criteria=["low", "mid", "high"], instructions="Rate")}
+        # expected_mean = 0*0.1 + 1*0.8 + 2*0.1 = 1.0
+        # 0.019 drift is within 0.02 tolerance
+        ans_ok = {
+            "q": {
+                "type": "score",
+                "score": 1.019,
+                "confidence": 0.8,
+                "probabilities": {0: 0.1, 1: 0.8, 2: 0.1},
+                "legend": {0: "low", 1: "mid", 2: "high"},
+            }
+        }
+        assert validate_response(_response(ans_ok), questions) is not None
+
+        # 0.021 drift exceeds 0.02 tolerance
+        ans_bad = {
+            "q": {
+                "type": "score",
+                "score": 1.021,
+                "confidence": 0.8,
+                "probabilities": {0: 0.1, 1: 0.8, 2: 0.1},
+                "legend": {0: "low", 1: "mid", 2: "high"},
+            }
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(_response(ans_bad), questions)
+
+    def test_score_7_level_tolerance_accepts_larger_drift(self):
+        # 7-level rubric: tolerance is 0.01 * (7 - 1) = 0.06
+        levels = [f"level_{i}" for i in range(7)]
+        questions = {"q": Score(criteria=levels, instructions="Rate")}
+        # expected_mean is 3.0
+        probs = {i: (1.0 if i == 3 else 0.0) for i in range(7)}
+        legend = {i: levels[i] for i in range(7)}
+        # Drift 0.05 is accepted (0.05 <= 0.06)
+        ans_ok = {
+            "q": {
+                "type": "score",
+                "score": 3.05,
+                "confidence": 0.9,
+                "probabilities": probs,
+                "legend": legend,
+            }
+        }
+        assert validate_response(_response(ans_ok), questions) is not None
+
+    def test_score_2_level_tolerance_rejects_tight_drift(self):
+        # 2-level rubric: tolerance is 0.01 * (2 - 1) = 0.01
+        questions = {"q": Score(criteria=["no", "yes"], instructions="Rate")}
+        # expected_mean = 0.5
+        # Drift of 0.019 exceeds 0.01 tolerance
+        ans = {
+            "q": {
+                "type": "score",
+                "score": 0.519,
+                "confidence": 0.5,
+                "probabilities": {0: 0.5, 1: 0.5},
+                "legend": {0: "no", 1: "yes"},
+            }
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(_response(ans), questions)
+
     def test_missing_usage_rejected(self):
         raw = {
             "model": "jev-latest",

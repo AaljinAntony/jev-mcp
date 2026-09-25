@@ -18,17 +18,22 @@ DEFAULT_MODEL = "jev-latest"
 DEFAULT_TIMEOUT_MS = 30_000
 
 
-def ensure_dotenv():
-    """Load .env if python-dotenv is available. Idempotent."""
+def ensure_dotenv() -> bool:
+    """Load the repo `.env` as a *fallback* only. Returns True if a file was loaded.
+
+    `override=False` is essential: opencode injects TYPESAFE_API_KEY and the
+    JEV_MCP_* knobs through the MCP `environment` block, and those are the
+    authoritative source. A stale `.env` must never win — least of all
+    JEV_MCP_MOCK, which would silently replace live decisions with the mock judge.
+    """
     try:
         from dotenv import load_dotenv
-        env_path = Path(__file__).resolve().parent / ".env"
-        if env_path.exists():
-            load_dotenv(dotenv_path=env_path, override=True)
-        else:
-            load_dotenv(override=True)
     except ImportError:
-        pass
+        return False
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return False   # never search upward from an unrelated CWD
+    return bool(load_dotenv(dotenv_path=env_path, override=False))
 
 
 @dataclass(frozen=True)

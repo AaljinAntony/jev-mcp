@@ -132,7 +132,7 @@ TYPESAFE_API_KEY=apikey_********************************
 # JEV_MCP_REVIEW_AT=0.5             # confidence below which we escalate (0..1)
 ```
 
-Both `jev_engine.py` and `jev_mcp.py` load `.env` via `python-dotenv` with `override=True` (relative to the file's parent directory). Because the MCP config already injects `TYPESAFE_API_KEY`, the `.env` file acts as a reliable fallback.
+Both `jev_engine.py` and `jev_mcp.py` load `.env` via `python-dotenv` with `override=False` (relative to the file's parent directory). Because the MCP config already injects `TYPESAFE_API_KEY`, injected variables take precedence and the `.env` file acts as a reliable fallback.
 
 ### Verify the SDK is healthy
 

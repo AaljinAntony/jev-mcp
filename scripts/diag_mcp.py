@@ -118,11 +118,18 @@ def main() -> int:
                 print("NOT strict-JSON:", e)
             print(f"strict-JSON: {'YES' if parse_ok else 'NO'}")
             result = call.get("result", {})
+            is_error = result.get("isError", False)
+            print(f"isError: {str(is_error).lower()}")
+            if is_error:
+                failed = True
             content = result.get("content", [])
             text = content[0].get("text", "") if content else ""
             print(f"response size: {len(raw)} bytes, text {len(text)} chars")
+            json_text = text
+            if text.startswith("Error executing tool ") and ": {" in text:
+                json_text = text[text.index(": {") + 2:]
             try:
-                body = json.loads(text)
+                body = json.loads(json_text)
                 if "error" in body and isinstance(body["error"], dict) and "code" in body["error"]:
                     print("ERROR ENVELOPE:", json.dumps(body["error"]))
                     failed = True

@@ -71,43 +71,48 @@ class TestLogRedaction:
 class TestEnsureDotenv:
     """Tests for Task 8C: Idempotent dotenv loading."""
 
-    def test_ensure_dotenv_loads_with_override_true(self, monkeypatch):
+    def test_ensure_dotenv_does_not_override(self, monkeypatch):
         called = {}
 
         def mock_load_dotenv(**kwargs):
             called.update(kwargs)
+            return True
 
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
-        ensure_dotenv()
-        assert called.get("override") is True
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        res = ensure_dotenv()
+        assert res is True
+        assert called.get("override") is False
 
     def test_ensure_dotenv_passes_env_path_when_exists(self, monkeypatch):
         called = {}
 
         def mock_load_dotenv(**kwargs):
             called.update(kwargs)
+            return True
 
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
         monkeypatch.setattr(Path, "exists", lambda self: True)
         ensure_dotenv()
-        assert called.get("override") is True
+        assert called.get("override") is False
         assert "dotenv_path" in called
         assert called["dotenv_path"].name == ".env"
 
-    def test_ensure_dotenv_passes_when_env_not_exists(self, monkeypatch):
+    def test_ensure_dotenv_skips_when_missing(self, monkeypatch):
         called = {}
 
         def mock_load_dotenv(**kwargs):
             called.update(kwargs)
+            return True
 
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
         monkeypatch.setattr(Path, "exists", lambda self: False)
-        ensure_dotenv()
-        assert called.get("override") is True
-        assert "dotenv_path" not in called
+        res = ensure_dotenv()
+        assert res is False
+        assert called == {}
 
     def test_ensure_dotenv_handles_import_error(self, monkeypatch):
         import builtins
@@ -119,8 +124,8 @@ class TestEnsureDotenv:
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
-        # Should not raise
-        ensure_dotenv()
+        # Should not raise, returns False
+        assert ensure_dotenv() is False
 
 
 class TestSymlinkProtection:

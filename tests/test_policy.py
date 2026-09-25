@@ -12,9 +12,22 @@ from policy import (
     guardrail_safe,
     min_confidence,
     require_complete_context,
+    score_mean_tolerance,
     validate_policy_thresholds,
     worst_action,
 )
+
+
+class TestScoreMeanTolerance:
+    def test_zero_or_negative_levels(self):
+        assert score_mean_tolerance(0) == 0.0
+        assert score_mean_tolerance(-1) == 0.0
+
+    def test_tolerance_scaling(self):
+        assert score_mean_tolerance(1) == pytest.approx(1e-12)
+        assert score_mean_tolerance(2) == pytest.approx(0.01 + 1e-12)
+        assert score_mean_tolerance(3) == pytest.approx(0.02 + 1e-12)
+        assert score_mean_tolerance(7) == pytest.approx(0.06 + 1e-12)
 
 
 class TestConfidenceFromProbabilities:

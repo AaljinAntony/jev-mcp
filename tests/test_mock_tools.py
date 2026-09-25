@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import pytest
 
-from jev_errors import JevValidationError
+from jev_errors import JevToolError, JevValidationError
 from typesafe_sdk import (
     ChoiceAnswer,
     NoulAnswer,
@@ -75,7 +75,9 @@ class TestGuardrailTool:
             "execute_system_one",
             lambda *a, **k: _fake_response({"is_destructive": NoulAnswer(noul=0.1)}),
         )
-        envelope = jev_mcp._run("guardrail_command", lambda: jev_engine.verify_command("x"))
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp._run("guardrail_command", lambda: jev_engine.verify_command("x"))
+        envelope = exc_info.value.envelope
         assert "error" in envelope
         assert envelope["error"]["code"] == "INVALID_RESPONSE"
         assert "safe" not in envelope
@@ -140,13 +142,64 @@ class TestSearchAgentSkills:
         assert result["count"] == 0
         assert result["resources"] == []
 
+    def test_dict_shaped_answer_sibling_augmentation(self, tmp_path, monkeypatch):
+        skills = tmp_path / ".agents" / "skills"
+        (skills / "opt_a").mkdir(parents=True)
+        (skills / "opt_b").mkdir(parents=True)
+        f_a = skills / "opt_a" / "SKILL.md"
+        f_b = skills / "opt_b" / "SKILL.md"
+        f_a.write_text("# Skill A", encoding="utf-8")
+        f_b.write_text("# Skill B", encoding="utf-8")
+        rel_a = f_a.relative_to(tmp_path).as_posix()
+        rel_b = f_b.relative_to(tmp_path).as_posix()
+
+        raw_res = SystemOneResponse(
+            model="jev-test",
+            answers={
+                "primary": {
+                    "type": "choice",
+                    "choice": rel_a,
+                    "confidence": 0.8,
+                    "probabilities": {rel_a: 0.8, rel_b: 0.2},
+                },
+                "secondary": {
+                    "type": "choice",
+                    "choice": "none",
+                    "confidence": 0.5,
+                    "probabilities": {rel_a: 0.0, rel_b: 0.0, "none": 1.0},
+                },
+            },
+            usage=Usage(input_tokens=10, output_tokens=5),
+        )
+        fitted_mock = {
+            "truncated": False,
+            "coverage": {
+                "complete": True,
+                "original_chars": 50,
+                "evaluated_chars": 50,
+                "estimated_tokens": {"state": 10, "questions": 5, "longest_question": 5},
+                "estimator": "chars/4",
+            },
+        }
+        cfg_mock = jev_engine.get_config()
+
+        monkeypatch.setattr(jev_engine, "_request", lambda state, questions: (raw_res, fitted_mock, cfg_mock))
+
+        res = jev_engine.find_agent_resources("task", str(tmp_path))
+        assert res["matched"] is True
+        resource_files = [r["file"] for r in res["resources"]]
+        assert rel_a in resource_files
+        assert rel_b in resource_files
+
     def test_root_dir_nonexistent_returns_empty(self):
         """Non-existent root_dir is rejected as invalid input by guardrails."""
         with pytest.raises(JevValidationError):
             jev_engine.find_agent_resources("anything", "/nonexistent/path/12345")
-        res = jev_mcp.search_agent_skills("anything", "/nonexistent/path/12345")
-        assert "error" in res
-        assert res["error"]["code"] == "INVALID_INPUT"
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp.search_agent_skills("anything", "/nonexistent/path/12345")
+        data = json.loads(str(exc_info.value))
+        assert "error" in data
+        assert data["error"]["code"] == "INVALID_INPUT"
 
     def test_symlink_outside_root_skipped(self, tmp_path):
         """Files reached via symlinks outside root should not crash relative_to()."""
@@ -361,10 +414,12 @@ class TestInputLengthGuardrails:
 
     def test_mcp_tool_oversized_returns_error_envelope(self):
         huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
-        res = jev_mcp.guardrail_command(huge)
-        assert "error" in res
-        assert res["error"]["code"] == "INVALID_INPUT"
-        assert res["error"]["retryable"] is False
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp.guardrail_command(huge)
+        data = json.loads(str(exc_info.value))
+        assert "error" in data
+        assert data["error"]["code"] == "INVALID_INPUT"
+        assert data["error"]["retryable"] is False
 
 
 class TestRootDirGuardrails:
@@ -415,10 +470,12 @@ class TestRootDirGuardrails:
 
     def test_mcp_search_skills_system_dir_returns_error_envelope(self):
         sys_root = "C:\\" if os.name == "nt" else "/"
-        res = jev_mcp.search_agent_skills("task", sys_root)
-        assert "error" in res
-        assert res["error"]["code"] == "INVALID_INPUT"
-        assert res["error"]["retryable"] is False
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp.search_agent_skills("task", sys_root)
+        data = json.loads(str(exc_info.value))
+        assert "error" in data
+        assert data["error"]["code"] == "INVALID_INPUT"
+        assert data["error"]["retryable"] is False
 
 
 class TestSettingsLookup:
@@ -463,19 +520,22 @@ class TestInputValidation:
     def test_oversized_command_returns_error(self):
         """Commands exceeding MAX_INPUT_CHARS should return INVALID_INPUT."""
         huge_command = "x" * 200_000
-        # This should be caught by _run() and returned as an error envelope
-        result = jev_mcp._run(
-            "guardrail_command",
-            lambda: jev_engine.verify_command(huge_command),
-        )
+        # This should be caught by _run() and raised as JevToolError
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp._run(
+                "guardrail_command",
+                lambda: jev_engine.verify_command(huge_command),
+            )
+        result = exc_info.value.envelope
         assert "error" in result
         assert result["error"]["code"] == "INVALID_INPUT"
-
     def test_oversized_task_returns_error(self):
         huge_task = "x" * 200_000
-        result = jev_mcp._run(
-            "select_model_tier",
-            lambda: jev_engine.select_model_tier(huge_task),
-        )
+        with pytest.raises(JevToolError) as exc_info:
+            jev_mcp._run(
+                "select_model_tier",
+                lambda: jev_engine.select_model_tier(huge_task),
+            )
+        result = exc_info.value.envelope
         assert "error" in result
         assert result["error"]["code"] == "INVALID_INPUT"

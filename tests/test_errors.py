@@ -20,7 +20,13 @@ from typesafe_sdk import (
     TypeSafeAPIError,
     TypeSafeAPIResponseValidationError,
     TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
+    TypeSafeBadRequestError,
     TypeSafeError,
+    TypeSafeNotFoundError,
+    TypeSafePermissionDeniedError,
+    TypeSafeRateLimitError,
+    TypeSafeUnprocessableEntityError,
 )
 
 
@@ -173,6 +179,40 @@ class TestSDKExceptionOrdering:
         assert envelope["code"] == "API_ERROR"
         assert envelope["retryable"] is True
         assert "Could not connect to TypeSafe" in envelope["message"]
+
+    @pytest.mark.parametrize(
+        "exc_factory,expected_code,expected_retryable",
+        [
+            (lambda: TypeSafeAuthenticationError(status=401, body=None, headers={}), "AUTH_ERROR", False),
+            (lambda: TypeSafePermissionDeniedError(status=403, body=None, headers={}), "FORBIDDEN", False),
+            (lambda: TypeSafeBadRequestError(status=400, body=None, headers={}), "INVALID_INPUT", False),
+            (lambda: TypeSafeUnprocessableEntityError(status=422, body=None, headers={}), "INVALID_INPUT", False),
+            (lambda: TypeSafeNotFoundError(status=404, body=None, headers={}), "API_ERROR", False),
+            (lambda: TypeSafeRateLimitError(status=429, body=None, headers={}), "RATE_LIMITED", True),
+        ],
+    )
+    def test_sdk_status_subclasses_mapped_correctly(self, exc_factory, expected_code, expected_retryable):
+        err = exc_factory()
+        result = error_details(err)
+        assert result["code"] == expected_code
+        assert result["retryable"] is expected_retryable
+
+    def test_response_validation_error_does_not_leak_endpoint_or_request_id(self):
+        err = TypeSafeAPIResponseValidationError(
+            status=200,
+            body={"error": "missing field"},
+            headers={"x-typesafe-request-id": "req_sensitive_12345"},
+            field_path="answers.q.confidence",
+            endpoint="POST /v1/system_one",
+        )
+        assert "POST /v1/system_one" in str(err)
+        assert "req_sensitive_12345" in str(err)
+        result = error_details(err)
+        assert result["code"] == "INVALID_RESPONSE"
+        assert result["retryable"] is False
+        assert "answers.q.confidence" in result["message"]
+        assert "POST /v1/system_one" not in result["message"]
+        assert "req_sensitive_12345" not in result["message"]
 
 
 class TestClientRetryPolicy:

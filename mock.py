@@ -19,6 +19,7 @@ from typesafe_sdk import (
 
 from limits import estimate_tokens, stringify_state
 from policy import confidence_from_probabilities
+from jev_validation import _assert_finite_json
 
 
 def _as_text(value) -> str:
@@ -142,7 +143,7 @@ def mock_system_one(state, questions, model="jev-latest"):
         else:
             raise ValueError(f"mock cannot answer question type {qtype!r}")
 
-    return SystemOneResponse(
+    res = SystemOneResponse(
         model=f"{model}+mock",
         answers=answers,
         usage=Usage(
@@ -150,3 +151,5 @@ def mock_system_one(state, questions, model="jev-latest"):
             output_tokens=len(questions) * 8,
         ),
     )
+    _assert_finite_json(res)
+    return res

@@ -21,8 +21,9 @@ from jev_engine import (
     select_model_tier as _engine_select_model_tier,
     load_jev_settings,
 )
-from jev_errors import error_details
+from jev_errors import JevToolError, error_details
 from jev_logging import log_tool_call, log_event, log_exception, log_path
+from jev_validation import _assert_finite_json
 
 mcp = FastMCP("jev-engine")
 
@@ -56,13 +57,15 @@ def _run(tool: str, fn, **args):
     start = time.perf_counter()
     try:
         result = fn()
+        _assert_finite_json(result)
         log_tool_call(tool, (time.perf_counter() - start) * 1000, args=args, result=result)
         return result
     except Exception as err:
         envelope = {"error": error_details(err)}
-        log_tool_call(tool, (time.perf_counter() - start) * 1000, args=args, error=envelope)
+        ms = (time.perf_counter() - start) * 1000
+        log_tool_call(tool, ms, args=args, error=envelope)
         log_exception("tool_error", err, tool=tool, args=args)
-        return envelope
+        raise JevToolError(envelope) from err
 
 
 @mcp.tool()

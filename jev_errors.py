@@ -6,13 +6,27 @@ exception taxonomy plus `error_details()` that turns any exception into a
 so a bad decision never masquerades as `safe:true`.
 """
 
+import json
+
 from typesafe_sdk import (
     TypeSafeAPIConnectionError,
     TypeSafeAPIError,
     TypeSafeAPIResponseValidationError,
     TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
+    TypeSafeBadRequestError,
     TypeSafeError,
+    TypeSafeNotFoundError,
+    TypeSafePermissionDeniedError,
+    TypeSafeRateLimitError,
+    TypeSafeUnprocessableEntityError,
 )
+
+try:
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:
+    class ToolError(Exception):
+        pass
 
 #: Provider status codes that are worth retrying: 408 (timeout), 429 (rate
 #: limit) and any 5xx (server fault).
@@ -47,6 +61,18 @@ class JevCancelledError(Exception):
     """The tool request was cancelled."""
 
 
+class JevToolError(ToolError):
+    """A typed Jev failure that must reach the client as isError=true.
+
+    The JSON envelope is embedded in the message so the structured body
+    survives the SDK's string-only error text.
+    """
+
+    def __init__(self, envelope: dict) -> None:
+        super().__init__(json.dumps(envelope, ensure_ascii=False))
+        self.envelope = envelope
+
+
 def _retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUSES or status >= 500
 
@@ -56,8 +82,14 @@ def error_details(err: Exception) -> dict:
 
     Ordering is critical based on the SDK inheritance tree:
       TypeSafeError (base)
-        ├── TypeSafeAPIError (HTTP status) -> check after ResponseValidationError
-        │     └── TypeSafeAPIResponseValidationError -> check BEFORE TypeSafeAPIError
+        ├── TypeSafeAPIError (HTTP status) -> check after ResponseValidationError & status subclasses
+        │     ├── TypeSafeAPIResponseValidationError -> check BEFORE TypeSafeAPIError
+        │     ├── TypeSafeAuthenticationError -> check BEFORE TypeSafeAPIError
+        │     ├── TypeSafePermissionDeniedError -> check BEFORE TypeSafeAPIError
+        │     ├── TypeSafeBadRequestError -> check BEFORE TypeSafeAPIError
+        │     ├── TypeSafeUnprocessableEntityError -> check BEFORE TypeSafeAPIError
+        │     ├── TypeSafeNotFoundError -> check BEFORE TypeSafeAPIError
+        │     └── TypeSafeRateLimitError -> check BEFORE TypeSafeAPIError
         └── TypeSafeAPIConnectionError (network) -> check BEFORE TypeSafeError
               └── TypeSafeAPITimeoutError -> check BEFORE TypeSafeAPIConnectionError
     """
@@ -84,13 +116,38 @@ def error_details(err: Exception) -> dict:
             "retryable": True,
         }
     if isinstance(err, TypeSafeAPIResponseValidationError):
-        return {"code": "INVALID_RESPONSE", "message": str(err), "retryable": False}
+        # field_path names the offending field and is safe; str(err) also
+        # carries the endpoint URL and request id, which must not be relayed.
+        field_path = getattr(err, "field_path", None)
+        path_str = f" (at {field_path!r})" if field_path else ""
+        return {
+            "code": "INVALID_RESPONSE",
+            "message": f"TypeSafe returned a response this server could not accept{path_str}.",
+            "retryable": False,
+        }
+    if isinstance(err, TypeSafeAuthenticationError):
+        return {
+            "code": "AUTH_ERROR",
+            "message": "TypeSafe rejected the API key. Check TYPESAFE_API_KEY.",
+            "retryable": False,
+        }
+    if isinstance(err, TypeSafePermissionDeniedError):
+        return {"code": "FORBIDDEN", "message": "TypeSafe denied access to this resource.", "retryable": False}
+    if isinstance(err, TypeSafeBadRequestError):
+        return {"code": "INVALID_INPUT", "message": "TypeSafe rejected the request as malformed.", "retryable": False}
+    if isinstance(err, TypeSafeUnprocessableEntityError):
+        return {"code": "INVALID_INPUT", "message": "TypeSafe rejected the request payload.", "retryable": False}
+    if isinstance(err, TypeSafeNotFoundError):
+        return {"code": "API_ERROR", "message": f"TypeSafe resource not found (HTTP {getattr(err, 'status', 404)}).", "retryable": False}
+    if isinstance(err, TypeSafeRateLimitError):
+        return {"code": "RATE_LIMITED", "message": "TypeSafe rate limit reached.", "retryable": True}
     # Provider errors can carry response bodies or request metadata; do not relay them.
     if isinstance(err, TypeSafeAPIError):
+        status = getattr(err, "status", 500)
         return {
             "code": "API_ERROR",
-            "message": f"TypeSafe API request failed (HTTP {err.status}).",
-            "retryable": _retryable_status(err.status),
+            "message": f"TypeSafe API request failed (HTTP {status}).",
+            "retryable": _retryable_status(status),
         }
     if isinstance(err, TypeSafeAPIConnectionError):
         return {"code": "API_ERROR", "message": "Could not connect to TypeSafe.", "retryable": True}
@@ -101,4 +158,4 @@ def error_details(err: Exception) -> dict:
 
 def error_message(err: Exception) -> str:
     """Shortcut returning just the envelope message."""
-    return error_details(err)["message"]
+    return error_details(err)["message"]
