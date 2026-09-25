@@ -17,7 +17,7 @@ except ImportError:
     pass
 
 # Direct imports from the active virtual environment SDK
-from typesafe_sdk import TypeSafeClient, Choice, Noul, Score
+from typesafe_sdk import TypeSafeClient, Choice, Noul, Score, RetryPolicy
 from typesafe_sdk import (
     TypeSafeAPIConnectionError,
     TypeSafeAPIResponseValidationError,
@@ -151,7 +151,16 @@ def get_client() -> Optional[TypeSafeClient]:
         return None
     if not cfg.api_key:
         raise JevConfigError("TYPESAFE_API_KEY environment variable is not configured.")
-    return TypeSafeClient(api_key=cfg.api_key, timeout=cfg.timeout_ms / 1000.0)
+    return TypeSafeClient(
+        api_key=cfg.api_key,
+        timeout=cfg.timeout_ms / 1000.0,
+        retry=RetryPolicy(
+            max_retries=2,
+            backoff_initial=0.5,
+            backoff_max=5.0,
+            backoff_jitter=0.25,
+        ),
+    )
 
 
 def execute_system_one(client, state: Any, questions: dict) -> Any:

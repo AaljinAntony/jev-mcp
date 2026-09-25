@@ -192,8 +192,8 @@ This means a single transient HTTP error (429 rate limit, 502 bad gateway, 503 s
 
 ## Checklist
 
-- [ ] `jev_errors.py`: Move `TypeSafeAPIResponseValidationError` check before `TypeSafeAPIError`
-- [ ] Add `tests/test_errors.py` with 4 error-ordering tests
-- [ ] `jev_engine.py` line 20: Add `RetryPolicy` to imports
-- [ ] `jev_engine.py` `get_client()`: Pass `RetryPolicy(max_retries=2, ...)`
-- [ ] Run `pytest tests/ -v` — all tests green
+- [x] `jev_errors.py`: Move `TypeSafeAPIResponseValidationError` check before `TypeSafeAPIError`
+- [x] Add `tests/test_errors.py` with 4 error-ordering tests
+- [x] `jev_engine.py` line 20: Add `RetryPolicy` to imports
+- [x] `jev_engine.py` `get_client()`: Pass `RetryPolicy(max_retries=2, ...)`
+- [x] Run `pytest tests/ -v` — all tests green

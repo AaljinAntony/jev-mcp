@@ -54,9 +54,11 @@ def _retryable_status(status: int) -> bool:
 def error_details(err: Exception) -> dict:
     """Map any exception to a `{code, message, retryable}` envelope.
 
-    Ordering matters: `TypeSafeAPITimeoutError` subclasses
-    `TypeSafeAPIConnectionError` and `TimeoutError`, so it must be checked
-    before the generic connection branch.
+    Ordering matters:
+    - `TypeSafeAPITimeoutError` subclasses `TypeSafeAPIConnectionError` and `TimeoutError`,
+      so it must be checked before the generic connection branch.
+    - `TypeSafeAPIResponseValidationError` subclasses `TypeSafeAPIError`, so it must be
+      checked before the generic `TypeSafeAPIError` branch.
     """
     if isinstance(err, JevBudgetError):
         return {"code": "INPUT_TOO_LARGE", "message": str(err), "retryable": False}
@@ -80,6 +82,8 @@ def error_details(err: Exception) -> dict:
             "message": "The tool request timed out. Reduce the request size or increase JEV_MCP_TIMEOUT_MS.",
             "retryable": True,
         }
+    if isinstance(err, TypeSafeAPIResponseValidationError):
+        return {"code": "INVALID_RESPONSE", "message": str(err), "retryable": False}
     # Provider errors can carry response bodies or request metadata; do not relay them.
     if isinstance(err, TypeSafeAPIError):
         return {
@@ -87,8 +91,6 @@ def error_details(err: Exception) -> dict:
             "message": f"TypeSafe API request failed (HTTP {err.status}).",
             "retryable": _retryable_status(err.status),
         }
-    if isinstance(err, TypeSafeAPIResponseValidationError):
-        return {"code": "INVALID_RESPONSE", "message": str(err), "retryable": False}
     if isinstance(err, TypeSafeAPIConnectionError):
         return {"code": "API_ERROR", "message": "Could not connect to TypeSafe.", "retryable": True}
     if isinstance(err, TypeSafeError):
