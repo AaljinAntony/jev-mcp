@@ -7,7 +7,7 @@ from typesafe_sdk import (
     TypeSafeAPITimeoutError,
 )
 from jev_errors import error_details
-from jev_engine import get_client
+from jev_engine import get_client, _reset_client_cache
 
 
 class TestErrorDetails:
@@ -58,3 +58,69 @@ class TestClientRetryPolicy:
         assert retry_policy.backoff_initial == 0.5
         assert retry_policy.backoff_max == 5.0
         assert retry_policy.backoff_jitter == 0.25
+
+
+class TestClientCache:
+    def test_client_is_cached_across_calls(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "test-key-cache")
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        _reset_client_cache()
+        c1 = get_client()
+        c2 = get_client()
+        assert c1 is not None
+        assert c1 is c2
+
+    def test_client_cache_invalidates_on_key_change(self, monkeypatch):
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-1")
+        _reset_client_cache()
+        c1 = get_client()
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-2")
+        c2 = get_client()
+        assert c1 is not None
+        assert c2 is not None
+        assert c1 is not c2
+
+    def test_client_cache_invalidates_on_timeout_change(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-timeout")
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        monkeypatch.setenv("JEV_MCP_TIMEOUT_MS", "30000")
+        _reset_client_cache()
+        c1 = get_client()
+        monkeypatch.setenv("JEV_MCP_TIMEOUT_MS", "60000")
+        c2 = get_client()
+        assert c1 is not c2
+
+    def test_client_cache_invalidates_on_model_change(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-model")
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        monkeypatch.setenv("JEV_MCP_MODEL", "model-a")
+        _reset_client_cache()
+        c1 = get_client()
+        monkeypatch.setenv("JEV_MCP_MODEL", "model-b")
+        c2 = get_client()
+        assert c1 is not c2
+
+    def test_mock_mode_clears_cache_and_returns_none(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-mock")
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        _reset_client_cache()
+        c1 = get_client()
+        assert c1 is not None
+        monkeypatch.setenv("JEV_MCP_MOCK", "1")
+        c2 = get_client()
+        assert c2 is None
+        # And when switching back to non-mock, a new client is created
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        c3 = get_client()
+        assert c3 is not None
+        assert c3 is not c1
+
+    def test_reset_client_cache_clears_cache(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "key-reset")
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        _reset_client_cache()
+        c1 = get_client()
+        _reset_client_cache()
+        c2 = get_client()
+        assert c1 is not c2

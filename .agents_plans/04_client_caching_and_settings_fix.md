@@ -170,8 +170,8 @@ def _find_config_files() -> List[Path]:
 
 ## Checklist
 
-- [ ] `jev_engine.py`: Replace `get_client()` with cached version (including `_cached_client`, `_cached_client_key`, and `_reset_client_cache()`)
-- [ ] `jev_engine.py`: Update `_find_settings_files()` to include script directory
-- [ ] `jev_engine.py`: Update `_find_config_files()` to include script directory
-- [ ] Run `pytest tests/ -v` — all tests green
-- [ ] Manual test: start the MCP server from a different directory and verify it still finds `jevs_settings.json`
+- [x] `jev_engine.py`: Replace `get_client()` with cached version (including `_cached_client`, `_cached_client_key`, and `_reset_client_cache()`)
+- [x] `jev_engine.py`: Update `_find_settings_files()` to include script directory
+- [x] `jev_engine.py`: Update `_find_config_files()` to include script directory
+- [x] Run `pytest tests/ -v` — all tests green
+- [x] Manual test: start the MCP server from a different directory and verify it still finds `jevs_settings.json`

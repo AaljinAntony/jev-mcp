@@ -89,10 +89,19 @@ def _validate_root_dir(root_dir: str) -> Path:
 def _find_settings_files() -> List[Path]:
     """Locate jevs_settings.json candidates: project-level first, user-level last."""
     candidates = []
+    # 1. Check cwd (for when invoked from the project root)
     for name in ("jevs_settings.json", ".opencode/jevs_settings.json"):
         local = Path.cwd() / name
         if local.exists():
             candidates.append(local)
+    # 2. Check script directory (the repo root, cwd-independent)
+    script_dir = Path(__file__).resolve().parent
+    if script_dir != Path.cwd().resolve():
+        for name in ("jevs_settings.json", ".opencode/jevs_settings.json"):
+            script_local = script_dir / name
+            if script_local.exists() and script_local not in candidates:
+                candidates.append(script_local)
+    # 3. User-level config
     user = Path.home() / ".config" / "opencode" / "jevs_settings.json"
     if user.exists():
         candidates.append(user)
@@ -106,6 +115,12 @@ def _find_config_files() -> List[Path]:
         local = Path.cwd() / name
         if local.exists():
             candidates.append(local)
+    script_dir = Path(__file__).resolve().parent
+    if script_dir != Path.cwd().resolve():
+        for name in ("opencode.json", ".opencode/opencode.json"):
+            script_local = script_dir / name
+            if script_local.exists() and script_local not in candidates:
+                candidates.append(script_local)
     user = Path.home() / ".config" / "opencode" / "opencode.json"
     if user.exists():
         candidates.append(user)
@@ -177,18 +192,42 @@ def get_scan_paths(root: Path) -> List[Path]:
     return paths
 
 
+# Module-level cache
+_cached_client: Optional[TypeSafeClient] = None
+_cached_client_key: Optional[tuple] = None
+
+
+def _reset_client_cache() -> None:
+    """Clear the cached client. Exposed for tests."""
+    global _cached_client, _cached_client_key
+    _cached_client = None
+    _cached_client_key = None
+
+
 def get_client() -> Optional[TypeSafeClient]:
     """Return a configured TypeSafe client, or None in mock mode.
 
+    Caches the client and reuses it across calls as long as the
+    configuration (api_key, model, mock, timeout) hasn't changed.
     Raises `JevConfigError` when `TYPESAFE_API_KEY` is missing (unless
     `JEV_MCP_MOCK=1`, which never needs a key).
     """
+    global _cached_client, _cached_client_key
+
     cfg = get_config()
     if cfg.mock:
+        _cached_client = None
+        _cached_client_key = None
         return None
     if not cfg.api_key:
         raise JevConfigError("TYPESAFE_API_KEY environment variable is not configured.")
-    return TypeSafeClient(
+
+    # Cache key: invalidate when any client-relevant config changes
+    cache_key = (cfg.api_key, cfg.timeout_ms, cfg.model)
+    if _cached_client is not None and _cached_client_key == cache_key:
+        return _cached_client
+
+    _cached_client = TypeSafeClient(
         api_key=cfg.api_key,
         timeout=cfg.timeout_ms / 1000.0,
         retry=RetryPolicy(
@@ -198,6 +237,8 @@ def get_client() -> Optional[TypeSafeClient]:
             backoff_jitter=0.25,
         ),
     )
+    _cached_client_key = cache_key
+    return _cached_client
 
 
 def execute_system_one(client, state: Any, questions: dict) -> Any:

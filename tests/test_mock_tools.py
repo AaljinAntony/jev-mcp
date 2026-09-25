@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import pytest
 
 from jev_errors import JevValidationError
@@ -301,3 +302,41 @@ class TestRootDirGuardrails:
         assert "error" in res
         assert res["error"]["code"] == "INVALID_INPUT"
         assert res["error"]["retryable"] is False
+
+
+class TestSettingsLookup:
+    def test_find_settings_files_includes_script_dir_when_cwd_differs(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        candidates = jev_engine._find_settings_files()
+        script_dir = Path(jev_engine.__file__).resolve().parent
+        expected = script_dir / "jevs_settings.json"
+        if expected.exists():
+            assert expected in candidates
+
+    def test_find_settings_files_cwd_precedes_script_dir(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        local_settings = tmp_path / "jevs_settings.json"
+        local_settings.write_text('{"enable_model_routing": true}', encoding="utf-8")
+        candidates = jev_engine._find_settings_files()
+        assert candidates[0] == local_settings
+        script_dir = Path(jev_engine.__file__).resolve().parent
+        expected_script = script_dir / "jevs_settings.json"
+        if expected_script.exists():
+            assert expected_script in candidates
+            assert candidates.index(local_settings) < candidates.index(expected_script)
+
+    def test_find_config_files_includes_script_dir(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        candidates = jev_engine._find_config_files()
+        script_dir = Path(jev_engine.__file__).resolve().parent
+        expected = script_dir / "opencode.json"
+        if expected.exists():
+            assert expected in candidates
+
+    def test_load_jev_settings_finds_script_dir_settings_from_different_cwd(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        settings = jev_engine.load_jev_settings()
+        script_dir = Path(jev_engine.__file__).resolve().parent
+        expected_file = script_dir / "jevs_settings.json"
+        if expected_file.exists():
+            assert settings["source"] == str(expected_file)
