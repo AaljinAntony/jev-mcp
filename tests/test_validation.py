@@ -195,3 +195,70 @@ class TestFailures:
         }
         with pytest.raises(JevResponseError):
             validate_response(raw, _noul_questions())
+
+    def test_missing_answers_object_rejected(self):
+        raw = {
+            "model": "jev-latest",
+            "usage": {"input_tokens": 10, "output_tokens": 6},
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(raw, _noul_questions())
+
+    def test_empty_questions_rejected(self):
+        raw = {
+            "model": "jev-latest",
+            "answers": {},
+            "usage": {"input_tokens": 10, "output_tokens": 6},
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(raw, {})
+
+    def test_empty_score_rubric_rejected(self):
+        questions = {"q": Score(criteria=[], instructions="Empty rubric")}
+        answers = {
+            "q": {
+                "type": "score",
+                "score": 0.0,
+                "confidence": 0.8,
+                "probabilities": {},
+                "legend": {},
+            }
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(_response(answers), questions)
+
+    def test_score_out_of_range_rejected(self):
+        questions = {"q": Score(criteria=["low", "high"], instructions="Rate")}
+        answers = {
+            "q": {
+                "type": "score",
+                "score": 5.0,
+                "confidence": 0.8,
+                "probabilities": {0: 0.5, 1: 0.5},
+                "legend": {0: "low", 1: "high"},
+            }
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(_response(answers), questions)
+
+    def test_negative_usage_tokens_rejected(self):
+        raw = {
+            "model": "jev-latest",
+            "answers": _noul_answers(),
+            "usage": {"input_tokens": -5, "output_tokens": 6},
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(raw, _noul_questions())
+
+    def test_invalid_confidence_rejected(self):
+        questions = _choice_questions()
+        answers = {
+            "primary": {
+                "type": "choice",
+                "choice": "a.md",
+                "confidence": 1.5,
+                "probabilities": {"a.md": 0.9, "b.md": 0.1},
+            }
+        }
+        with pytest.raises(JevResponseError):
+            validate_response(_response(answers), questions)

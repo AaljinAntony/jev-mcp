@@ -270,10 +270,11 @@ class TestInputValidation:
 
 ## Checklist
 
-- [ ] Create `tests/test_errors.py` with `TestErrorDetailsMapping`, `TestSDKExceptionOrdering`, `TestErrorMessage`
-- [ ] `tests/test_mock_tools.py`: Add `test_root_dir_nonexistent_returns_empty` to `TestSearchAgentSkills`
-- [ ] `tests/test_mock_tools.py`: Add `test_symlink_outside_root_skipped` to `TestSearchAgentSkills`
-- [ ] `tests/test_mock_tools.py`: Add `test_verify_command_logs_round` to `TestGuardrailTool` (skip if Phase 2 not done)
-- [ ] `tests/test_mock_tools.py`: Add `test_empty_command` and `test_empty_task`
-- [ ] After Phase 3: Add `TestInputValidation` class
-- [ ] Run `pytest tests/ -v` — all tests green
+- [x] Create `tests/test_errors.py` with `TestErrorDetailsMapping`, `TestSDKExceptionOrdering`, `TestErrorMessage`
+- [x] `tests/test_mock_tools.py`: Add `test_root_dir_nonexistent_returns_empty` to `TestSearchAgentSkills`
+- [x] `tests/test_mock_tools.py`: Add `test_symlink_outside_root_skipped` to `TestSearchAgentSkills`
+- [x] `tests/test_mock_tools.py`: Add `test_verify_command_logs_round` to `TestGuardrailTool` (skip if Phase 2 not done)
+- [x] `tests/test_mock_tools.py`: Add `test_empty_command` and `test_empty_task`
+- [x] After Phase 3: Add `TestInputValidation` class
+- [x] Run `pytest tests/ -v` — all tests green
+

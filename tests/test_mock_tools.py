@@ -84,6 +84,24 @@ class TestGuardrailTool:
         result = jev_engine.verify_command("git status")
         json.dumps(result)  # must not raise
 
+    def test_verify_command_logs_round(self, monkeypatch):
+        """After BUG-2 fix, verify_command should log a round via _request()."""
+        logged = []
+        original_log_round = jev_engine.log_round
+        monkeypatch.setattr(
+            jev_engine,
+            "log_round",
+            lambda *a, **kw: logged.append(kw) or original_log_round(*a, **kw),
+        )
+        jev_engine.verify_command("git status")
+        assert len(logged) >= 1, "verify_command should call log_round via _request()"
+
+    def test_empty_command(self):
+        """Empty command should still return a valid envelope."""
+        result = jev_engine.verify_command("")
+        assert "safe" in result
+        assert "action" in result
+
 
 class TestSearchAgentSkills:
     def test_mock_offline_with_files(self, tmp_path, monkeypatch):
@@ -121,6 +139,32 @@ class TestSearchAgentSkills:
         assert result["matched"] is False
         assert result["count"] == 0
         assert result["resources"] == []
+
+    def test_root_dir_nonexistent_returns_empty(self):
+        """Non-existent root_dir is rejected as invalid input by guardrails."""
+        with pytest.raises(JevValidationError):
+            jev_engine.find_agent_resources("anything", "/nonexistent/path/12345")
+        res = jev_mcp.search_agent_skills("anything", "/nonexistent/path/12345")
+        assert "error" in res
+        assert res["error"]["code"] == "INVALID_INPUT"
+
+    def test_symlink_outside_root_skipped(self, tmp_path):
+        """Files reached via symlinks outside root should not crash relative_to()."""
+        skills = tmp_path / ".agents" / "skills" / "symlinked"
+        skills.mkdir(parents=True)
+        # Create a symlink pointing outside tmp_path
+        external = tmp_path.parent / "external_skill"
+        external.mkdir(exist_ok=True)
+        (external / "SKILL.md").write_text("# External", encoding="utf-8")
+        try:
+            link = skills / "ext_link"
+            link.symlink_to(external)
+        except OSError:
+            pytest.skip("Cannot create symlinks on this OS/filesystem")
+        # Should not raise ValueError from relative_to()
+        result = jev_engine.find_agent_resources("external skill", str(tmp_path))
+        # Result should work, just might not include the external file
+        assert isinstance(result["matched"], bool)
 
 
 class TestSearchTargetFiles:
@@ -225,6 +269,12 @@ class TestSearchTargetFiles:
         result = jev_engine.select_target_files("edit git_discovered", str(tmp_path))
         assert result["matched"] is True
         assert result["files"] == ["git_discovered.py"]
+
+    def test_empty_task(self, tmp_path):
+        """Empty task should still return a valid envelope."""
+        (tmp_path / "file.py").write_text("pass", encoding="utf-8")
+        result = jev_engine.select_target_files("", str(tmp_path))
+        assert "matched" in result
 
 
 class TestSelectModelTier:
@@ -407,3 +457,25 @@ class TestSettingsLookup:
         expected_file = script_dir / "jevs_settings.json"
         if expected_file.exists():
             assert settings["source"] == str(expected_file)
+
+
+class TestInputValidation:
+    def test_oversized_command_returns_error(self):
+        """Commands exceeding MAX_INPUT_CHARS should return INVALID_INPUT."""
+        huge_command = "x" * 200_000
+        # This should be caught by _run() and returned as an error envelope
+        result = jev_mcp._run(
+            "guardrail_command",
+            lambda: jev_engine.verify_command(huge_command),
+        )
+        assert "error" in result
+        assert result["error"]["code"] == "INVALID_INPUT"
+
+    def test_oversized_task_returns_error(self):
+        huge_task = "x" * 200_000
+        result = jev_mcp._run(
+            "select_model_tier",
+            lambda: jev_engine.select_model_tier(huge_task),
+        )
+        assert "error" in result
+        assert result["error"]["code"] == "INVALID_INPUT"
