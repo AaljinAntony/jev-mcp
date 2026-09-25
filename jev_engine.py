@@ -5,17 +5,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-# Load .env if present
-try:
-    from dotenv import load_dotenv
-    env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.exists():
-        load_dotenv(dotenv_path=env_path, override=True)
-    else:
-        load_dotenv(override=True)
-except ImportError:
-    pass
-
 # Direct imports from the active virtual environment SDK
 from typesafe_sdk import TypeSafeClient, Choice, Noul, Score, RetryPolicy
 from typesafe_sdk import (
@@ -664,6 +653,8 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
         for p in root.rglob("*"):
             if any(ignored in p.parts for ignored in ignore_dirs):
                 continue
+            if p.is_symlink():
+                continue  # skip symlinks to prevent loops
             if p.is_file() and p.suffix.lower() not in ignore_exts:
                 candidates.append(p.relative_to(root).as_posix())
             if len(candidates) >= MAX_CHOICE_OPTIONS:
@@ -803,4 +794,6 @@ def _cli_dispatch(argv) -> int:
 
 
 if __name__ == "__main__":
+    from config import ensure_dotenv
+    ensure_dotenv()
     sys.exit(_cli_dispatch(sys.argv[1:]))

@@ -30,7 +30,16 @@ def log_path() -> Path:
 _logger: logging.Logger | None = None
 
 #: Values that look like credentials and must never be written to the log.
-_SECRET_MARKERS = ("sk-", "apikey_", "api_key=", "typesafe_api_key")
+_SECRET_MARKERS = (
+    "sk-",
+    "ts_",
+    "apikey_",
+    "api_key=",
+    "api_key:",
+    "typesafe_api_key",
+    "bearer ",
+    "authorization:",
+)
 
 
 def _redact(value) -> str:
@@ -39,6 +48,9 @@ def _redact(value) -> str:
     for marker in _SECRET_MARKERS:
         if marker in lowered:
             return "<redacted>"
+    # Heuristic: long alphanumeric strings that look like API keys
+    if len(text) > 40 and text.replace("-", "").replace("_", "").isalnum():
+        return "<redacted>"
     return text
 
 

@@ -3,21 +3,13 @@ import sys
 import time
 from pathlib import Path
 
-# Load environment variables
-try:
-    from dotenv import load_dotenv
-    env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.exists():
-        load_dotenv(dotenv_path=env_path, override=True)
-    else:
-        load_dotenv(override=True)
-except ImportError:
-    pass
-
-from mcp.server.mcpserver import MCPServer as FastMCP
-
 # Ensure the local directory is in Python's path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from config import ensure_dotenv
+ensure_dotenv()
+
+from mcp.server.mcpserver import MCPServer as FastMCP
 
 # Import tested logic from jev_engine
 from jev_engine import (

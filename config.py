@@ -7,11 +7,25 @@ every call so tests and live deployments can toggle `JEV_MCP_MOCK` freely.
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from jev_errors import JevConfigError
 
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_TIMEOUT_MS = 30_000
+
+
+def ensure_dotenv():
+    """Load .env if python-dotenv is available. Idempotent."""
+    try:
+        from dotenv import load_dotenv
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=True)
+        else:
+            load_dotenv(override=True)
+    except ImportError:
+        pass
 
 
 @dataclass(frozen=True)

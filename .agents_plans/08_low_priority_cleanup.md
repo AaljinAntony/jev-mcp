@@ -134,10 +134,10 @@ Remove the inline try/except dotenv blocks from both files.
 
 ## Checklist
 
-- [ ] `jev_engine.py`: Add `if p.is_symlink(): continue` to the `rglob` loop in `select_target_files()`
-- [ ] `jev_logging.py`: Expand `_SECRET_MARKERS` with `"ts_"`, `"bearer "`, `"authorization:"`
-- [ ] `jev_logging.py`: Add length-based heuristic to `_redact()`
-- [ ] `config.py`: Add `ensure_dotenv()` function
-- [ ] `jev_mcp.py`: Replace inline dotenv block with `from config import ensure_dotenv; ensure_dotenv()`
-- [ ] `jev_engine.py`: Remove inline dotenv block (lines 8–17), add `ensure_dotenv()` call in `__main__` only
-- [ ] Run `pytest tests/ -v` — all tests green
+- [x] `jev_engine.py`: Add `if p.is_symlink(): continue` to the `rglob` loop in `select_target_files()`
+- [x] `jev_logging.py`: Expand `_SECRET_MARKERS` with `"ts_"`, `"bearer "`, `"authorization:"`
+- [x] `jev_logging.py`: Add length-based heuristic to `_redact()`
+- [x] `config.py`: Add `ensure_dotenv()` function
+- [x] `jev_mcp.py`: Replace inline dotenv block with `from config import ensure_dotenv; ensure_dotenv()`
+- [x] `jev_engine.py`: Remove inline dotenv block (lines 8–17), add `ensure_dotenv()` call in `__main__` only
+- [x] Run `pytest tests/ -v` — all tests green
