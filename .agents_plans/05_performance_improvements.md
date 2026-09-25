@@ -288,9 +288,9 @@ This eliminates the `longest_question_tokens()` function call and its redundant 
 
 ## Checklist
 
-- [ ] `limits.py`: Replace `truncate_to_token_budget()` with direct character-budget calculation (or simpler iterative approach)
-- [ ] `jev_engine.py`: Add `_discover_files_git()` helper function
-- [ ] `jev_engine.py`: Update `select_target_files()` to try git first, fall back to rglob
-- [ ] `limits.py`: Optimize `fit_state()` to avoid redundant question serialization
-- [ ] Run `pytest tests/test_limits.py -v` — all tests green
-- [ ] Run `pytest tests/test_mock_tools.py -v` — all tests green
+- [x] `limits.py`: Replace `truncate_to_token_budget()` with direct character-budget calculation (or simpler iterative approach)
+- [x] `jev_engine.py`: Add `_discover_files_git()` helper function
+- [x] `jev_engine.py`: Update `select_target_files()` to try git first, fall back to rglob
+- [x] `limits.py`: Optimize `fit_state()` to avoid redundant question serialization
+- [x] Run `pytest tests/test_limits.py -v` — all tests green
+- [x] Run `pytest tests/test_mock_tools.py -v` — all tests green

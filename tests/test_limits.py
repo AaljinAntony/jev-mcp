@@ -65,3 +65,78 @@ class TestFitState:
     def test_questions_over_budget_raise(self):
         with pytest.raises(JevBudgetError):
             fit_state("x", {"q": {"type": "noul", "instructions": "y" * 400_000}})
+
+    def test_fit_state_non_dict_questions(self):
+        result = fit_state("hello", None)
+        assert result["state"] == "hello"
+        assert result["coverage"]["estimated_tokens"]["questions"] == 0
+        assert result["coverage"]["estimated_tokens"]["longest_question"] == 0
+
+
+class TestCharBudgetForTokens:
+    def test_zero_or_negative_budget(self):
+        from limits import _char_budget_for_tokens
+        assert _char_budget_for_tokens("hello", 0) == 0
+        assert _char_budget_for_tokens("hello", -5) == 0
+
+    def test_ascii_budget_calculation(self):
+        from limits import _char_budget_for_tokens
+        # marker is 4 tokens. For budget = 10, available = 6. 6 / 0.25 = 24 ascii chars.
+        text = "a" * 100
+        assert _char_budget_for_tokens(text, 10) == 24
+
+    def test_non_ascii_budget_calculation(self):
+        from limits import _char_budget_for_tokens
+        # marker is 4 tokens. For budget = 10, available = 6. 6 / 1.0 = 6 non-ascii chars.
+        text = "é" * 100
+        assert _char_budget_for_tokens(text, 10) == 6
+
+
+class TestTruncateToTokenBudget:
+    def test_zero_or_negative_budget_returns_empty(self):
+        from limits import truncate_to_token_budget
+        assert truncate_to_token_budget("hello", 0) == ""
+        assert truncate_to_token_budget("hello", -1) == ""
+
+    def test_text_already_within_budget_returns_unchanged(self):
+        from limits import truncate_to_token_budget
+        assert truncate_to_token_budget("hello", 10) == "hello"
+
+    def test_ascii_truncation_fits_budget(self):
+        from limits import truncate_to_token_budget
+        text = "a" * 500
+        truncated = truncate_to_token_budget(text, 20)
+        assert truncated.endswith(TRUNCATION_MARKER)
+        assert estimate_tokens(truncated) <= 20
+
+    def test_non_ascii_truncation_fits_budget(self):
+        from limits import truncate_to_token_budget
+        text = "é" * 100
+        truncated = truncate_to_token_budget(text, 15)
+        assert truncated.endswith(TRUNCATION_MARKER)
+        assert estimate_tokens(truncated) <= 15
+
+    def test_mixed_text_truncation_fits_budget(self):
+        from limits import truncate_to_token_budget
+        text = ("abc" + "é" + "def" + "🔥") * 50
+        for b in [5, 10, 25, 50]:
+            truncated = truncate_to_token_budget(text, b)
+            assert estimate_tokens(truncated) <= b
+
+    def test_budget_smaller_than_marker(self):
+        from limits import truncate_to_token_budget
+        # marker is 4 tokens. Test budgets 1, 2, 3
+        text = "hello world this is a test"
+        for b in [1, 2, 3]:
+            truncated = truncate_to_token_budget(text, b)
+            assert estimate_tokens(truncated) <= b
+
+    def test_surrogate_pair_not_split(self):
+        from limits import truncate_to_token_budget
+        # Unicode emoji whose UTF-16 representation is a surrogate pair
+        text = "a" * 23 + "\U0001F600" + "b" * 50
+        truncated = truncate_to_token_budget(text, 10)
+        assert estimate_tokens(truncated) <= 10
+        # If truncated with marker, the prefix before marker shouldn't end in high surrogate
+        prefix = truncated[:-len(TRUNCATION_MARKER)]
+        assert not (prefix and 0xD800 <= ord(prefix[-1]) <= 0xDBFF)

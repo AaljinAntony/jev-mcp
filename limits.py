@@ -83,8 +83,14 @@ def fit_state(state, questions) -> dict:
     estimated_tokens, estimator}``. Over-budget state is truncated; questions
     over budget raise ``JevBudgetError``.
     """
-    questions_tokens = estimate_tokens(questions)
-    longest_tokens = longest_question_tokens(questions)
+    question_token_counts = {}
+    if questions and hasattr(questions, "items"):
+        for key, value in questions.items():
+            question_token_counts[key] = estimate_tokens(value)
+
+    questions_tokens = sum(question_token_counts.values()) if question_token_counts else estimate_tokens(questions)
+    longest_tokens = max(question_token_counts.values()) if question_token_counts else 0
+
     budget = min(
         MAX_TOTAL_TOKENS - questions_tokens,
         MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS - longest_tokens,
@@ -117,18 +123,47 @@ def fit_state(state, questions) -> dict:
     }
 
 
+def _char_budget_for_tokens(text: str, token_budget: int) -> int:
+    """Compute the maximum character count that fits within a token budget.
+
+    Since estimate_tokens uses ceil(ascii/4 + non_ascii), the worst case
+    is all non-ASCII (1 token per char) and the best case is all ASCII
+    (4 chars per token). We scan to find the exact cutoff.
+    """
+    if token_budget <= 0:
+        return 0
+    marker_tokens = estimate_tokens(TRUNCATION_MARKER)
+    available = token_budget - marker_tokens
+    if available <= 0:
+        return 0
+
+    tokens_used = 0.0
+    for i, char in enumerate(text):
+        cost = 0.25 if ord(char) <= 0x7F else 1.0
+        if tokens_used + cost > available:
+            return i
+        tokens_used += cost
+    return len(text)
+
+
 def truncate_to_token_budget(text: str, budget: int) -> str:
-    """Binary search the longest prefix whose estimate fits ``budget``."""
+    """Truncate text to fit within the estimated token budget."""
     if budget <= 0:
         return ""
-    low, high = 0, min(len(text), max(budget, budget * 4))
-    best = ""
-    while low <= high:
-        mid = (low + high) // 2
-        candidate = truncate_text(text, mid)
-        if estimate_tokens(candidate) <= budget:
-            best = candidate
-            low = mid + 1
-        else:
-            high = mid - 1
-    return best
+    if len(text) <= budget:
+        return text
+    if len(text) <= budget * 4 and estimate_tokens(text) <= budget:
+        return text
+
+    marker_tokens = estimate_tokens(TRUNCATION_MARKER)
+    if budget < marker_tokens:
+        candidate = truncate_text(text, budget * 4)
+        while estimate_tokens(candidate) > budget and len(candidate) > 0:
+            candidate = candidate[:-1]
+        return candidate
+
+    max_chars = _char_budget_for_tokens(text, budget)
+    end = max_chars
+    if end > 0 and len(text) > end - 1 and 0xD800 <= ord(text[end - 1]) <= 0xDBFF:
+        end -= 1
+    return text[:end] + TRUNCATION_MARKER

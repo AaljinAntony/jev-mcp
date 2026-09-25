@@ -159,6 +159,73 @@ class TestSearchTargetFiles:
         assert result["files"] == []
         assert result["exists"] in {"absent", "partial"}
 
+    def test_discover_files_git_returns_none_for_nongit(self, tmp_path):
+        assert jev_engine._discover_files_git(tmp_path, {".png"}, 10) is None
+
+    def test_discover_files_git_parses_git_output(self, tmp_path, monkeypatch):
+        # Create a mock .git directory in tmp_path
+        (tmp_path / ".git").mkdir()
+        # Mock subprocess.run
+        import subprocess
+
+        fake_files = [
+            "src/main.py",
+            "src\\utils.py",
+            "node_modules/pkg/index.js",
+            "assets/logo.png",
+            "build/bundle.js",
+            "README.md",
+        ]
+        # Create the fake files so (root / p).is_file() returns True
+        for f in fake_files:
+            p = tmp_path / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("ok", encoding="utf-8")
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                args=a[0], returncode=0, stdout="\n".join(fake_files)
+            ),
+        )
+
+        ignore_dirs = {"node_modules", "build"}
+        ignore_exts = {".png"}
+        candidates = jev_engine._discover_files_git(
+            tmp_path, ignore_exts, max_count=10, ignore_dirs=ignore_dirs
+        )
+        assert candidates == ["src/main.py", "src/utils.py", "README.md"]
+
+    def test_discover_files_git_handles_failure(self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        import subprocess
+
+        # Non-zero exit code
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(args=a[0], returncode=128, stdout="", stderr="fatal"),
+        )
+        assert jev_engine._discover_files_git(tmp_path, {".png"}, 10) is None
+
+        # TimeoutExpired
+        def _raise_timeout(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+        monkeypatch.setattr(subprocess, "run", _raise_timeout)
+        assert jev_engine._discover_files_git(tmp_path, {".png"}, 10) is None
+
+    def test_select_target_files_uses_git_candidates(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            jev_engine,
+            "_discover_files_git",
+            lambda root, exts, count, dirs=None: ["git_discovered.py"],
+        )
+        result = jev_engine.select_target_files("edit git_discovered", str(tmp_path))
+        assert result["matched"] is True
+        assert result["files"] == ["git_discovered.py"]
+
 
 class TestSelectModelTier:
     def test_routing_off_disabled_payload(self):

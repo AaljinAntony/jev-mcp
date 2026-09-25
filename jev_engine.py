@@ -608,20 +608,66 @@ def _exists_verdict(chosen, confidence: float) -> str:
     return "absent" if confidence >= 0.35 else "partial"
 
 
+def _discover_files_git(
+    root: Path,
+    ignore_exts: set,
+    max_count: int,
+    ignore_dirs: Optional[set] = None,
+) -> Optional[List[str]]:
+    """Use git ls-files for fast, .gitignore-aware file discovery. Returns None if not a git repo."""
+    import subprocess
+
+    if not (root / ".git").exists() and not any((p / ".git").exists() for p in root.parents):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        candidates = []
+        dirs_to_ignore = ignore_dirs or set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            p = Path(line)
+            if any(ignored in p.parts for ignored in dirs_to_ignore):
+                continue
+            if p.suffix.lower() in ignore_exts:
+                continue
+            if (root / p).is_file():
+                candidates.append(line.replace("\\", "/"))
+            if len(candidates) >= max_count:
+                break
+        return candidates
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
 def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) -> dict:
     _check_input_length("task", task)
     root = _validate_root_dir(root_dir)
     ignore_dirs = {".git", ".godot", ".import", ".venv", "node_modules", "dist", "build"}
     ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".wav", ".ogg", ".mp3", ".ttf", ".import", ".zip"}
 
-    candidates = []
-    for p in root.rglob("*"):
-        if any(ignored in p.parts for ignored in ignore_dirs):
-            continue
-        if p.is_file() and p.suffix.lower() not in ignore_exts:
-            candidates.append(p.relative_to(root).as_posix())
-        if len(candidates) >= MAX_CHOICE_OPTIONS:
-            break
+    # Fast path: use git if available
+    candidates = _discover_files_git(root, ignore_exts, MAX_CHOICE_OPTIONS, ignore_dirs)
+
+    # Fallback: manual directory walk
+    if candidates is None:
+        candidates = []
+        for p in root.rglob("*"):
+            if any(ignored in p.parts for ignored in ignore_dirs):
+                continue
+            if p.is_file() and p.suffix.lower() not in ignore_exts:
+                candidates.append(p.relative_to(root).as_posix())
+            if len(candidates) >= MAX_CHOICE_OPTIONS:
+                break
 
     if not candidates:
         return {"matched": False, "files": [], "exists": "absent"}

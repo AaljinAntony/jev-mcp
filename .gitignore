@@ -30,5 +30,6 @@ reference/
 .idea/
 .vscode/
 *.log
+logs/
 .DS_Store
 Thumbs.db
