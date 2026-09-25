@@ -105,7 +105,7 @@ def _validate_score(answer, criteria, name: str) -> None:
     expected_int = list(range(n))
     if sorted(normalized_keys) != expected_int:
         raise JevResponseError(f"answer '{name}' probabilities must cover exactly the score levels 0..{n - 1}")
-    numeric_probs = {k: float(probabilities[k]) for k in probabilities}
+    numeric_probs = {_int_key(k): float(probabilities[k]) for k in probabilities}
     _validate_probabilities(numeric_probs, expected_int, name, "score")
     legend = _attr(answer, "legend")
     if not isinstance(legend, dict):

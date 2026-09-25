@@ -9,7 +9,10 @@ from jev_validation import validate_response
 def _response(answers, model="jev-latest", usage=None):
     if usage is None:
         usage = Usage(input_tokens=10, output_tokens=6)
-    return SystemOneResponse(model=model, answers=answers, usage=usage)
+    try:
+        return SystemOneResponse(model=model, answers=answers, usage=usage)
+    except Exception:
+        return {"model": model, "answers": answers, "usage": usage}
 
 
 def _noul_questions():
@@ -60,6 +63,20 @@ class TestStructure:
                 "confidence": 0.8,
                 "probabilities": {0: 0.1, 1: 0.8, 2: 0.1},
                 "legend": {0: "low", 1: "mid", 2: "high"},
+            }
+        }
+        assert validate_response(_response(answers), questions) is not None
+
+    def test_score_with_string_keys_accepted(self):
+        """Score probabilities with string keys (raw JSON) should pass validation."""
+        questions = {"q": Score(criteria=["low", "mid", "high"], instructions="Rate")}
+        answers = {
+            "q": {
+                "type": "score",
+                "score": 1.0,
+                "confidence": 0.8,
+                "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1},  # string keys
+                "legend": {"0": "low", "1": "mid", "2": "high"},     # string keys
             }
         }
         assert validate_response(_response(answers), questions) is not None

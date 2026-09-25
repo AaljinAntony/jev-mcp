@@ -77,8 +77,6 @@ def _score_option(state_text: str, label: str, description: str, instructions: s
     for key, (patterns, amount) in boosts.items():
         if label == key and any(p in haystack for p in patterns):
             score += amount
-    if label == "is_destructive" or label == "modifies_git":
-        pass
     if label == "primary" or label == "target_file":
         score += _overlap(state_text, label) * 1.5
     if label == "secondary" or label == "tertiary":

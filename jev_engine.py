@@ -316,7 +316,6 @@ def _request(state_text: str, questions: dict):
 # 1. Command Verification Guardrail
 # ----------------------------------------------------------------------
 def verify_command(command: str) -> dict:
-    client = get_client()
     state = f"Terminal shell command to execute: {command}"
     questions = {
         "is_destructive": Noul(
@@ -327,10 +326,7 @@ def verify_command(command: str) -> dict:
         )
     }
 
-    cfg = get_config()
-    fitted = fit_state(state, questions)
-    res = execute_system_one(client, state=fitted["state"], questions=questions)
-    validate_response(res, questions)
+    res, fitted, cfg = _request(state, questions)
 
     dest_prob = round(float(get_prob(get_answer(res, "is_destructive"))), 2)
     git_prob = round(float(get_prob(get_answer(res, "modifies_git"))), 2)
@@ -390,7 +386,10 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
             continue
         for p in sdir.rglob("*.md"):
             if p.is_file():
-                rel = p.relative_to(root).as_posix()
+                try:
+                    rel = p.relative_to(root).as_posix()
+                except ValueError:
+                    continue  # path is outside root, skip it
                 candidate_files[rel] = p
 
     if not candidate_files:

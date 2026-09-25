@@ -239,9 +239,9 @@ All tests must pass.
 
 ## Checklist
 
-- [ ] `jev_engine.py` `verify_command()`: Replace inline calls with `res, fitted, cfg = _request(state, questions)`
-- [ ] `jev_validation.py` line 108: Change `numeric_probs = {k: ...}` to `numeric_probs = {_int_key(k): ...}`
-- [ ] `tests/test_validation.py`: Add `test_score_with_string_keys_accepted` test
-- [ ] `jev_engine.py` line 384: Wrap `relative_to()` in try/except ValueError
-- [ ] `mock.py` lines 80–81: Delete the dead `is_destructive`/`modifies_git` branch
-- [ ] Run `pytest tests/ -v` — all tests green
+- [x] `jev_engine.py` `verify_command()`: Replace inline calls with `res, fitted, cfg = _request(state, questions)`
+- [x] `jev_validation.py` line 108: Change `numeric_probs = {k: ...}` to `numeric_probs = {_int_key(k): ...}`
+- [x] `tests/test_validation.py`: Add `test_score_with_string_keys_accepted` test
+- [x] `jev_engine.py` line 384: Wrap `relative_to()` in try/except ValueError
+- [x] `mock.py` lines 80–81: Delete the dead `is_destructive`/`modifies_git` branch
+- [x] Run `pytest tests/ -v` — all tests green

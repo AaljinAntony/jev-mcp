@@ -107,6 +107,18 @@ class TestSearchAgentSkills:
         assert result["count"] == 0
         assert result["resources"] == []
 
+    def test_mock_search_outside_root_skipped(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "test.md").write_text("# Outside\nnot in root", encoding="utf-8")
+        root = tmp_path / "root"
+        root.mkdir()
+        monkeypatch.setattr(jev_engine, "get_scan_paths", lambda r: [outside])
+        result = jev_engine.find_agent_resources("test", str(root))
+        assert result["matched"] is False
+        assert result["count"] == 0
+        assert result["resources"] == []
+
 
 class TestSearchTargetFiles:
     def test_mock_offline_picks_file(self, tmp_path):
