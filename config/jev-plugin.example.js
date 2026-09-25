@@ -1,7 +1,7 @@
 /**
  * jev-plugin.js — OpenCode `chat.message` hook for Jev AI.
  *
- * Source example:   D:\mcp\jev-typesafe-mcp\config\jev-plugin.example.js
+ * Source example:   config/jev-plugin.example.js
  * Real install:     C:\Users\<you>\.config\opencode\plugins\jev-plugin.js
  *
  * Two jobs per user message:
@@ -23,6 +23,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, "..");
 
 const DEFAULT_SCAN_PATHS = [
   ".agents/skills",
@@ -32,6 +37,8 @@ const DEFAULT_SCAN_PATHS = [
   "skills",
   ".agents",
 ];
+
+const MAX_INJECT_CHARS = 6000; // Match jev_engine MAX_CONTENT_CHARS
 
 // Dedicated plugin log (opencode may swallow console output). Best effort only.
 function pluginLog(msg) {
@@ -111,16 +118,32 @@ function loadSettings() {
     }
   }
   if (!pythonPath || !fs.existsSync(pythonPath)) {
-    const defaultVenvPy = "D:\\mcp\\jev-typesafe-mcp\\.venv\\Scripts\\python.exe";
-    pythonPath = fs.existsSync(defaultVenvPy) ? defaultVenvPy : "python";
+    const defaultVenvPy = path.join(REPO_ROOT, ".venv", "Scripts", "python.exe");
+    // Also try Unix-style venv path
+    const defaultVenvPyUnix = path.join(REPO_ROOT, ".venv", "bin", "python");
+    const cwdVenvPy = path.join(cwd, ".venv", "Scripts", "python.exe");
+    const cwdVenvPyUnix = path.join(cwd, ".venv", "bin", "python");
+    if (fs.existsSync(defaultVenvPy)) {
+      pythonPath = defaultVenvPy;
+    } else if (fs.existsSync(defaultVenvPyUnix)) {
+      pythonPath = defaultVenvPyUnix;
+    } else if (fs.existsSync(cwdVenvPy)) {
+      pythonPath = cwdVenvPy;
+    } else if (fs.existsSync(cwdVenvPyUnix)) {
+      pythonPath = cwdVenvPyUnix;
+    } else {
+      pythonPath = "python";
+    }
   }
 
   // API key: process env -> repo .env
   let apiKey = process.env.TYPESAFE_API_KEY || "";
   if (!apiKey) {
-    const envFile = "D:\\mcp\\jev-typesafe-mcp\\.env";
-    if (fs.existsSync(envFile)) {
-      const match = fs.readFileSync(envFile, "utf-8").match(/TYPESAFE_API_KEY\s*=\s*(.+)/);
+    const envFile = path.join(REPO_ROOT, ".env");
+    const cwdEnvFile = path.join(cwd, ".env");
+    const targetEnv = fs.existsSync(envFile) ? envFile : fs.existsSync(cwdEnvFile) ? cwdEnvFile : null;
+    if (targetEnv) {
+      const match = fs.readFileSync(targetEnv, "utf-8").match(/TYPESAFE_API_KEY\s*=\s*['"]?([^'"\s\n]+)['"]?/);
       if (match) apiKey = match[1].trim();
     }
   }
@@ -193,6 +216,12 @@ function extractUserPrompt(input, output) {
 /**
  * Query Jev via the configured Python environment using the current
  * TypeSafeClient.system_one(...) API. Returns { tier?, target? }.
+ *
+ * TODO: This spawns a new Python process per message, which is slow (~1-3s).
+ * A better approach would be to call the jev-engine MCP server's tools
+ * (search_agent_skills, select_model_tier) via the MCP protocol, reusing
+ * the already-running server's client, connection pool, and retry logic.
+ * This requires the plugin to act as an MCP client over stdio.
  *
  * Async: spawns a child and awaits its exit so the hook NEVER blocks the
  * opencode process (a blocking spawnSync here is what trips opencode's task
@@ -297,7 +326,17 @@ except Exception as e:
           pluginLog(`queryJev JSON parse failed: ${err.message}`);
         }
       }
-      pluginLog(`queryJev failed (status ${code}): ${String(stderr).trim().slice(0, 300)}`);
+      const stderrTrimmed = String(stderr).trim().slice(0, 300);
+      pluginLog(`queryJev failed (status ${code}): ${stderrTrimmed}`);
+
+      // Surface import errors so the user knows the SDK is missing
+      if (code === 2 && stderrTrimmed.includes("IMPORT_ERROR")) {
+        console.warn(
+          `[jev-plugin] ⚠️  TypeSafe SDK not found in Python environment. ` +
+          `Skills and model routing are disabled. Check your venv path.`
+        );
+      }
+
       resolve(null);
     });
 
@@ -403,7 +442,13 @@ export const JevPlugin = async () => ({
       const selectedRel = result?.target;
       if (selectedRel && fileMap.has(selectedRel)) {
         const fullPath = fileMap.get(selectedRel);
-        const content = fs.readFileSync(fullPath, "utf-8");
+        let content = fs.readFileSync(fullPath, "utf-8");
+
+        // Truncate to prevent bloating the LLM context
+        if (content.length > MAX_INJECT_CHARS) {
+          content = content.slice(0, MAX_INJECT_CHARS) + "\n…[truncated]";
+          pluginLog(`Truncated skill ${selectedRel} from ${fs.statSync(fullPath).size} to ${MAX_INJECT_CHARS} chars`);
+        }
 
         console.log(`[jev-plugin] ⚡ Selected ${selectedRel} in ${elapsed}ms`);
         pluginLog(`Injecting skill ${selectedRel} (${content.length} chars)`);

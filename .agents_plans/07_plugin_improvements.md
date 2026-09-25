@@ -237,12 +237,12 @@ Add a comment block at the top of the `queryJev` function:
 
 ## Checklist
 
-- [ ] Add `import { fileURLToPath } from "node:url"` and derive `REPO_ROOT` from `__dirname`
-- [ ] Replace hardcoded `D:\\mcp\\jev-typesafe-mcp\\.venv\\...` with `path.join(REPO_ROOT, ...)`
-- [ ] Replace hardcoded `D:\\mcp\\jev-typesafe-mcp\\.env` with `path.join(REPO_ROOT, ".env")`
-- [ ] Add Unix venv path fallback (`bin/python`)
-- [ ] Fix `.env` regex to strip quotes: `/TYPESAFE_API_KEY\s*=\s*['"]?([^'"\s\n]+)['"]?/`
-- [ ] Add `MAX_INJECT_CHARS = 6000` and truncate injected skill content
-- [ ] Add `console.warn` for import errors (exit code 2)
-- [ ] Add TODO comment about MCP protocol refactor
-- [ ] Manual test: copy plugin to a fresh location, verify it resolves paths correctly
+- [x] Add `import { fileURLToPath } from "node:url"` and derive `REPO_ROOT` from `__dirname`
+- [x] Replace hardcoded `D:\\mcp\\jev-typesafe-mcp\\.venv\\...` with `path.join(REPO_ROOT, ...)`
+- [x] Replace hardcoded `D:\\mcp\\jev-typesafe-mcp\\.env` with `path.join(REPO_ROOT, ".env")`
+- [x] Add Unix venv path fallback (`bin/python`)
+- [x] Fix `.env` regex to strip quotes: `/TYPESAFE_API_KEY\s*=\s*['"]?([^'"\s\n]+)['"]?/`
+- [x] Add `MAX_INJECT_CHARS = 6000` and truncate injected skill content
+- [x] Add `console.warn` for import errors (exit code 2)
+- [x] Add TODO comment about MCP protocol refactor
+- [x] Manual test: copy plugin to a fresh location, verify it resolves paths correctly
