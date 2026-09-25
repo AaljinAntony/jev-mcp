@@ -2,6 +2,7 @@
 
 import pytest
 
+from config import _reset_config_cache
 from jev_engine import _reset_client_cache, get_client
 from jev_errors import (
     JevBudgetError,
@@ -203,9 +204,11 @@ class TestClientCache:
     def test_client_cache_invalidates_on_key_change(self, monkeypatch):
         monkeypatch.setenv("JEV_MCP_MOCK", "0")
         monkeypatch.setenv("TYPESAFE_API_KEY", "key-1")
+        _reset_config_cache()
         _reset_client_cache()
         c1 = get_client()
         monkeypatch.setenv("TYPESAFE_API_KEY", "key-2")
+        _reset_config_cache()
         c2 = get_client()
         assert c1 is not None
         assert c2 is not None
@@ -215,9 +218,11 @@ class TestClientCache:
         monkeypatch.setenv("TYPESAFE_API_KEY", "key-timeout")
         monkeypatch.setenv("JEV_MCP_MOCK", "0")
         monkeypatch.setenv("JEV_MCP_TIMEOUT_MS", "30000")
+        _reset_config_cache()
         _reset_client_cache()
         c1 = get_client()
         monkeypatch.setenv("JEV_MCP_TIMEOUT_MS", "60000")
+        _reset_config_cache()
         c2 = get_client()
         assert c1 is not c2
 
@@ -225,23 +230,28 @@ class TestClientCache:
         monkeypatch.setenv("TYPESAFE_API_KEY", "key-model")
         monkeypatch.setenv("JEV_MCP_MOCK", "0")
         monkeypatch.setenv("JEV_MCP_MODEL", "model-a")
+        _reset_config_cache()
         _reset_client_cache()
         c1 = get_client()
         monkeypatch.setenv("JEV_MCP_MODEL", "model-b")
+        _reset_config_cache()
         c2 = get_client()
         assert c1 is not c2
 
     def test_mock_mode_clears_cache_and_returns_none(self, monkeypatch):
         monkeypatch.setenv("TYPESAFE_API_KEY", "key-mock")
         monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        _reset_config_cache()
         _reset_client_cache()
         c1 = get_client()
         assert c1 is not None
         monkeypatch.setenv("JEV_MCP_MOCK", "1")
+        _reset_config_cache()
         c2 = get_client()
         assert c2 is None
         # And when switching back to non-mock, a new client is created
         monkeypatch.setenv("JEV_MCP_MOCK", "0")
+        _reset_config_cache()
         c3 = get_client()
         assert c3 is not None
         assert c3 is not c1
