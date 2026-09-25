@@ -104,9 +104,11 @@ def log_tool_call(tool: str, ms: int, args=None, result=None, error=None) -> Non
     if error is not None:
         payload = {"error": error}
     else:
-        payload = {"result_len": len(json.dumps(result, default=str))}
-        preview = json.dumps(result, default=str)[:1000]
-        payload["result_preview"] = preview
+        dumped = json.dumps(result, default=str)
+        payload = {
+            "result_len": len(dumped),
+            "result_preview": dumped[:1000],
+        }
     args_safe = {k: _redact(v) for k, v in (args or {}).items()}
     log_event("tool_call", tool=tool, args=args_safe, ms=int(ms), **payload)
 

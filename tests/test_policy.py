@@ -3,7 +3,9 @@ import pytest
 from jev_errors import JevValidationError
 from policy import (
     DEFAULT_AUTO_ACCEPT,
+    DEFAULT_ESCALATE_THRESHOLD,
     DEFAULT_REVIEW_AT,
+    DEFAULT_RISK_THRESHOLD,
     ESCAPE_HATCHES,
     action_from_confidence,
     confidence_from_probabilities,
@@ -101,6 +103,12 @@ class TestGuardrailSafe:
         assert guardrail_safe("auto", 0.03, 0.30) is False
         assert guardrail_safe("review", 0.03, 0.03) is False
         assert guardrail_safe("escalate", 0.03, 0.03) is False
+
+    def test_risk_constants_and_boundaries(self):
+        assert DEFAULT_RISK_THRESHOLD == 0.20
+        assert DEFAULT_ESCALATE_THRESHOLD == 0.50
+        assert guardrail_safe("auto", 0.199, 0.199) is True
+        assert guardrail_safe("auto", 0.20, 0.0) is False
 
 
 class TestEscapeHatches:

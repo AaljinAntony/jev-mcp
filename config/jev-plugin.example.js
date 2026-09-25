@@ -39,16 +39,29 @@ const DEFAULT_SCAN_PATHS = [
 ];
 
 const MAX_INJECT_CHARS = 6000; // Match jev_engine MAX_CONTENT_CHARS
+const MAX_PROMPT_CHARS = 100_000; // Guard against runaway user prompts
+const CHILD_KILL_MS = 12_000; // Backstop only; must exceed the Python retry budget
 
 // Dedicated plugin log (opencode may swallow console output). Best effort only.
 function pluginLog(msg) {
   try {
     const dir = path.join(os.homedir(), ".config", "opencode", "logs");
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, "jev-plugin.log"),
-      `${new Date().toISOString()} ${msg}\n`
-    );
+    const logFile = path.join(dir, "jev-plugin.log");
+
+    // Rotate once past 2MB so the log cannot grow without bound.
+    if (fs.existsSync(logFile)) {
+      const stats = fs.statSync(logFile);
+      if (stats.size > 2 * 1024 * 1024) {
+        const backupFile = path.join(dir, "jev-plugin.log.1");
+        try {
+          if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+          fs.renameSync(logFile, backupFile);
+        } catch {}
+      }
+    }
+
+    fs.appendFileSync(logFile, `${new Date().toISOString()} ${msg}\n`);
   } catch (err) {
     console.warn(`[jev-plugin] pluginLog failed:`, err.message);
   }
@@ -166,18 +179,20 @@ function loadSettings() {
 }
 
 /**
- * Recursively discover all Markdown skill, workflow, and memory files
+ * Recursively discover all Markdown skill, workflow, and memory files.
+ * Depth-bounded so a symlink loop or a huge tree cannot stall the hook.
  */
-function scanResourceFiles(dir) {
+function scanResourceFiles(dir, depth = 0, maxDepth = 6) {
   const results = [];
-  if (!fs.existsSync(dir)) return results;
+  if (depth > maxDepth || !fs.existsSync(dir)) return results;
 
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        results.push(...scanResourceFiles(fullPath));
+        results.push(...scanResourceFiles(fullPath, depth + 1, maxDepth));
       } else if (entry.isFile() && entry.name.endsWith(".md")) {
         results.push(fullPath);
       }
@@ -232,7 +247,7 @@ function queryJev(pythonPath, apiKey, task, candidates, wantTier) {
 import sys, json, os
 
 try:
-    from typesafe_sdk import TypeSafeClient, Choice
+    from typesafe_sdk import TypeSafeClient, Choice, RetryPolicy
 except ImportError as e:
     sys.stderr.write(f"IMPORT_ERROR: {e}")
     sys.exit(2)
@@ -273,7 +288,16 @@ try:
         print(json.dumps({}))
         sys.exit(0)
 
-    client = TypeSafeClient(api_key=os.environ.get("TYPESAFE_API_KEY"))
+    client = TypeSafeClient(
+        api_key=os.environ.get("TYPESAFE_API_KEY"),
+        timeout=3.0,
+        retry=RetryPolicy(
+            max_retries=2,
+            backoff_initial=0.5,
+            backoff_max=5.0,
+            backoff_jitter=0.25,
+        ),
+    )
     res = client.system_one(state=f"User Task: {task}", questions=questions)
     answers = getattr(res, "answers", {})
     out = {}
@@ -302,10 +326,13 @@ except Exception as e:
       return;
     }
 
+    // Hard kill is a backstop only. It must outlast the in-Python budget
+    // (3s timeout x (1 + 2 retries) + backoff), otherwise every retry path
+    // would be killed before it can report a result.
     const timer = setTimeout(() => {
-      pluginLog("queryJev timed out (4s), killing child");
+      pluginLog(`queryJev timed out (${CHILD_KILL_MS}ms), killing child`);
       proc.kill();
-    }, 4000);
+    }, CHILD_KILL_MS);
 
     let stdout = "";
     let stderr = "";
@@ -313,6 +340,9 @@ except Exception as e:
     proc.stderr.on("data", (d) => (stderr += d));
     proc.on("error", (err) => {
       clearTimeout(timer);
+      try {
+        proc.kill();
+      } catch {}
       pluginLog(`queryJev child error: ${err.message}`);
       resolve(null);
     });
@@ -350,15 +380,17 @@ except Exception as e:
 }
 
 /**
- * Split a "providerID/modelID" string into its parts (modelID may be absent).
+ * Split a "providerID/modelID" string into its parts.
+ * Returns null for anything not strictly in that format, so callers can
+ * skip the model switch instead of forcing a bogus model object.
  */
-function splitModelId(modelId) {
+export function splitModelId(modelId) {
   if (typeof modelId !== "string" || !modelId) return null;
   const slash = modelId.indexOf("/");
   if (slash > 0 && slash < modelId.length - 1) {
     return { providerID: modelId.slice(0, slash), modelID: modelId.slice(slash + 1) };
   }
-  return { providerID: modelId, modelID: modelId };
+  return null;
 }
 
 /**
@@ -396,8 +428,12 @@ function injectIntoUserMessage(output, notice) {
 export const JevPlugin = async () => ({
   "chat.message": async (input, output) => {
     try {
-      const promptText = extractUserPrompt(input, output);
+      let promptText = extractUserPrompt(input, output);
       if (!promptText) return;
+      if (promptText.length > MAX_PROMPT_CHARS) {
+        promptText = promptText.slice(0, MAX_PROMPT_CHARS) + "\n…[truncated]";
+        pluginLog("User prompt exceeded 100k chars; truncated for Jev evaluation.");
+      }
 
       const cwd = process.cwd();
       const settings = loadSettings();
@@ -428,13 +464,15 @@ export const JevPlugin = async () => ({
       // 1. Forced model switch (only when routing is enabled)
       if (wantTier && result?.tier) {
         const modelId = settings.models[result.tier];
-        if (modelId && output?.message?.model) {
-          const parts = splitModelId(modelId);
+        const parts = modelId ? splitModelId(modelId) : null;
+        if (parts && output?.message?.model) {
           output.message.model = parts;
           pluginLog(`Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID}`);
           console.log(
             `[jev-plugin] ⚡ Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID} in ${elapsed}ms`
           );
+        } else if (modelId && !parts) {
+          pluginLog(`Skipping forced model switch: '${modelId}' is not in 'provider/model' format.`);
         }
       }
 

@@ -5,6 +5,7 @@ Borrowed from `reference/burnigtm-jev-mcp/src/policy.ts` and
 unit-testable; nothing here touches the network.
 """
 
+import math
 from typing import Iterable, List, Literal
 
 from jev_errors import JevValidationError
@@ -13,6 +14,8 @@ PolicyAction = Literal["auto", "review", "escalate"]
 
 DEFAULT_AUTO_ACCEPT = 0.8
 DEFAULT_REVIEW_AT = 0.5
+DEFAULT_RISK_THRESHOLD = 0.20
+DEFAULT_ESCALATE_THRESHOLD = 0.50
 
 #: Float-safe sum tolerance: an exact 0.01 delta can exceed 0.01 in IEEE-754.
 PROBABILITY_SUM_TOLERANCE = 0.01 + 1e-12
@@ -106,8 +109,8 @@ def guardrail_safe(
     action: PolicyAction,
     destructive_prob: float,
     git_modify_prob: float,
-    destructive_threshold: float = 0.20,
-    git_threshold: float = 0.20,
+    destructive_threshold: float = DEFAULT_RISK_THRESHOLD,
+    git_threshold: float = DEFAULT_RISK_THRESHOLD,
 ) -> bool:
     """Backward-compatible ``safe``: auto AND low destructive/git probabilities."""
     return (
@@ -119,8 +122,6 @@ def guardrail_safe(
 
 def _is_finite(value: float) -> bool:
     try:
-        import math
-
         return isinstance(value, (int, float)) and math.isfinite(value)
     except (TypeError, ValueError):
         return False

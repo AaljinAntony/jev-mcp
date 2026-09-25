@@ -98,4 +98,41 @@ const hook = pluginInstance["chat.message"];
 await hook({}, {});
 console.log("chat.message hook safe invocation passed.");
 
+console.log("--- 6. Testing splitModelId provider/model parsing ---");
+const splitModelId = pluginModule.splitModelId;
+assert.strictEqual(typeof splitModelId, "function", "Plugin should export splitModelId");
+
+assert.deepStrictEqual(splitModelId("anthropic/claude-3-5-sonnet"), {
+  providerID: "anthropic",
+  modelID: "claude-3-5-sonnet",
+});
+// Only the first slash splits; the remainder is the model ID.
+assert.deepStrictEqual(splitModelId("openrouter/vendor/model-x"), {
+  providerID: "openrouter",
+  modelID: "vendor/model-x",
+});
+
+const invalidModelIds = [
+  "bare-model-id",
+  "/leading-slash",
+  "trailing-slash/",
+  "",
+  null,
+  undefined,
+  123,
+];
+for (const value of invalidModelIds) {
+  assert.strictEqual(splitModelId(value), null, `Expected null for ${JSON.stringify(value)}`);
+}
+console.log("splitModelId parsing and rejection verified.");
+
+console.log("--- 7. Testing plugin hardening guards are present ---");
+const pluginSource = fs.readFileSync(pluginPath, "utf-8");
+assert.ok(pluginSource.includes("RetryPolicy("), "Should configure RetryPolicy");
+assert.ok(pluginSource.includes("timeout=3.0"), "Should set a 3s client timeout");
+assert.ok(pluginSource.includes("maxDepth = 6"), "Should bound scanResourceFiles depth");
+assert.ok(pluginSource.includes("2 * 1024 * 1024"), "Should rotate the plugin log at 2MB");
+assert.ok(pluginSource.includes("MAX_PROMPT_CHARS"), "Should truncate oversized user prompts");
+console.log("Plugin hardening guards verified.");
+
 console.log("\nALL PLUGIN TESTS PASSED! 🎉");

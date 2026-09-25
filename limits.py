@@ -5,7 +5,9 @@ inside the estimated TypeSafe context budget and reports truncation so policy
 never auto-accepts on partial context.
 """
 
+import copy
 import json
+import math
 
 from jev_errors import JevBudgetError
 
@@ -31,7 +33,7 @@ def estimate_tokens(value) -> int:
             ascii_chars += 1
         else:
             other_chars += 1
-    return __import__("math").ceil(ascii_chars / 4 + other_chars)
+    return math.ceil(ascii_chars / 4 + other_chars)
 
 
 def stringify_state(state) -> str:
@@ -106,15 +108,27 @@ def fit_state(state, questions) -> dict:
     evaluated = fitted
     if truncated and len(fitted) >= len(TRUNCATION_MARKER):
         evaluated = fitted[: -len(TRUNCATION_MARKER)]
+
+    # Performance optimization: reuse pre-calculated tokens if state wasn't truncated
+    state_tokens = estimate_tokens(fitted) if truncated else tokens
+
+    # Defensive copy: prevent caller from mutating internal returned state
+    if truncated:
+        output_state = fitted
+    elif isinstance(state, (dict, list)):
+        output_state = copy.deepcopy(state)
+    else:
+        output_state = state
+
     return {
-        "state": fitted if truncated else state,
+        "state": output_state,
         "truncated": truncated,
         "coverage": {
             "complete": not truncated,
             "original_chars": len(raw),
             "evaluated_chars": len(evaluated),
             "estimated_tokens": {
-                "state": estimate_tokens(fitted),
+                "state": state_tokens,
                 "questions": questions_tokens,
                 "longest_question": longest_tokens,
             },

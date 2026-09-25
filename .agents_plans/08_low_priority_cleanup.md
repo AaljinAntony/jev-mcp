@@ -1,143 +1,168 @@
-# Phase 8: Low-Priority Cleanup
+# Phase 8: Low Priority Cleanup — Imports, State Aliasing, Score Keys & Graceful Shutdown
 
-> **Priority:** 🟢 Low
-> **Estimated effort:** ~30 minutes
-> **Files to modify:** `jev_engine.py`, `jev_logging.py`
-
----
-
-## Task 8A: Add Symlink Protection to `select_target_files()` Directory Walk
-
-### Problem
-
-`select_target_files()` in `jev_engine.py` (line 529) uses `root.rglob("*")` which follows symlinks by default. A symlink loop (e.g. `ln -s . loop`) would cause infinite iteration and hang the MCP tool call.
-
-### Where to look
-
-- File: `jev_engine.py`, line 529
-
-### Exact fix
-
-Add a symlink filter after the `rglob`:
-
-```python
-candidates = []
-for p in root.rglob("*"):
-    if any(ignored in p.parts for ignored in ignore_dirs):
-        continue
-    if p.is_symlink():
-        continue  # skip symlinks to prevent loops
-    if p.is_file() and p.suffix.lower() not in ignore_exts:
-        candidates.append(p.relative_to(root).as_posix())
-    if len(candidates) >= MAX_CHOICE_OPTIONS:
-        break
-```
-
-> **Note:** If Phase 5 (Task 5B) adds `git ls-files`, this only applies to the fallback `rglob` path. Git handles symlinks correctly.
+> **Phase**: 08  
+> **Target Files**:
+> - [`limits.py`](file:///d:/mcp/jev-typesafe-mcp/limits.py)
+> - [`mock.py`](file:///d:/mcp/jev-typesafe-mcp/mock.py)
+> - [`jev_validation.py`](file:///d:/mcp/jev-typesafe-mcp/jev_validation.py)
+> - [`jev_mcp.py`](file:///d:/mcp/jev-typesafe-mcp/jev_mcp.py)  
+> **Parallel Execution Track**:
+> - In parallel mode:
+>   - **Track C Agent**: Modifies `limits.py`, `mock.py`, and `jev_validation.py`.
+>   - **Track E Agent**: Modifies `jev_mcp.py`.
+> - In sequential mode: Single agent applies all changes.
 
 ---
 
-## Task 8B: Improve Log Redaction
+## 1. Problem Context & Rationale
 
-### Problem
-
-`jev_logging.py` (lines 33–42) uses a fixed set of secret markers:
+### Cleanup 1: Top-Level `import math` in `limits.py`
+In `limits.py` line 34:
 ```python
-_SECRET_MARKERS = ("sk-", "apikey_", "api_key=", "typesafe_api_key")
+return __import__("math").ceil(ascii_chars / 4 + other_chars)
 ```
+Calling `__import__("math")` inside a tight per-invocation loop is unnecessary overhead. `math` should be imported once at module load time.
 
-This misses:
-- Keys with `ts_` prefix (potential future format)
-- Bearer tokens in error messages
-- Any key that doesn't start with `sk-`
-
-### Where to look
-
-- File: `jev_logging.py`, lines 33–42
-
-### Exact fix
-
-Expand the markers and add a length-based heuristic:
-
+### Cleanup 2: `fit_state` Mutable State Aliasing
+In `limits.py` line 110:
 ```python
-#: Values that look like credentials and must never be written to the log.
-_SECRET_MARKERS = (
-    "sk-",
-    "ts_",
-    "apikey_",
-    "api_key=",
-    "api_key:",
-    "typesafe_api_key",
-    "bearer ",
-    "authorization:",
-)
-
-
-def _redact(value) -> str:
-    text = str(value)
-    lowered = text.lower()
-    for marker in _SECRET_MARKERS:
-        if marker in lowered:
-            return "<redacted>"
-    # Heuristic: long alphanumeric strings that look like API keys
-    if len(text) > 40 and text.replace("-", "").replace("_", "").isalnum():
-        return "<redacted>"
-    return text
+return {
+    "state": fitted if truncated else state,
+    ...
+}
 ```
+If `state` is a mutable `dict` or `list` and `truncated` is `False`, returning `state` directly means the caller and any downstream consumer share the exact same object reference. If a consumer mutates keys or values in `fitted["state"]`, the original caller's data is silently altered.
+**Fix**: Defensively copy mutable container objects (`dict`, `list`) when not truncated.
 
-### Design decisions
+### Cleanup 3: Score Probability Key Normalization
+In `mock.py` and `jev_validation.py`:
+Live JSON responses from HTTP APIs parse keys as strings (`"0"`, `"1"`), whereas local python objects or mocks may key distributions with integers (`0`, `1`). Code accessing `probabilities[0]` vs `probabilities["0"]` must never throw a `KeyError`.
+**Fix**: Verify and guarantee that `jev_validation.py` normalizes all distribution keys to `int`.
 
-- The 40-char heuristic catches most API keys (TypeSafe keys are ~90 chars) without false-positiving on normal log content.
-- Adding `"bearer "` and `"authorization:"` catches HTTP auth headers that might appear in error messages.
+### Cleanup 4: Graceful Shutdown in `jev_mcp.py`
+`jev_mcp.py` currently logs `server_start` on boot, but when the MCP host terminates the stdio process via SIGINT or SIGTERM, pending log events in the `RotatingFileHandler` buffer may not be flushed to disk.
+**Fix**: Register an `atexit` handler to emit `server_stop` and flush handlers.
 
 ---
 
-## Task 8C: Clean Up Duplicate `dotenv` Loading
+## 2. Step-by-Step Code Changes
 
-### Problem
+### Step 2.1: `limits.py` — Math Import & Defensive Copying
 
-Both `jev_mcp.py` (lines 7–15) and `jev_engine.py` (lines 8–17) have identical `dotenv` loading blocks. When `jev_mcp.py` imports `jev_engine`, the `.env` file is loaded twice (harmless but wasteful and a maintenance risk if one is changed without the other).
-
-### Exact fix
-
-Remove the `dotenv` block from `jev_engine.py` (lines 8–17). The entry points are:
-1. `jev_mcp.py` (MCP server) — loads `.env` before importing `jev_engine`
-2. `jev_engine.py` `__main__` (CLI) — needs its own loading
-
-Cleaner approach: move the dotenv loading into a shared function in `config.py` and call it from both entry points:
-
+**Target lines** (`limits.py` lines 1–15):
+Add top-level imports:
 ```python
-# config.py — add at the top:
-def ensure_dotenv():
-    """Load .env if python-dotenv is available. Idempotent."""
-    try:
-        from dotenv import load_dotenv
-        from pathlib import Path
-        env_path = Path(__file__).resolve().parent / ".env"
-        if env_path.exists():
-            load_dotenv(dotenv_path=env_path, override=True)
+import copy
+import json
+import math
+
+from jev_errors import JevBudgetError
+```
+
+**Target lines** (`limits.py` lines 24–35 in `estimate_tokens`):
+```python
+def estimate_tokens(value) -> int:
+    """Rough token estimate: ASCII chars / 4 + non-ASCII chars."""
+    text = stringify_state(value)
+    ascii_chars = 0
+    other_chars = 0
+    for char in text:
+        if ord(char) <= 0x7F:
+            ascii_chars += 1
         else:
-            load_dotenv(override=True)
-    except ImportError:
-        pass
+            other_chars += 1
+    return math.ceil(ascii_chars / 4 + other_chars)
 ```
 
-Then in both `jev_mcp.py` and `jev_engine.py`'s `__main__` block:
+**Target lines** (`limits.py` lines 105–123 in `fit_state`):
 ```python
-from config import ensure_dotenv
-ensure_dotenv()
-```
+    # Defensively copy mutable containers when not truncated to avoid aliasing
+    if truncated:
+        output_state = fitted
+    elif isinstance(state, (dict, list)):
+        output_state = copy.deepcopy(state)
+    else:
+        output_state = state
 
-Remove the inline try/except dotenv blocks from both files.
+    return {
+        "state": output_state,
+        "truncated": truncated,
+        "coverage": {
+            "complete": not truncated,
+            "original_chars": len(raw),
+            "evaluated_chars": len(evaluated),
+            "estimated_tokens": {
+                "state": state_tokens,
+                "questions": questions_tokens,
+                "longest_question": longest_tokens,
+            },
+            "estimator": "chars/4",
+        },
+    }
+```
 
 ---
 
-## Checklist
+### Step 2.2: `jev_validation.py` — Ensure Integer Keyed Distribution
 
-- [x] `jev_engine.py`: Add `if p.is_symlink(): continue` to the `rglob` loop in `select_target_files()`
-- [x] `jev_logging.py`: Expand `_SECRET_MARKERS` with `"ts_"`, `"bearer "`, `"authorization:"`
-- [x] `jev_logging.py`: Add length-based heuristic to `_redact()`
-- [x] `config.py`: Add `ensure_dotenv()` function
-- [x] `jev_mcp.py`: Replace inline dotenv block with `from config import ensure_dotenv; ensure_dotenv()`
-- [x] `jev_engine.py`: Remove inline dotenv block (lines 8–17), add `ensure_dotenv()` call in `__main__` only
-- [x] Run `pytest tests/ -v` — all tests green
+**Target lines** (`jev_validation.py` lines 102–110):
+Confirm `numeric_probs` consistently normalizes string/int keys:
+```python
+    try:
+        normalized_keys = [_int_key(k) for k in probabilities.keys()]
+    except (ValueError, TypeError):
+        raise JevResponseError(f"answer '{name}' probabilities must be keyed by score level")
+    expected_int = list(range(n))
+    if sorted(normalized_keys) != expected_int:
+        raise JevResponseError(f"answer '{name}' probabilities must cover exactly the score levels 0..{n - 1}")
+    numeric_probs = {_int_key(k): float(probabilities[k]) for k in probabilities}
+```
+
+---
+
+### Step 2.3: `jev_mcp.py` — Graceful Shutdown Hook
+
+**Target lines** (`jev_mcp.py` lines 25–30):
+Add `atexit` registration:
+```python
+import atexit
+import logging
+
+mcp = FastMCP("jev-engine")
+
+log_event("server_start", pid=os.getpid(), log_file=str(log_path()))
+
+
+def _on_shutdown():
+    try:
+        log_event("server_stop", pid=os.getpid())
+        for handler in logging.getLogger("jev_engine").handlers:
+            handler.flush()
+    except Exception:
+        pass
+
+
+atexit.register(_on_shutdown)
+```
+
+---
+
+## 3. Verification Commands
+
+Run validation, limits, and server tests:
+```powershell
+.venv\Scripts\pytest tests/test_validation.py tests/test_limits.py -v
+```
+
+Expected output:
+- All validation tests pass.
+- State mutation isolation tests pass.
+- Server start and shutdown hooks initialize without error.
+
+---
+
+## 4. Acceptance Criteria
+- [ ] `math` is imported at top level in `limits.py`.
+- [ ] `fit_state()` deep-copies mutable dict/list inputs to prevent aliasing.
+- [ ] `_validate_score()` handles string and int level keys transparently.
+- [ ] `jev_mcp.py` registers an `atexit` shutdown handler that flushes log buffers.

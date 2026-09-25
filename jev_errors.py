@@ -54,11 +54,12 @@ def _retryable_status(status: int) -> bool:
 def error_details(err: Exception) -> dict:
     """Map any exception to a `{code, message, retryable}` envelope.
 
-    Ordering matters:
-    - `TypeSafeAPITimeoutError` subclasses `TypeSafeAPIConnectionError` and `TimeoutError`,
-      so it must be checked before the generic connection branch.
-    - `TypeSafeAPIResponseValidationError` subclasses `TypeSafeAPIError`, so it must be
-      checked before the generic `TypeSafeAPIError` branch.
+    Ordering is critical based on the SDK inheritance tree:
+      TypeSafeError (base)
+        ├── TypeSafeAPIError (HTTP status) -> check after ResponseValidationError
+        │     └── TypeSafeAPIResponseValidationError -> check BEFORE TypeSafeAPIError
+        └── TypeSafeAPIConnectionError (network) -> check BEFORE TypeSafeError
+              └── TypeSafeAPITimeoutError -> check BEFORE TypeSafeAPIConnectionError
     """
     if isinstance(err, JevBudgetError):
         return {"code": "INPUT_TOO_LARGE", "message": str(err), "retryable": False}

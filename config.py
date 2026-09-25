@@ -1,13 +1,16 @@
 """Environment config parsing and validation.
 
 Borrowed from `reference/burnigtm-jev-mcp/src/config.ts` (MIT). Reads the Jev
-knobs from the environment with fail-fast validation; values are re-read on
-every call so tests and live deployments can toggle `JEV_MCP_MOCK` freely.
+knobs from the environment with fail-fast validation. The parsed result is
+cached; call `_reset_config_cache()` after changing the environment so tests and
+live deployments can toggle `JEV_MCP_MOCK` freely.
 """
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from jev_errors import JevConfigError
 
@@ -71,13 +74,24 @@ def _timeout_env() -> int:
 
 
 def _is_finite(value: float) -> bool:
-    import math
-
     return math.isfinite(value)
 
 
+_cached_config: Optional[JevConfig] = None
+
+
+def _reset_config_cache() -> None:
+    """Clear the cached config. Exposed for tests."""
+    global _cached_config
+    _cached_config = None
+
+
 def get_config() -> JevConfig:
-    """Parse + validate the environment into a `JevConfig`."""
+    """Parse + validate the environment into a cached `JevConfig`."""
+    global _cached_config
+    if _cached_config is not None:
+        return _cached_config
+
     config = JevConfig(
         api_key=(os.getenv("TYPESAFE_API_KEY") or "").strip(),
         model=(os.getenv("JEV_MCP_MODEL") or DEFAULT_MODEL).strip(),
@@ -88,4 +102,6 @@ def get_config() -> JevConfig:
     )
     if config.review_at > config.auto_accept:
         raise JevConfigError("JEV_MCP_REVIEW_AT must not exceed JEV_MCP_AUTO_ACCEPT.")
+
+    _cached_config = config
     return config

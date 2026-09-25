@@ -161,14 +161,17 @@ class TestSDKExceptionOrdering:
         assert result["retryable"] is True
 
     def test_connection_error_is_retryable(self):
-        try:
-            err = TypeSafeAPIConnectionError()
-        except TypeError:
-            pytest.skip("TypeSafeAPIConnectionError constructor signature unknown")
+        """Verify that pure TypeSafeAPIConnectionError maps to retryable API_ERROR."""
 
-        result = error_details(err)
-        assert result["code"] == "API_ERROR"
-        assert result["retryable"] is True
+        class MockConnectionError(TypeSafeAPIConnectionError):
+            def __init__(self):
+                super(Exception, self).__init__("Connection dropped")
+
+        err = MockConnectionError()
+        envelope = error_details(err)
+        assert envelope["code"] == "API_ERROR"
+        assert envelope["retryable"] is True
+        assert "Could not connect to TypeSafe" in envelope["message"]
 
 
 class TestClientRetryPolicy:

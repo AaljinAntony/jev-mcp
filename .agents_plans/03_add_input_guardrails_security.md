@@ -1,192 +1,188 @@
-# Phase 3: Add Input Guardrails (Security)
+# Phase 3: Add Input Guardrails, Windows Drive Blocking, and Bounded Directory Walk
 
-> **Priority:** 🟡 High
-> **Estimated effort:** ~30 minutes
-> **Files to modify:** `jev_mcp.py`, `jev_engine.py`, `jev_errors.py`
-
----
-
-## Task 3A: Add Input Length Validation on Tool Parameters
-
-### Problem
-
-The four MCP tool functions accept `command`, `task`, and `root_dir` string parameters with **no length limits**. A malicious or buggy caller can send a 10MB command string which goes through `fit_state()` → `stringify_state()` → `estimate_tokens()` → binary-search truncation — all expensive CPU work — before any useful work happens.
-
-### Where to look
-
-- File: `jev_mcp.py`, lines 57–78 (the four `@mcp.tool()` functions)
-- File: `jev_engine.py`, lines 309 (`verify_command`), 374 (`find_agent_resources`), 523 (`select_target_files`), 595 (`select_model_tier`)
-
-### Exact fix
-
-Add input validation at the MCP tool level (the entry point) so expensive processing is never started. Add a constant and a validation helper.
-
-**In `jev_mcp.py`**, add at the top (after imports):
-
-```python
-from jev_errors import JevValidationError
-
-#: Maximum allowed length for any single tool parameter string.
-MAX_INPUT_CHARS = 100_000  # 100KB — generous but prevents abuse
-
-
-def _validate_input_length(**params):
-    """Reject inputs over MAX_INPUT_CHARS before any processing."""
-    for name, value in params.items():
-        if isinstance(value, str) and len(value) > MAX_INPUT_CHARS:
-            raise JevValidationError(
-                f"Parameter '{name}' exceeds the maximum allowed length "
-                f"({len(value):,} chars > {MAX_INPUT_CHARS:,} limit)."
-            )
-```
-
-**Update each tool function** to validate inputs before calling the engine:
-
-```python
-@mcp.tool()
-def guardrail_command(command: str) -> dict:
-    """Check whether a terminal shell command is safe to execute or potentially destructive."""
-    _validate_input_length(command=command)
-    return _run("guardrail_command", lambda: verify_command(command), command=command)
-
-
-@mcp.tool()
-def search_agent_skills(task: str, root_dir: str = ".") -> dict:
-    """Find and retrieve relevant agent skills, workflows, and memory markdown files for a given task."""
-    _validate_input_length(task=task, root_dir=root_dir)
-    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
-
-
-@mcp.tool()
-def search_target_files(task: str, root_dir: str = ".") -> dict:
-    """Identify which workspace files are relevant to a task using Jev AI evaluation."""
-    _validate_input_length(task=task, root_dir=root_dir)
-    return _run("search_target_files", lambda: select_target_files(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
-
-
-@mcp.tool()
-def select_model_tier(task: str) -> dict:
-    """Select the optimal LLM model tier (fast, balanced, or frontier) based on task complexity."""
-    _validate_input_length(task=task)
-    return _run("select_model_tier", lambda: _engine_select_model_tier(task), task=task)
-```
-
-The `_validate_input_length()` call goes **before** `_run()` so the validation error is caught by `_run()`'s exception handler and returned as a proper error envelope.
-
-Actually, looking at this more carefully, `_validate_input_length` should be **inside** the `_run()` lambda or called within `_run()` so its exception gets mapped through `error_details()`. Let me reconsider.
-
-Better approach — put the validation **inside** the lambda so `_run()` catches it:
-
-```python
-@mcp.tool()
-def guardrail_command(command: str) -> dict:
-    """Check whether a terminal shell command is safe to execute or potentially destructive."""
-    def _do():
-        _validate_input_length(command=command)
-        return verify_command(command)
-    return _run("guardrail_command", _do, command=command)
-```
-
-Or even simpler — add validation at the engine function level, since that's where the actual processing starts. This is cleaner because the engine functions are also callable from the CLI.
-
-**Preferred approach — validate in each engine function:**
-
-In `jev_engine.py`, add a helper near the top:
-
-```python
-MAX_INPUT_CHARS = 100_000
-
-
-def _check_input_length(name: str, value: str) -> None:
-    """Reject oversized string inputs before expensive processing."""
-    if len(value) > MAX_INPUT_CHARS:
-        raise JevValidationError(
-            f"Parameter '{name}' is too long ({len(value):,} chars, limit {MAX_INPUT_CHARS:,})."
-        )
-```
-
-Then add at the start of each engine function:
-
-```python
-def verify_command(command: str) -> dict:
-    _check_input_length("command", command)
-    # ... rest of function
-
-def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -> dict:
-    _check_input_length("task", task)
-    # ... rest of function
-
-def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) -> dict:
-    _check_input_length("task", task)
-    # ... rest of function
-
-def select_model_tier(task: str) -> dict:
-    _check_input_length("task", task)
-    # ... rest of function
-```
-
-Note: `JevValidationError` is already imported in `jev_engine.py` via `from jev_errors import ...` — check if it's in the import. If not, add it. Looking at line 28: `from jev_errors import JevConfigError, JevResponseError, JevTimeoutError, error_details` — `JevValidationError` is NOT imported. Add it:
-
-```python
-from jev_errors import JevConfigError, JevResponseError, JevTimeoutError, JevValidationError, error_details
-```
-
-`error_details()` already handles `JevValidationError` (line 63) → returns `{"code": "INVALID_INPUT", "retryable": false}`.
+> **Phase**: 03  
+> **Target Files**:
+> - [`jev_engine.py`](file:///d:/mcp/jev-typesafe-mcp/jev_engine.py)
+> - [`tests/test_mock_tools.py`](file:///d:/mcp/jev-typesafe-mcp/tests/test_mock_tools.py)  
+> **Parallel Execution Track**:
+> - Belongs to **Track E (Core Engine Security)**.
+> - Can be executed after Track A/B/C or in sequence.
 
 ---
 
-## Task 3B: Validate `root_dir` Against Directory Traversal
+## 1. Problem Context & Rationale
 
-### Problem
+### Issue 1: Incomplete Windows Drive and System Path Blocking
+In `jev_engine.py`:
+```python
+if os.name == "nt":
+    for drive in "CDEFGH":
+        blocked.add(Path(f"{drive}:\\Windows").resolve())
+        blocked.add(Path(f"{drive}:\\").resolve())
+```
+**Vulnerabilities**:
+1. Only drive letters `C` through `H` are checked. Enterprise workstations and developer rigs often use drives `I:`, `N:`, `P:`, `Z:` for network shares and project storage. If a user sets `root_dir="Z:\\"`, it bypasses the drive list check!
+2. Windows paths are case-insensitive. `C:\windows` vs `C:\Windows` may resolve differently across Python versions or symlinks.
+3. System directories like `ProgramFiles` and `ProgramFiles(x86)` are not blocked.
 
-`root_dir` is accepted as-is and resolved with `Path(root_dir).resolve()`. A caller can pass `/etc`, `C:\Windows`, or `../../../` and the MCP will:
-1. Walk the entire directory tree via `rglob("*")`
-2. Read markdown file contents and return them in the response
+**Fix**:
+Dynamically detect and block all drive roots (any path where `root.parent == root`, `len(root.parts) <= 1`, or `root.drive.rstrip('\\') == str(root).rstrip('\\')`).
+Check all critical Windows environment paths (`SystemRoot`, `windir`, `ProgramFiles`, `ProgramFiles(x86)`) case-insensitively.
 
-### Where to look
+### Issue 2: Unbounded `rglob("*")` Directory Scan
+When git is not available (e.g. non-git workspaces or git not in PATH):
+```python
+for p in root.rglob("*"):
+    ...
+```
+`Path.rglob("*")` performs an unbounded recursive directory traversal. In deep folder structures, massive assets directories, or large nested codebases, this blocks the MCP server process for seconds or minutes, leading to client timeouts.
 
-- File: `jev_engine.py`, lines 375 (`find_agent_resources`) and 524 (`select_target_files`)
+**Fix**:
+Replace with an in-place pruned `os.walk()` limited to a maximum depth of 5 levels. When `depth >= 5` or when directory names match `ignore_dirs`, prune `dirnames.clear()` immediately so subtrees are never traversed.
 
-### Exact fix
+---
 
-Add a `_validate_root_dir()` function:
+## 2. Step-by-Step Code Changes
+
+### Step 2.1: `jev_engine.py` — Harden `_validate_root_dir`
+
+**Target lines** (`jev_engine.py` lines 58–76):
+Replace `_validate_root_dir` with:
 
 ```python
 def _validate_root_dir(root_dir: str) -> Path:
-    """Resolve and sanity-check root_dir. Rejects system-level paths."""
+    """Resolve and sanity-check root_dir. Rejects system-level paths and drive roots."""
+    _check_input_length("root_dir", root_dir)
     root = Path(root_dir).resolve()
-    # Block obvious system roots
-    blocked = {Path("/").resolve(), Path("/etc").resolve(), Path("/usr").resolve()}
-    if os.name == "nt":
-        for drive in "CDEFGH":
-            blocked.add(Path(f"{drive}:\\Windows").resolve())
-            blocked.add(Path(f"{drive}:\\").resolve())
-    if root in blocked:
+
+    # Block POSIX system roots
+    blocked_posix = {Path("/").resolve(), Path("/etc").resolve(), Path("/usr").resolve(), Path("/bin").resolve(), Path("/sbin").resolve()}
+    if root in blocked_posix:
         raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+
+    # Block Windows drive roots and system directories
+    if os.name == "nt":
+        # Check if root is any drive root (e.g., C:\, D:\, Z:\)
+        # On Windows, drive roots have root.parent == root and typically 1 part (e.g. ('C:\\',))
+        if root.parent == root or len(root.parts) <= 1:
+            raise JevValidationError(f"root_dir '{root_dir}' points to a filesystem drive root.")
+
+        root_lower = str(root).lower().rstrip("\\")
+
+        # Collect and check all system directories case-insensitively
+        system_env_vars = ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "SystemDrive"]
+        for env_var in system_env_vars:
+            val = os.environ.get(env_var)
+            if val:
+                val_resolved = str(Path(val).resolve()).lower().rstrip("\\")
+                if root_lower == val_resolved or root_lower.startswith(val_resolved + "\\"):
+                    raise JevValidationError(f"root_dir '{root_dir}' points inside a system directory ({env_var}).")
+
+    if root.parent == root:
+        raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+
     if not root.is_dir():
         raise JevValidationError(f"root_dir '{root_dir}' does not exist or is not a directory.")
+
     return root
 ```
 
-Replace `root = Path(root_dir).resolve()` in both `find_agent_resources()` (line 375) and `select_target_files()` (line 524) with:
+---
+
+### Step 2.2: `jev_engine.py` — Bounded Depth Walk in `select_target_files`
+
+**Target lines** (`jev_engine.py` lines 650–662):
+Replace the `rglob("*")` fallback with:
 
 ```python
-root = _validate_root_dir(root_dir)
+    # Fallback: bounded manual directory walk (max 5 levels deep)
+    if candidates is None:
+        candidates = []
+        max_depth = 5
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Calculate current relative depth from root
+            rel_dir = Path(dirpath).relative_to(root)
+            depth = len(rel_dir.parts)
+
+            # Do not descend beyond max_depth
+            if depth >= max_depth:
+                dirnames.clear()
+                continue
+
+            # Prune ignored directories in-place to avoid unnecessary traversal
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ignore_dirs and not d.startswith(".")
+            ]
+
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                p = Path(dirpath) / fname
+                if p.is_symlink():
+                    continue
+                if p.suffix.lower() not in ignore_exts:
+                    candidates.append(p.relative_to(root).as_posix())
+                    if len(candidates) >= MAX_CHOICE_OPTIONS:
+                        break
+            if len(candidates) >= MAX_CHOICE_OPTIONS:
+                break
 ```
-
-### Design decisions
-
-- This is a **best-effort** guard, not a security sandbox. The MCP server already runs in the user's context with their filesystem permissions.
-- We block only the most obviously dangerous paths (filesystem roots, Windows directory).
-- We require `root_dir` to be an existing directory — prevents scanning of arbitrary file paths.
 
 ---
 
-## Checklist
+### Step 2.3: `tests/test_mock_tools.py` — Add Guardrail Tests
 
-- [x] `jev_engine.py`: Add `JevValidationError` to the import from `jev_errors`
-- [x] `jev_engine.py`: Add `MAX_INPUT_CHARS` constant and `_check_input_length()` helper
-- [x] `jev_engine.py`: Add `_check_input_length()` call to `verify_command()`, `find_agent_resources()`, `select_target_files()`, `select_model_tier()`
-- [x] `jev_engine.py`: Add `_validate_root_dir()` helper
-- [x] `jev_engine.py`: Replace `Path(root_dir).resolve()` with `_validate_root_dir(root_dir)` in `find_agent_resources()` and `select_target_files()`
-- [x] Run `pytest tests/ -v` — all tests green (tests use `tmp_path` which is a valid dir)
+Add tests for drive roots and system directory rejection:
+```python
+import pytest
+from jev_errors import JevValidationError
+from jev_engine import _validate_root_dir, select_target_files
+
+def test_root_dir_blocks_drive_roots():
+    """Verify that drive roots are rejected regardless of letter."""
+    for drive in ["C:\\", "D:\\", "Z:\\"]:
+        with pytest.raises(JevValidationError):
+            _validate_root_dir(drive)
+
+def test_root_dir_blocks_system_dirs():
+    """Verify system directories like Windows or Program Files are rejected."""
+    win_dir = os.environ.get("SystemRoot", "C:\\Windows")
+    with pytest.raises(JevValidationError):
+        _validate_root_dir(win_dir)
+
+def test_select_target_files_respects_depth(tmp_path):
+    """Verify that fallback walk does not exceed max_depth."""
+    # Create deep folder structure: level1/level2/level3/level4/level5/level6/deep.py
+    current = tmp_path
+    for i in range(1, 8):
+        current = current / f"level{i}"
+        current.mkdir()
+        (current / f"file_{i}.py").write_text("print(1)")
+
+    # Run select_target_files with git disabled (tmp_path has no .git)
+    result = select_target_files("find file", root_dir=str(tmp_path))
+    assert result is not None
+```
+
+---
+
+## 3. Verification Commands
+
+Run mock tools and engine test suite:
+```powershell
+.venv\Scripts\pytest tests/test_mock_tools.py -v
+```
+
+Expected output:
+- All path validation tests pass.
+- System directory and drive root rejections raise `JevValidationError`.
+- Directory walk bounds hold true.
+
+---
+
+## 4. Acceptance Criteria
+- [ ] Any drive root (C:\ through Z:\) is rejected by `_validate_root_dir`.
+- [ ] Windows system environment paths (`SystemRoot`, `ProgramFiles`, etc.) are blocked case-insensitively.
+- [ ] `select_target_files` directory walk is capped at 5 levels of depth using `os.walk` in-place pruning.
+- [ ] `pytest tests/test_mock_tools.py` passes completely.
