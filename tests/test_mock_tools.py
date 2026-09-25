@@ -1,8 +1,10 @@
 """Offline mock-mode tool tests (no TYPESAFE_API_KEY required)."""
 
 import json
+import os
 import pytest
 
+from jev_errors import JevValidationError
 from typesafe_sdk import (
     ChoiceAnswer,
     NoulAnswer,
@@ -205,3 +207,97 @@ class TestSelectModelTier:
         result = jev_engine.select_model_tier("design a protocol")
         assert result["action"] == "escalate"
         assert result["recommended_tier"] == "balanced"
+
+
+class TestInputLengthGuardrails:
+    def test_verify_command_oversized_rejected(self):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine.verify_command(huge)
+        assert "command" in str(exc_info.value)
+        assert "too long" in str(exc_info.value)
+
+    def test_find_agent_resources_oversized_task_rejected(self, tmp_path):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine.find_agent_resources(huge, str(tmp_path))
+        assert "task" in str(exc_info.value)
+
+    def test_find_agent_resources_oversized_root_dir_rejected(self):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine.find_agent_resources("task", huge)
+        assert "root_dir" in str(exc_info.value)
+
+    def test_select_target_files_oversized_task_rejected(self, tmp_path):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine.select_target_files(huge, str(tmp_path))
+        assert "task" in str(exc_info.value)
+
+    def test_select_model_tier_oversized_task_rejected(self):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine.select_model_tier(huge)
+        assert "task" in str(exc_info.value)
+
+    def test_mcp_tool_oversized_returns_error_envelope(self):
+        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        res = jev_mcp.guardrail_command(huge)
+        assert "error" in res
+        assert res["error"]["code"] == "INVALID_INPUT"
+        assert res["error"]["retryable"] is False
+
+
+class TestRootDirGuardrails:
+    def test_root_dir_system_root_rejected(self):
+        sys_root = "C:\\" if os.name == "nt" else "/"
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine._validate_root_dir(sys_root)
+        assert "system directory" in str(exc_info.value)
+
+    def test_root_dir_windows_rejected(self):
+        if os.name == "nt":
+            with pytest.raises(JevValidationError) as exc_info:
+                jev_engine._validate_root_dir("C:\\Windows")
+            assert "system directory" in str(exc_info.value)
+
+    def test_root_dir_etc_rejected(self):
+        if os.name != "nt":
+            with pytest.raises(JevValidationError) as exc_info:
+                jev_engine._validate_root_dir("/etc")
+            assert "system directory" in str(exc_info.value)
+
+    def test_root_dir_nonexistent_rejected(self, tmp_path):
+        nonexistent = str(tmp_path / "does_not_exist_abc123")
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine._validate_root_dir(nonexistent)
+        assert "does not exist or is not a directory" in str(exc_info.value)
+
+    def test_root_dir_file_rejected(self, tmp_path):
+        f = tmp_path / "file.txt"
+        f.write_text("hello", encoding="utf-8")
+        with pytest.raises(JevValidationError) as exc_info:
+            jev_engine._validate_root_dir(str(f))
+        assert "does not exist or is not a directory" in str(exc_info.value)
+
+    def test_root_dir_valid_dir_accepted(self, tmp_path):
+        resolved = jev_engine._validate_root_dir(str(tmp_path))
+        assert resolved == tmp_path.resolve()
+
+    def test_find_agent_resources_system_dir_rejected(self):
+        sys_root = "C:\\" if os.name == "nt" else "/"
+        with pytest.raises(JevValidationError):
+            jev_engine.find_agent_resources("task", sys_root)
+
+    def test_select_target_files_system_dir_rejected(self):
+        sys_root = "C:\\" if os.name == "nt" else "/"
+        with pytest.raises(JevValidationError):
+            jev_engine.select_target_files("task", sys_root)
+
+    def test_mcp_search_skills_system_dir_returns_error_envelope(self):
+        sys_root = "C:\\" if os.name == "nt" else "/"
+        res = jev_mcp.search_agent_skills("task", sys_root)
+        assert "error" in res
+        assert res["error"]["code"] == "INVALID_INPUT"
+        assert res["error"]["retryable"] is False

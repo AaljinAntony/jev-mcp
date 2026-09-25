@@ -25,7 +25,13 @@ from typesafe_sdk import (
 )
 
 from config import get_config
-from jev_errors import JevConfigError, JevResponseError, JevTimeoutError, error_details
+from jev_errors import (
+    JevConfigError,
+    JevResponseError,
+    JevTimeoutError,
+    JevValidationError,
+    error_details,
+)
 from jev_logging import log_round
 from jev_validation import validate_response
 from limits import fit_state, MAX_CHOICE_OPTIONS, MAX_CONTENT_CHARS
@@ -47,6 +53,37 @@ DEFAULT_SCAN_PATHS = [
     "skills",
     ".agents",
 ]
+
+#: Maximum allowed length for any single tool parameter string.
+MAX_INPUT_CHARS = 100_000
+
+
+def _check_input_length(name: str, value: str) -> None:
+    """Reject oversized string inputs before expensive processing."""
+    if isinstance(value, str) and len(value) > MAX_INPUT_CHARS:
+        raise JevValidationError(
+            f"Parameter '{name}' is too long ({len(value):,} chars, limit {MAX_INPUT_CHARS:,})."
+        )
+
+
+def _validate_root_dir(root_dir: str) -> Path:
+    """Resolve and sanity-check root_dir. Rejects system-level paths."""
+    _check_input_length("root_dir", root_dir)
+    root = Path(root_dir).resolve()
+    # Block obvious system roots
+    blocked = {Path("/").resolve(), Path("/etc").resolve(), Path("/usr").resolve()}
+    if os.name == "nt":
+        for drive in "CDEFGH":
+            blocked.add(Path(f"{drive}:\\Windows").resolve())
+            blocked.add(Path(f"{drive}:\\").resolve())
+        sys_root = os.environ.get("SystemRoot") or os.environ.get("windir")
+        if sys_root:
+            blocked.add(Path(sys_root).resolve())
+    if root in blocked or root.parent == root:
+        raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+    if not root.is_dir():
+        raise JevValidationError(f"root_dir '{root_dir}' does not exist or is not a directory.")
+    return root
 
 
 def _find_settings_files() -> List[Path]:
@@ -316,6 +353,7 @@ def _request(state_text: str, questions: dict):
 # 1. Command Verification Guardrail
 # ----------------------------------------------------------------------
 def verify_command(command: str) -> dict:
+    _check_input_length("command", command)
     state = f"Terminal shell command to execute: {command}"
     questions = {
         "is_destructive": Noul(
@@ -377,7 +415,8 @@ def _answer_probs(res: Any, slot: str) -> Dict[str, float]:
 
 
 def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -> dict:
-    root = Path(root_dir).resolve()
+    _check_input_length("task", task)
+    root = _validate_root_dir(root_dir)
     search_dirs = get_scan_paths(root)
 
     candidate_files: Dict[str, Path] = {}
@@ -529,7 +568,8 @@ def _exists_verdict(chosen, confidence: float) -> str:
 
 
 def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) -> dict:
-    root = Path(root_dir).resolve()
+    _check_input_length("task", task)
+    root = _validate_root_dir(root_dir)
     ignore_dirs = {".git", ".godot", ".import", ".venv", "node_modules", "dist", "build"}
     ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".wav", ".ogg", ".mp3", ".ttf", ".import", ".zip"}
 
@@ -606,6 +646,7 @@ def select_model_tier(task: str) -> dict:
     Gated by `jevs_settings.enable_model_routing`. Low-confidence or truncated
     judgments report `action: "escalate"` while keeping `recommended_tier`.
     """
+    _check_input_length("task", task)
     settings = load_jev_settings()
     result = {
         "enabled": settings["enable_model_routing"],

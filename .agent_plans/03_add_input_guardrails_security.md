@@ -184,9 +184,9 @@ root = _validate_root_dir(root_dir)
 
 ## Checklist
 
-- [ ] `jev_engine.py`: Add `JevValidationError` to the import from `jev_errors`
-- [ ] `jev_engine.py`: Add `MAX_INPUT_CHARS` constant and `_check_input_length()` helper
-- [ ] `jev_engine.py`: Add `_check_input_length()` call to `verify_command()`, `find_agent_resources()`, `select_target_files()`, `select_model_tier()`
-- [ ] `jev_engine.py`: Add `_validate_root_dir()` helper
-- [ ] `jev_engine.py`: Replace `Path(root_dir).resolve()` with `_validate_root_dir(root_dir)` in `find_agent_resources()` and `select_target_files()`
-- [ ] Run `pytest tests/ -v` — all tests green (tests use `tmp_path` which is a valid dir)
+- [x] `jev_engine.py`: Add `JevValidationError` to the import from `jev_errors`
+- [x] `jev_engine.py`: Add `MAX_INPUT_CHARS` constant and `_check_input_length()` helper
+- [x] `jev_engine.py`: Add `_check_input_length()` call to `verify_command()`, `find_agent_resources()`, `select_target_files()`, `select_model_tier()`
+- [x] `jev_engine.py`: Add `_validate_root_dir()` helper
+- [x] `jev_engine.py`: Replace `Path(root_dir).resolve()` with `_validate_root_dir(root_dir)` in `find_agent_resources()` and `select_target_files()`
+- [x] Run `pytest tests/ -v` — all tests green (tests use `tmp_path` which is a valid dir)
