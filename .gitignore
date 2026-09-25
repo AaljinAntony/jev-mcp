@@ -27,6 +27,7 @@ config/opencode.local.json
 reference/
 
 # Tooling
+.pytest_cache/
 .idea/
 .vscode/
 *.log

@@ -135,4 +135,31 @@ assert.ok(pluginSource.includes("2 * 1024 * 1024"), "Should rotate the plugin lo
 assert.ok(pluginSource.includes("MAX_PROMPT_CHARS"), "Should truncate oversized user prompts");
 console.log("Plugin hardening guards verified.");
 
+// --- 8. Installed plugin must match the committed example -----------------
+console.log("--- 8. Testing installed plugin drift ---");
+
+const homePlugin = path.join(os.homedir(), ".config", "opencode", "plugins", "jev-plugin.js");
+if (!fs.existsSync(homePlugin)) {
+  console.warn(
+    `SKIP: no installed plugin at ${homePlugin}. ` +
+    `Copy config\\jev-plugin.example.js there per config\\README.md step 5.`
+  );
+} else {
+  const installed = fs.readFileSync(homePlugin, "utf-8");
+  const example = fs.readFileSync(pluginPath, "utf-8");
+  if (installed !== example) {
+    const instLines = installed.split("\n").length;
+    const exLines = example.split("\n").length;
+    console.error(
+      `\nFAIL: installed plugin has drifted from config/jev-plugin.example.js\n` +
+      `  installed: ${homePlugin} (${instLines} lines)\n` +
+      `  example:   ${pluginPath} (${exLines} lines)\n` +
+      `  Fix: copy the example over the installed file, or move the shared logic\n` +
+      `  into a module both import. See .agents_plans/phase-6-plugin-as-mcp-client.md\n`
+    );
+    process.exit(1);
+  }
+  console.log("Installed plugin matches the committed example.");
+}
+
 console.log("\nALL PLUGIN TESTS PASSED! 🎉");
