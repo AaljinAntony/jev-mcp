@@ -34,6 +34,20 @@ def _tokenize(text: str):
     return re.split(r"[^a-z0-9]+", text.lower())
 
 
+#: Words that carry no routing signal. They appear in every goal sentence and in
+#: most candidate previews, so counting them would let any option score a hit.
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "not", "but",
+    "you", "your", "are", "was", "were", "has", "have", "had", "its", "it's",
+    "which", "what", "when", "where", "does", "must", "should", "can", "will",
+    "any", "all", "each", "per", "via", "use", "using", "used", "task", "goal",
+    "file", "files", "select", "single", "supplied", "candidate", "candidates",
+    "none", "true", "false", "yes", "answer", "answers", "question", "state",
+    "a", "an", "of", "to", "in", "is", "it", "be", "or", "on", "at", "by", "if",
+    "describe", "described", "describes", "following", "such", "than", "then",
+}
+
+
 def _overlap(a: str, b: str) -> float:
     left = set(_tokenize(a))
     right = [t for t in _tokenize(b) if len(t) > 1]
@@ -41,6 +55,34 @@ def _overlap(a: str, b: str) -> float:
         return 0.0
     hits = sum(1 for token in right if token in left)
     return hits / len(right)
+
+
+def _state_terms(text: str) -> set:
+    """The meaningful tokens of the state, once per request."""
+    return {t for t in _tokenize(text) if len(t) > 1 and t not in _STOPWORDS}
+
+
+def _document_frequency(texts) -> dict:
+    """How many candidates contain each token."""
+    frequency: dict = {}
+    for text in texts:
+        for token in set(_tokenize(text)):
+            frequency[token] = frequency.get(token, 0) + 1
+    return frequency
+
+
+def _evidence_score(terms: set, description: str, frequency: dict) -> float:
+    """Inverse-frequency weight of the state terms one candidate contains.
+
+    Counting shared words is not enough with 250 candidates: a word that appears
+    in two files means much more than a word that appears in fifty. Weighting by
+    `1 / candidates containing the term` makes a rare, task-specific word dominate
+    a word every option happens to share.
+    """
+    if not terms:
+        return 0.0
+    tokens = set(_tokenize(description))
+    return sum(1.0 / frequency.get(token, 1) for token in terms if token in tokens)
 
 
 def _clamp01(value: float) -> float:
@@ -54,7 +96,19 @@ def _softmax(scores) -> list:
     return [e / total for e in exps]
 
 
-def _mock_noul(state_text: str, instructions: str) -> float:
+def _mock_noul(state_text: str, instructions: str, presence: bool = False, options=None, frequency=None) -> float:
+    if presence:
+        # A presence Noul (one that carries true/false criteria) asks whether any
+        # candidate actually fits. Answer it from the candidate evidence itself:
+        # that is the only thing the real model judges against too.
+        terms = _state_terms(state_text)
+        frequency = frequency or _document_frequency(options or [])
+        best = max((_evidence_score(terms, text, frequency) for text in (options or [])), default=0.0)
+        if best < EVIDENCE_MIN_SCORE:
+            return 0.1
+        if best < 1.0:
+            return 0.6
+        return _clamp01(0.6 + 0.1 * best)
     hay = state_text.lower()
     if re.search(
         r"delete|drop table|wipe|truncate|rm -rf|force push|--force|reset --hard|filter-branch|git config --|clean -fdx",
@@ -66,34 +120,68 @@ def _mock_noul(state_text: str, instructions: str) -> float:
     return _clamp01(0.35 + 0.5 * _overlap(state_text, instructions))
 
 
-def _score_option(state_text: str, label: str, description: str, instructions: str) -> float:
-    score = _overlap(state_text, f"{label} {description}") * 3 + _overlap(state_text, instructions)
-    haystack = state_text.lower()
-    boosts = {
-        "none": (["none of the", "no relevant", "does not", "not related"], 4.0),
-        "frontier": (["architecture", "refactor across", "design", "complex", "multi-file", "race", "deadlock"], 3.0),
-        "balanced": (["bug", "test", "feature", "isolated"], 1.5),
-        "fast": (["typo", "lookup", "docstring", "rename", "format"], 1.5),
-    }
-    for key, (patterns, amount) in boosts.items():
+def _question_attr(question, name):
+    if isinstance(question, dict):
+        return question.get(name)
+    return getattr(question, name, None)
+
+
+def _candidate_evidence(questions) -> list:
+    """Every real Choice option's description in the request.
+
+    The `none` escape hatch is excluded: it restates the goal in the model's own
+    words, so it would look like the strongest evidence in the request.
+    """
+    texts = []
+    for question in questions.values():
+        if _question_attr(question, "type") != "choice":
+            continue
+        criteria = _question_attr(question, "criteria")
+        items = criteria.items() if hasattr(criteria, "items") else []
+        texts.extend(_as_text(value) for label, value in items if label != "none" and value is not None)
+    return texts
+
+
+_TIER_BOOSTS = {
+    "frontier": (["architecture", "refactor across", "design", "complex", "multi-file", "race", "deadlock"], 3.0),
+    "balanced": (["bug", "test", "feature", "isolated"], 1.5),
+    "fast": (["typo", "lookup", "docstring", "rename", "format"], 1.5),
+}
+
+#: Evidence weight a candidate needs before the mock treats it as a real match.
+#: One word shared with a hundred files is not evidence.
+EVIDENCE_MIN_SCORE = 0.5
+
+
+def _score_option(terms: set, description: str, frequency: dict, haystack: str, label: str) -> float:
+    score = 3.0 * _evidence_score(terms, description, frequency)
+    for key, (patterns, amount) in _TIER_BOOSTS.items():
         if label == key and any(p in haystack for p in patterns):
             score += amount
-    if label == "primary" or label == "target_file":
-        score += _overlap(state_text, label) * 1.5
-    if label == "secondary" or label == "tertiary":
-        score += _overlap(state_text, label) * 0.5
     return score
 
 
-def _mock_choice(state_text: str, question) -> ChoiceAnswer:
-    instructions = _as_text(question.instructions)
+def _mock_choice(state_text: str, question, frequency: dict = None) -> ChoiceAnswer:
     labels = list(question.criteria.keys())
+    descriptions = [_as_text(question.criteria.get(label)) for label in labels]
+    if frequency is None:
+        frequency = _document_frequency([d for l, d in zip(labels, descriptions) if l != "none"])
+    terms = _state_terms(state_text)
+    haystack = state_text.lower()
+
+    # `none` is the escape hatch, not a competitor. It scores zero and only wins
+    # when no supplied candidate carries enough task-specific evidence to believe.
     scores = [
-        _score_option(state_text, label, _as_text(question.criteria.get(label)), instructions)
-        for label in labels
+        0.0 if label == "none" else _score_option(terms, text, frequency, haystack, label)
+        for label, text in zip(labels, descriptions)
     ]
+    if "none" in labels:
+        candidates = [s for label, s in zip(labels, scores) if label != "none"]
+        if not candidates or max(candidates) < EVIDENCE_MIN_SCORE:
+            scores[labels.index("none")] = max(scores) + 1.0
+
     probabilities = dict(zip(labels, _softmax(scores)))
-    choice = labels[int(max(range(len(labels)), key=lambda i: scores[i]))]
+    choice = labels[max(range(len(labels)), key=lambda i: probabilities[labels[i]])]
     return ChoiceAnswer(
         choice=choice,
         probabilities=probabilities,
@@ -130,14 +218,19 @@ def mock_system_one(state, questions, model="jev-latest"):
     runs against the exact shapes production uses.
     """
     state_text = stringify_state(state)
+    options = _candidate_evidence(questions)
+    frequency = _document_frequency(options)
     answers = {}
     for name, question in questions.items():
-        qtype = question.type if not isinstance(question, dict) else question.get("type")
+        qtype = _question_attr(question, "type")
         if qtype == "noul":
-            instructions = _as_text(question.instructions)
-            answers[name] = NoulAnswer(noul=round(_mock_noul(state_text, instructions), 2))
+            instructions = _as_text(_question_attr(question, "instructions"))
+            presence = _question_attr(question, "criteria") is not None
+            answers[name] = NoulAnswer(
+                noul=round(_mock_noul(state_text, instructions, presence, options, frequency), 2)
+            )
         elif qtype == "choice":
-            answers[name] = _mock_choice(state_text, question)
+            answers[name] = _mock_choice(state_text, question, frequency)
         elif qtype == "score":
             answers[name] = _mock_score(state_text, question)
         else:

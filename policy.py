@@ -17,6 +17,19 @@ DEFAULT_REVIEW_AT = 0.5
 DEFAULT_RISK_THRESHOLD = 0.20
 DEFAULT_ESCALATE_THRESHOLD = 0.50
 
+#: Presence probability at or above which a chosen candidate is reported as a
+#: real match. Below it the Choice winner is treated as a forced pick among
+#: options that do not actually fit, which is the failure mode a `none` option
+#: inside a Choice cannot detect on its own.
+NONE_CONFIDENCE = 0.50
+
+#: Minimum primary probability before family-prefix siblings are pulled in.
+#: A 0.15-probability primary is a guess, not a decision, and must not be
+#: allowed to fill every result slot with its own directory family.
+FAMILY_CLUSTER_MIN_PROB = 0.50
+#: Hard cap on siblings added by family-prefix clustering.
+FAMILY_CLUSTER_MAX_SIBLINGS = 2
+
 #: Float-safe sum tolerance: an exact 0.01 delta can exceed 0.01 in IEEE-754.
 PROBABILITY_SUM_TOLERANCE = 0.01 + 1e-12
 #: Per-level drift allowed between a reported score and its distribution mean.

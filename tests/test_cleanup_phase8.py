@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from unittest.mock import patch
 
-from typesafe_sdk import ChoiceAnswer, SystemOneResponse, Usage
+from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
 import jev_engine
 from config import ensure_dotenv
 from jev_logging import _redact, _SECRET_MARKERS
@@ -164,7 +164,8 @@ class TestSymlinkProtection:
                             choice="valid1.py",
                             confidence=0.9,
                             probabilities={"valid1.py": 0.9, "none": 0.1},
-                        )
+                        ),
+                        "is_relevant": NoulAnswer(noul=0.9),
                     },
                     usage=Usage(input_tokens=10, output_tokens=5),
                 ),

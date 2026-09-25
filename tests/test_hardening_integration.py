@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from config import get_config, _reset_config_cache
+import jev_engine
 from jev_engine import (
     get_client,
     _reset_client_cache,
@@ -19,8 +20,19 @@ from jev_engine import (
 )
 from jev_errors import error_details, JevValidationError
 from limits import fit_state
-from policy import DEFAULT_RISK_THRESHOLD, DEFAULT_ESCALATE_THRESHOLD, guardrail_safe
-from typesafe_sdk import TypeSafeAPIConnectionError, TypeSafeAPITimeoutError
+from policy import (
+    DEFAULT_RISK_THRESHOLD,
+    DEFAULT_ESCALATE_THRESHOLD,
+    FAMILY_CLUSTER_MAX_SIBLINGS,
+    guardrail_safe,
+)
+from typesafe_sdk import (
+    ChoiceAnswer,
+    SystemOneResponse,
+    TypeSafeAPIConnectionError,
+    TypeSafeAPITimeoutError,
+    Usage,
+)
 
 
 # 1. Connection error mapping
@@ -45,22 +57,95 @@ def test_risk_constants_and_guardrail_boundaries():
 
 
 # 3. Sibling family-prefix matching
+def _stub_primary(monkeypatch, probs, choice):
+    """Answer `find_agent_resources` with one hand-built Choice distribution."""
+    def _fake_request(state, questions):
+        return (
+            SystemOneResponse(
+                model="jev-test",
+                answers={
+                    "primary": ChoiceAnswer(
+                        choice=choice,
+                        probabilities=probs,
+                        confidence=0.9,
+                    )
+                },
+                usage=Usage(input_tokens=10, output_tokens=5),
+            ),
+            {"truncated": False, "coverage": {}},
+            get_config(),
+        )
+
+    monkeypatch.setattr(jev_engine, "_request", _fake_request)
+
+
+def _family_tree(tmp_path):
+    skills_dir = tmp_path / ".agents" / "skills"
+    for name in ["tool-runner", "tool-builder", "tool-linter", "my-tool-extra"]:
+        (skills_dir / name).mkdir(parents=True)
+        (skills_dir / name / "SKILL.md").write_text(f"# {name}\n\n{name} summary text\n")
+    return {
+        name: f".agents/skills/{name}/SKILL.md"
+        for name in ["tool-runner", "tool-builder", "tool-linter", "my-tool-extra"]
+    }
+
+
 def test_family_prefix_sibling_matching(tmp_path, monkeypatch):
     monkeypatch.setenv("JEV_MCP_MOCK", "1")
     _reset_config_cache()
     _reset_client_cache()
     _reset_settings_cache()
-    skills_dir = tmp_path / ".agents" / "skills"
+    rel = _family_tree(tmp_path)
 
-    (skills_dir / "tool-runner").mkdir(parents=True)
-    (skills_dir / "tool-runner" / "SKILL.md").write_text("# Runner")
-    (skills_dir / "tool-builder").mkdir(parents=True)
-    (skills_dir / "tool-builder" / "SKILL.md").write_text("# Builder")
-    (skills_dir / "my-tool-extra").mkdir(parents=True)
-    (skills_dir / "my-tool-extra" / "SKILL.md").write_text("# Unrelated")
-
+    # A confident primary pulls in same-family siblings, highest probability first.
+    _stub_primary(
+        monkeypatch,
+        {
+            rel["tool-runner"]: 0.7,
+            rel["tool-linter"]: 0.2,
+            rel["tool-builder"]: 0.05,
+            rel["my-tool-extra"]: 0.04,
+            "none": 0.01,
+        },
+        rel["tool-runner"],
+    )
     res = find_agent_resources("run tools", root_dir=str(tmp_path))
-    assert res is not None
+    files = [r["file"] for r in res["resources"]]
+    assert files[0] == rel["tool-runner"]
+    assert rel["tool-linter"] in files          # same "tool-" family
+    assert rel["my-tool-extra"] not in files    # different family prefix
+
+    # At most FAMILY_CLUSTER_MAX_SIBLINGS siblings are added, never the whole family.
+    _stub_primary(
+        monkeypatch,
+        {
+            rel["tool-runner"]: 0.7,
+            rel["tool-linter"]: 0.2,
+            rel["tool-builder"]: 0.05,
+            rel["my-tool-extra"]: 0.04,
+            "none": 0.01,
+        },
+        rel["tool-runner"],
+    )
+    res = find_agent_resources("run tools", root_dir=str(tmp_path))
+    assert len(res["resources"]) <= 1 + FAMILY_CLUSTER_MAX_SIBLINGS
+
+    # A weak primary must not claim any slot for its family: every sibling is
+    # below the independent 0.12 sibling floor, so only clustering could add one.
+    _stub_primary(
+        monkeypatch,
+        {
+            rel["tool-runner"]: 0.15,
+            rel["tool-linter"]: 0.11,
+            rel["tool-builder"]: 0.10,
+            rel["my-tool-extra"]: 0.09,
+            "none": 0.55,
+        },
+        rel["tool-runner"],
+    )
+    res = find_agent_resources("run tools", root_dir=str(tmp_path))
+    assert [r["file"] for r in res["resources"]] == [rel["tool-runner"]]
+
     _reset_config_cache()
     _reset_client_cache()
     _reset_settings_cache()

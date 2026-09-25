@@ -15,6 +15,14 @@ from typesafe_sdk import (
 )
 
 from config import get_config
+from candidates import (
+    build_criteria,
+    bound_candidates,
+    looks_binary,
+    markdown_preview,
+    read_head,
+    read_text_cache,
+)
 from jev_errors import (
     JevConfigError,
     JevResponseError,
@@ -24,15 +32,25 @@ from jev_errors import (
 )
 from jev_logging import log_round, log_event
 from jev_validation import validate_response
-from limits import fit_state, MAX_CHOICE_OPTIONS, MAX_CONTENT_CHARS
+from limits import (
+    fit_state,
+    MAX_CANDIDATE_CHARS,
+    MAX_CHOICE_OPTIONS,
+    MAX_CONTENT_CHARS,
+    MAX_PREVIEW_READS,
+    MAX_TOTAL_PREVIEW_CHARS,
+    truncate_text,
+)
 from mock import mock_system_one
 from policy import (
     DEFAULT_RISK_THRESHOLD,
     DEFAULT_ESCALATE_THRESHOLD,
+    FAMILY_CLUSTER_MAX_SIBLINGS,
+    FAMILY_CLUSTER_MIN_PROB,
+    NONE_CONFIDENCE,
     action_from_confidence,
     confidence_from_probabilities,
     guardrail_safe,
-    min_confidence,
     require_complete_context,
     worst_action,
 )
@@ -402,17 +420,43 @@ def _response_meta(res: Any, cfg) -> dict:
     }
 
 
-def _coverage_envelope(fitted: Optional[dict]) -> dict:
-    """A coverage block for paths where no Jev request was made."""
-    if fitted is not None:
-        return fitted["coverage"]
-    return {
-        "complete": True,
-        "original_chars": 0,
-        "evaluated_chars": 0,
-        "estimated_tokens": {"state": 0, "questions": 0, "longest_question": 0},
-        "estimator": "chars/4",
+def _candidate_fields(
+    complete: bool,
+    considered: int,
+    original_chars: int,
+    evaluated_chars: int,
+    **extra: int,
+) -> dict:
+    """The `coverage.candidate_fields` block (reference output-schemas shape).
+
+    Reports how much candidate evidence actually reached the model, so a
+    truncated candidate set is visible in the envelope instead of silent.
+    """
+    fields = {
+        "complete": complete,
+        "candidates_considered": considered,
+        "original_chars": original_chars,
+        "evaluated_chars": evaluated_chars,
     }
+    fields.update(extra)
+    return fields
+
+
+def _coverage_envelope(fitted: Optional[dict], candidate_fields: Optional[dict] = None) -> dict:
+    """A coverage block for paths where no Jev request was made."""
+    if isinstance(fitted, dict) and isinstance(fitted.get("coverage"), dict):
+        coverage = dict(fitted["coverage"])
+    else:
+        coverage = {
+            "complete": True,
+            "original_chars": 0,
+            "evaluated_chars": 0,
+            "estimated_tokens": {"state": 0, "questions": 0, "longest_question": 0},
+            "estimator": "chars/4",
+        }
+    if candidate_fields is not None:
+        coverage["candidate_fields"] = candidate_fields
+    return coverage
 
 
 def _slot_confidence(ans_obj: Any) -> float:
@@ -538,6 +582,18 @@ def _answer_probs(res: Any, slot: str) -> Dict[str, float]:
     return {k: float(v) for k, v in probs.items()}
 
 
+#: Probability at or above which a non-primary candidate is reported as a hit.
+RESOURCE_SIBLING_MIN_PROB = 0.12
+
+AGENT_RESOURCE_INSTRUCTIONS = (
+    "Select the single agent skill, workflow, or memory document that is most "
+    "directly relevant to the task described in `task`. Each option's "
+    "description is that document's own summary. Judge relevance from what the "
+    "document covers, not from its filename. If no supplied document addresses "
+    "the task, choose the 'none' option."
+)
+
+
 def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -> dict:
     _check_input_length("task", task)
     root = _validate_root_dir(root_dir)
@@ -566,78 +622,101 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
             "content": None,
             "primary_probability": None,
             "ranked": [],
+            "candidates_considered": 0,
+            "candidates_evaluated": 0,
+            "candidates_truncated": False,
+            "reason_codes": [],
             "action": "auto",          # nothing to decide; see note below
             "confidence": None,
             "truncated": False,
-            "coverage": _coverage_envelope(None),
+            "coverage": _coverage_envelope(
+                None, _candidate_fields(True, 0, 0, 0)
+            ),
             "model": None,
             "usage": None,
         }
         return result
 
-    options = list(candidate_files.keys())[:MAX_CHOICE_OPTIONS]
+    options_all = list(candidate_files.keys())
+    options, candidates_truncated = bound_candidates(options_all, MAX_CHOICE_OPTIONS)
+    if candidates_truncated:
+        log_event(
+            "candidates_truncated",
+            tool="find_agent_resources",
+            considered=len(options_all),
+            kept=len(options),
+        )
 
-    criteria_map = {opt: f"Agent resource: {Path(opt).name}" for opt in options}
+    # One read per candidate, reused for both the criteria preview and the
+    # resource content returned below.
+    text_cache, read_text = read_text_cache(root)
+    criteria_map = build_criteria(options, read_text)
+    if candidates_truncated:
+        criteria_map["none"] = (
+            "None of the supplied agent resources addresses the task; a further "
+            f"{len(options_all) - len(options)} candidates were not evaluated"
+        )
+    else:
+        criteria_map["none"] = "None of the supplied agent resources addresses the task"
+    criteria_map = dict(sorted(criteria_map.items()))
+
     questions = {
         "primary": Choice(
             criteria=criteria_map,
-            instructions="Select the primary matching agent skill, workflow, or memory document."
+            instructions=AGENT_RESOURCE_INSTRUCTIONS,
         ),
     }
 
-    if len(options) > 1:
-        secondary_map = {**criteria_map, "none": "No additional relevant resource"}
-        questions["secondary"] = Choice(
-            criteria=secondary_map,
-            instructions="Select a secondary relevant skill or workflow, or choose 'none'."
-        )
-    if len(options) > 2:
-        tertiary_map = {**criteria_map, "none": "No additional relevant resource"}
-        questions["tertiary"] = Choice(
-            criteria=tertiary_map,
-            instructions="Select a third relevant skill or workflow, or choose 'none'."
-        )
-
-    res, fitted, cfg = _request(
-        f"User Task: {task}\nGoal: Identify which specific Markdown agent resources are directly relevant.",
-        questions,
-    )
-
-    selected_keys = []
-    primary_ans = get_answer(res, "primary")
-    primary_val = get_val(primary_ans)
-    if primary_val and primary_val in candidate_files:
-        selected_keys.append(primary_val)
+    state = {
+        "task": task,
+        "goal": "Identify which specific Markdown agent resources are directly relevant.",
+        "candidates_considered": len(options_all),
+        "candidates_evaluated": len(options),
+        "candidates_truncated": candidates_truncated,
+    }
+    res, fitted, cfg = _request(state, questions)
 
     probs = _answer_probs(res, "primary")
-    for opt, p in probs.items():
-        if opt in candidate_files and opt not in selected_keys and p >= 0.12:
+    primary_ans = get_answer(res, "primary")
+    primary_val = get_val(primary_ans)
+    if primary_val == "none":
+        primary_val = None
+    primary_prob = probs.get(primary_val, 0.0) if primary_val else 0.0
+
+    selected_keys: List[str] = []
+    if primary_val and primary_val in candidate_files:
+        selected_keys.append(primary_val)
+    for opt, p in sorted(probs.items(), key=lambda kv: -kv[1]):
+        if opt in candidate_files and opt not in selected_keys and p >= RESOURCE_SIBLING_MIN_PROB:
             selected_keys.append(opt)
 
-    for slot in ["secondary", "tertiary"]:
-        val = get_val(get_answer(res, slot))
-        if val and val != "none" and val in candidate_files and val not in selected_keys:
-            selected_keys.append(val)
-
-    if primary_val:
+    # Family clustering is a convenience for hyphenated skill trees. It only runs
+    # on a decision the model actually made, and it can never claim every slot.
+    if primary_val and primary_prob >= FAMILY_CLUSTER_MIN_PROB:
         primary_name = Path(primary_val).parent.name
         if "-" in primary_name:
             family_prefix = primary_name.rsplit("-", 1)[0] + "-"
-            for opt in options:
-                opt_parent = Path(opt).parent.name
-                if opt not in selected_keys and opt_parent.startswith(family_prefix):
-                    selected_keys.append(opt)
+            siblings = sorted(
+                (
+                    opt for opt in options
+                    if opt != primary_val
+                    and opt not in selected_keys
+                    and Path(opt).parent.name.startswith(family_prefix)
+                ),
+                key=lambda opt: probs.get(opt, 0.0),
+                reverse=True,
+            )
+            for opt in siblings[:FAMILY_CLUSTER_MAX_SIBLINGS]:
+                selected_keys.append(opt)
 
     selected_keys = selected_keys[:max_matches]
 
     resources = []
     for rel_path in selected_keys:
         full_path = candidate_files[rel_path]
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(MAX_CONTENT_CHARS)
-        except Exception:
-            content = ""
+        # The bytes are already in `text_cache` from the criteria build: the
+        # content is sliced from the same read, not fetched again.
+        content = truncate_text(text_cache.get(rel_path, ""), MAX_CONTENT_CHARS)
 
         name = full_path.parent.name if full_path.name.lower() == "skill.md" else full_path.stem
         resources.append({
@@ -648,32 +727,39 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
 
     summary_names = ", ".join(r["name"] for r in resources)
 
-    ranked_map: Dict[str, float] = {}
-    for slot in ["primary", "secondary", "tertiary"]:
-        for f, p in _answer_probs(res, slot).items():
-            if f in candidate_files and f != "none":
-                ranked_map[f] = max(ranked_map.get(f, 0.0), p)
+    ranked_map: Dict[str, float] = {
+        opt: p for opt, p in probs.items() if opt in candidate_files and opt != "none"
+    }
     ranked = sorted(
         ({"file": f, "probability": round(p, 4)} for f, p in ranked_map.items()),
         key=lambda r: -r["probability"],
     )[:max_matches]
 
-    slot_confs = [
-        _slot_confidence(get_answer(res, slot))
-        for slot in ["primary", "secondary", "tertiary"]
-        if get_answer(res, slot) is not None
-    ]
-    confidence = round(min_confidence(slot_confs), 4)
-    actions = [
-        action_from_confidence(c, cfg.auto_accept, cfg.review_at)
-        for c in slot_confs
-    ]
+    confidence = round(_slot_confidence(primary_ans), 4)
     action = require_complete_context(
-        worst_action(actions) if actions else "escalate",
-        fitted["truncated"],
+        action_from_confidence(confidence, cfg.auto_accept, cfg.review_at),
+        fitted["truncated"] or candidates_truncated,
     )
 
-    primary_prob = round(_answer_probs(res, "primary").get(primary_val, 0.0), 4) if primary_val else None
+    reason_codes = []
+    if candidates_truncated:
+        reason_codes.append("candidates_truncated")
+    if fitted["truncated"]:
+        reason_codes.append("context_truncated")
+    if confidence < cfg.auto_accept:
+        reason_codes.append(f"confidence={confidence:.2f}<{cfg.auto_accept:.2f}")
+    if action != "auto":
+        reason_codes.append(f"action={action}")
+
+    coverage = _coverage_envelope(
+        fitted,
+        _candidate_fields(
+            complete=not candidates_truncated,
+            considered=len(options_all),
+            original_chars=sum(len(text_cache.get(o, "")) for o in options),
+            evaluated_chars=sum(len(v) for v in criteria_map.values()),
+        ),
+    )
 
     result = {
         "matched": len(resources) > 0,
@@ -683,12 +769,16 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
         "content": resources[0]["content"] if resources else None,
         "resources": resources,
         "summary": f"Found {len(resources)} relevant agent resource(s): {summary_names}",
-        "primary_probability": primary_prob,
+        "primary_probability": round(primary_prob, 4) if primary_val else None,
         "ranked": ranked,
+        "candidates_considered": len(options_all),
+        "candidates_evaluated": len(options),
+        "candidates_truncated": candidates_truncated,
+        "reason_codes": reason_codes,
         "action": action,
         "confidence": confidence,
         "truncated": fitted["truncated"],
-        "coverage": fitted["coverage"],
+        "coverage": coverage,
     }
     result.update(_response_meta(res, cfg))
     return result
@@ -697,9 +787,15 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
 # ----------------------------------------------------------------------
 # 3. Fast Workspace File Selector
 # ----------------------------------------------------------------------
-def _exists_verdict(chosen, confidence: float) -> str:
+def _exists_verdict(chosen, confidence: float, relevance_prob: float) -> str:
+    """What the model actually established about workspace relevance.
+
+    A confident Choice paired with a low presence Noul is a forced winner among
+    poor options, not an answer: that reports `partial`, which is the fail-closed
+    direction. `absent` is reserved for a genuine `none`.
+    """
     if chosen and chosen != "none":
-        return "answered"
+        return "answered" if relevance_prob >= NONE_CONFIDENCE else "partial"
     return "absent" if confidence >= 0.35 else "partial"
 
 
@@ -744,6 +840,57 @@ def _discover_files_git(
         return None
 
 
+TARGET_FILE_INSTRUCTIONS = (
+    "Select the single workspace file that must be inspected or edited to perform "
+    "the task described in `task`. Each option's description is that file's path "
+    "followed by its opening content. Choose 'none' if no supplied file is relevant."
+)
+
+TARGET_FILE_STATE_GOAL = "Identify which single workspace file must be inspected or edited."
+
+
+def _preview_criteria(root: Path, candidates: List[str]):
+    """Criteria for the workspace files: `path`, then a preview of its head.
+
+    Three bounds keep this honest on a 250-candidate tree: at most
+    `MAX_PREVIEW_READS` files are opened, the total preview payload is capped at
+    `MAX_TOTAL_PREVIEW_CHARS` and shared fairly across the candidates, and each
+    preview is at most `MAX_CANDIDATE_CHARS`. Candidates that get no preview
+    keep their path alone, which is still selectable evidence. Binary or empty
+    heads fall back to the path rather than sending noise.
+
+    A deterministic lexical prefilter would beat "first N" here: it could spend
+    the read budget on the candidates that actually mention the task. That is
+    deliberately left to the scan-cache phase; this bound is cheap and safe.
+    """
+    total = len(candidates)
+    remaining = MAX_TOTAL_PREVIEW_CHARS
+    criteria: Dict[str, str] = {}
+    previews_built = 0
+    previews_skipped = 0
+    original_chars = 0
+
+    for index, cand in enumerate(candidates):
+        if previews_built >= MAX_PREVIEW_READS or remaining <= 0:
+            previews_skipped += 1
+            criteria[cand] = cand
+            continue
+        allowance = min(
+            MAX_CANDIDATE_CHARS,
+            remaining // max(total - index, 1),
+        )
+        text = read_head(root / cand)
+        preview = markdown_preview(text, allowance) if text and not looks_binary(text) else ""
+        if preview:
+            criteria[cand] = f"{cand}\n---\n{preview}"
+            previews_built += 1
+            remaining -= len(preview)
+            original_chars += len(text)
+        else:
+            criteria[cand] = cand
+    return criteria, previews_built, previews_skipped, original_chars
+
+
 def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) -> dict:
     _check_input_length("task", task)
     root = _validate_root_dir(root_dir)
@@ -782,34 +929,64 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
             "files": [],
             "exists": "no_candidates",     # was "absent" — see note
             "probability": 0.0,
+            "relevance_prob": 0.0,
             "ranked": [],
+            "candidates_truncated": False,
             "action": "auto",
             "confidence": None,
             "truncated": False,
-            "coverage": _coverage_envelope(None),
+            "coverage": _coverage_envelope(
+                None, _candidate_fields(True, 0, 0, 0, previews_built=0, previews_skipped=0)
+            ),
             "model": None,
             "usage": None,
         }
         return result
 
-    criteria = {cand: "Candidate workspace file relevant to the task" for cand in candidates}
-    criteria["none"] = "None of the supplied workspace files is relevant to the task"
+    # Building a preview means reading a file, so the read count and the total
+    # preview bytes are both bounded. Anything past the bound keeps its path
+    # only — still a selectable option, just without content evidence.
+    candidates_truncated = len(candidates) >= MAX_CHOICE_OPTIONS
+    criteria, previews_built, previews_skipped, original_chars = _preview_criteria(root, candidates)
+    criteria["none"] = "None of the supplied workspace files must be inspected or edited for this task."
+
+    questions = {
+        "target_file": Choice(criteria=criteria, instructions=TARGET_FILE_INSTRUCTIONS),
+        "is_relevant": Noul(
+            instructions=(
+                "Does at least one of the supplied workspace files actually have to be "
+                "inspected or edited to perform the task, or is the top-ranked file a "
+                "forced winner among files that are all poor matches?"
+            ),
+            criteria={
+                "true": "At least one supplied file is genuinely required for the task",
+                "false": "No supplied file is genuinely required; the top choice is a forced winner",
+            },
+        ),
+    }
 
     res, fitted, cfg = _request(
-        f"User Task: {task}\nGoal: Identify which specific workspace files must be inspected or edited.",
-        {"target_file": Choice(criteria=criteria, instructions="Select the primary workspace file that directly relates to this task.")},
+        {
+            "task": task,
+            "goal": TARGET_FILE_STATE_GOAL,
+            "candidates_evaluated": len(candidates),
+        },
+        questions,
     )
 
     target_ans = get_answer(res, "target_file")
     chosen = get_val(target_ans)
     probs = _answer_probs(res, "target_file")
     conf = _slot_confidence(target_ans)
+    relevance_prob = round(float(get_prob(get_answer(res, "is_relevant"))), 4)
     action = require_complete_context(
         action_from_confidence(conf, cfg.auto_accept, cfg.review_at),
-        fitted["truncated"],
+        fitted["truncated"] or candidates_truncated,
     )
 
-    escaped = not chosen or chosen == "none"
+    # A low presence probability means the top file is a forced winner among
+    # options that do not fit, so it is not reported as a match.
+    escaped = (not chosen) or chosen == "none" or relevance_prob < NONE_CONFIDENCE
     if not escaped:
         probability = round(probs.get(chosen, 0.0), 4)
         files = [chosen]
@@ -825,13 +1002,25 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
     result = {
         "matched": not escaped,
         "files": files if not escaped else [],
-        "exists": _exists_verdict(chosen, conf),
+        "exists": _exists_verdict(chosen, conf, relevance_prob),
         "probability": probability,
+        "relevance_prob": relevance_prob,
         "ranked": ranked,
+        "candidates_truncated": candidates_truncated,
         "action": action,
         "confidence": round(conf, 4),
         "truncated": fitted["truncated"],
-        "coverage": fitted["coverage"],
+        "coverage": _coverage_envelope(
+            fitted,
+            _candidate_fields(
+                complete=not candidates_truncated,
+                considered=len(candidates),
+                original_chars=original_chars,
+                evaluated_chars=sum(len(v) for v in criteria.values()),
+                previews_built=previews_built,
+                previews_skipped=previews_skipped,
+            ),
+        ),
     }
     result.update(_response_meta(res, cfg))
     return result

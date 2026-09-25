@@ -1,0 +1,152 @@
+[
+  {
+    "id": "policy-threshold",
+    "task": "change the confidence threshold that decides between auto and review",
+    "expected_file": "policy.py",
+    "expected_skill": null
+  },
+  {
+    "id": "token-estimate",
+    "task": "estimate the token count of a large state string",
+    "expected_file": "limits.py",
+    "expected_skill": null
+  },
+  {
+    "id": "offline-judge",
+    "task": "the deterministic offline judge used when no API key is configured",
+    "expected_file": "mock.py",
+    "expected_skill": null
+  },
+  {
+    "id": "error-mapping",
+    "task": "map a TypeSafe API failure into a stable error code and retryable flag",
+    "expected_file": "jev_errors.py",
+    "expected_skill": null
+  },
+  {
+    "id": "log-redaction",
+    "task": "redact secret looking values before a record is written to disk",
+    "expected_file": "jev_logging.py",
+    "expected_skill": null
+  },
+  {
+    "id": "mcp-tool-registration",
+    "task": "register the four MCP tools the opencode plugin calls",
+    "expected_file": "jev_mcp.py",
+    "expected_skill": null
+  },
+  {
+    "id": "response-validation",
+    "task": "check that a system_one response matches the questions that produced it",
+    "expected_file": "jev_validation.py",
+    "expected_skill": null
+  },
+  {
+    "id": "env-config",
+    "task": "read TYPESAFE_API_KEY and JEV_MCP_MOCK from the environment with fallback",
+    "expected_file": "config.py",
+    "expected_skill": null
+  },
+  {
+    "id": "retry-backoff",
+    "task": "tune the retry backoff and the scan directories used for routing",
+    "expected_file": "jev_engine.py",
+    "expected_skill": null
+  },
+  {
+    "id": "uninformative-name",
+    "task": "the uninformative file that dispatches incoming requests",
+    "expected_file": "jev_mcp.py",
+    "expected_skill": null
+  },
+  {
+    "id": "plan-index",
+    "task": "the index of reliability and performance remediation phases",
+    "expected_file": ".agents_plans/README.md",
+    "expected_skill": null
+  },
+  {
+    "id": "phase-plan",
+    "task": "the work order for giving the Choice questions candidate evidence",
+    "expected_file": ".agents_plans/phase-3-decision-quality.md",
+    "expected_skill": null
+  },
+  {
+    "id": "benchmark",
+    "task": "the offline benchmark harness with regression gates",
+    "expected_file": "scripts/bench_jev.py",
+    "expected_skill": null
+  },
+  {
+    "id": "diagnostic-client",
+    "task": "the stdio diagnostic client that reproduces a tool failure",
+    "expected_file": "scripts/diag_mcp.py",
+    "expected_skill": null
+  },
+  {
+    "id": "sdk-dependency",
+    "task": "the pinned python SDK dependency for the Jev client",
+    "expected_file": "requirements.txt",
+    "expected_skill": null
+  },
+  {
+    "id": "repo-readme",
+    "task": "how to install and configure the MCP server",
+    "expected_file": "README.md",
+    "expected_skill": null
+  },
+  {
+    "id": "perf-doc",
+    "task": "the recorded benchmark numbers and phase five targets",
+    "expected_file": "docs/perf-baseline.md",
+    "expected_skill": null
+  },
+  {
+    "id": "skill-typesafe",
+    "task": "build an AI powered app with TypeSafe and System One models",
+    "expected_file": null,
+    "expected_skill": ".agents/skills/typesafe-ai/SKILL.md"
+  },
+  {
+    "id": "skill-guardrail",
+    "task": "which agent skill should be loaded before judging a destructive shell command",
+    "expected_file": "policy.py",
+    "expected_skill": ".agents/skills/typesafe-ai/SKILL.md"
+  },
+  {
+    "id": "no-match-dark-mode",
+    "task": "add a dark mode toggle to the settings screen of a React app",
+    "expected_file": null,
+    "expected_skill": null
+  },
+  {
+    "id": "no-match-chmod",
+    "task": "chmod the deploy script and rotate the production database password",
+    "expected_file": null,
+    "expected_skill": null
+  },
+  {
+    "id": "no-match-godot",
+    "task": "add a 2D player controller with double jump to the Godot platformer scene",
+    "expected_file": null,
+    "expected_skill": null
+  },
+  {
+    "id": "no-match-k8s",
+    "task": "add a liveness probe to the helm chart for the ingest deployment",
+    "expected_file": null,
+    "expected_skill": null
+  },
+  {
+    "id": "no-match-sourdough",
+    "task": "sourdough bread recipe with a rye starter and a 24 hour bulk ferment",
+    "expected_file": null,
+    "expected_skill": null
+  },
+  {
+    "id": "no-match-rust",
+    "task": "sort a vector of structs by two keys in Rust with a custom comparator",
+    "expected_file": null,
+    "expected_skill": null
+  }
+]

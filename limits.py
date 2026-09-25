@@ -19,6 +19,26 @@ MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS = 32_000
 MAX_CHOICE_OPTIONS = 250
 #: Per-content read cap for resources.
 MAX_CONTENT_CHARS = 6_000
+#: Per-candidate evidence included in Choice criteria. Ported from
+#: reference/burnigtm-jev-mcp/src/limits.ts:9.
+MAX_CANDIDATE_CHARS = 2_000
+#: Upper bound on candidates supplied to a tool. Matches MAX_CHOICE_OPTIONS but is
+#: a separate knob: this one bounds *our* input, the other bounds the API.
+MAX_RANK_CANDIDATES = 5_000
+#: Total evidence budget for one Choice question's criteria, in characters.
+#: MAX_CANDIDATE_CHARS * MAX_CHOICE_OPTIONS would be 500k chars (~125k tokens),
+#: far past MAX_TOTAL_TOKENS, so the per-candidate share is capped by this
+#: budget: 96k ASCII chars is ~24k estimated tokens, which leaves headroom under
+#: both MAX_TOTAL_TOKENS and MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS.
+MAX_TOTAL_CRITERIA_CHARS = 96_000
+#: At most this many candidates get a preview built (select_target_files); the
+#: remainder fall back to the path alone. Bounds per-call filesystem work.
+MAX_PREVIEW_READS = 120
+#: Total preview characters sent for one request, shared round-robin.
+MAX_TOTAL_PREVIEW_CHARS = 40_000
+#: Bytes read from the head of a file to derive its preview. Previews are capped
+#: at MAX_CANDIDATE_CHARS, so reading further is pure I/O.
+MAX_PREVIEW_READ_CHARS = 16_000
 
 TRUNCATION_MARKER = "\n…[truncated]"
 

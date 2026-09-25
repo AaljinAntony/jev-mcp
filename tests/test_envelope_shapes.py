@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import pytest
 
-from typesafe_sdk import ChoiceAnswer, SystemOneResponse, Usage
+from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
 import jev_engine
 
 
@@ -48,7 +48,6 @@ class TestFindAgentResourcesEnvelopeKeys:
             model="jev-mock",
             answers={
                 "primary": ChoiceAnswer(choice="none", probabilities={rel1: 0.05, "none": 0.95}, confidence=0.9),
-                "secondary": ChoiceAnswer(choice="none", probabilities={rel1: 0.0, "none": 1.0}, confidence=1.0),
             },
             usage=Usage(input_tokens=10, output_tokens=5),
         )
@@ -100,6 +99,7 @@ class TestSelectTargetFilesEnvelopeKeys:
             model="jev-mock",
             answers={
                 "target_file": ChoiceAnswer(choice="none", probabilities={"main.py": 0.1, "util.py": 0.1, "none": 0.8}, confidence=0.7),
+                "is_relevant": NoulAnswer(noul=0.1),
             },
             usage=Usage(input_tokens=10, output_tokens=5),
         )

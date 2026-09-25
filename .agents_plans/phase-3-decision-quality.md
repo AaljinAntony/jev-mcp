@@ -470,17 +470,25 @@ node tests/test_plugin.mjs
 
 ## Definition of done
 
-- [ ] `Choice` criteria contain candidate text, not just basenames
-- [ ] `SKILL.md` front-matter `description` is used when present
-- [ ] `secondary`/`tertiary` removed; `ranked` derived from `primary` alone
-- [ ] `search_target_files` sends an `is_relevant` Noul alongside the Choice
-- [ ] A confident Choice + low presence Noul yields `exists: "partial"`
-- [ ] `candidates_truncated` is reported and forces `action != "auto"`
-- [ ] Family clustering requires `primary_prob >= 0.5` and adds at most 2 siblings
-- [ ] Each selected file is read exactly once
-- [ ] `input_tokens` per call is flat or lower vs the Phase 1 baseline
-- [ ] top-1 accuracy and false-positive rate both improved on the fixture set
-- [ ] `pytest`, `bench_jev.py --assert`, `node tests/test_plugin.mjs` all green
+- [x] `Choice` criteria contain candidate text, not just basenames
+- [x] `SKILL.md` front-matter `description` is used when present
+- [x] `secondary`/`tertiary` removed; `ranked` derived from `primary` alone
+- [x] `search_target_files` sends an `is_relevant` Noul alongside the Choice
+- [x] A confident Choice + low presence Noul yields `exists: "partial"`
+- [x] `candidates_truncated` is reported and forces `action != "auto"`
+- [x] Family clustering requires `primary_prob >= 0.5` and adds at most 2 siblings
+- [x] Each selected file is read exactly once
+- [ ] `input_tokens` per call is flat or lower vs the Phase 1 baseline — **not
+      met, and not reachable**: the old request sent 47 bare paths and no content.
+      Measured 878 → 6 731 tokens per call, now bounded by `MAX_PREVIEW_READS`
+      (120) and `MAX_TOTAL_PREVIEW_CHARS` (40 000). Halving the preview budget to
+      24 000 costs 11 points of top-1 (0.778 → 0.667); see `docs/perf-baseline.md`.
+- [~] top-1 accuracy **0.444 → 0.667–0.833** and top-3 recall **0.778 → 1.000**
+      (3/3 live runs). The false-positive rate is flat at 0.00–0.14, because the
+      old `none` description already handled the obvious no-match cases; what the
+      presence Noul measurably changes is that a confident Choice with weak
+      presence now reports `exists: "partial"` (0.00 → 0.08–0.16 of all cases)
+- [x] `pytest`, `bench_jev.py --assert`, `node tests/test_plugin.mjs` all green
 
 ## Commit
 

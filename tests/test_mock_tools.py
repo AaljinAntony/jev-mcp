@@ -12,7 +12,6 @@ from typesafe_sdk import (
     SystemOneResponse,
     Usage,
 )
-
 import jev_engine
 import jev_mcp
 
@@ -110,8 +109,12 @@ class TestSearchAgentSkills:
         skills = tmp_path / ".agents" / "skills"
         (skills / "tool-x").mkdir(parents=True)
         (skills / "tool-y").mkdir(parents=True)
-        (skills / "tool-x" / "SKILL.md").write_text("# tool-x\ntheme and layout helpers", encoding="utf-8")
-        (skills / "tool-y" / "SKILL.md").write_text("# tool-y\nui dialog navigation", encoding="utf-8")
+        (skills / "tool-x" / "SKILL.md").write_text(
+            "---\ndescription: theme and layout helpers\n---\n# tool-x\n", encoding="utf-8"
+        )
+        (skills / "tool-y" / "SKILL.md").write_text(
+            "---\ndescription: ui dialog navigation\n---\n# tool-y\n", encoding="utf-8"
+        )
 
         result = jev_engine.find_agent_resources("theme layout helper", str(tmp_path))
         assert "matched" in result and isinstance(result["matched"], bool)
@@ -123,6 +126,11 @@ class TestSearchAgentSkills:
         assert "confidence" in result
         assert "model" in result and result["model"].endswith("+mock")
         assert "usage" in result
+        # the front-matter description is what reached the model
+        assert result["coverage"]["candidate_fields"]["evaluated_chars"] > 0
+        assert result["candidates_considered"] == 2
+        assert result["candidates_truncated"] is False
+        assert "candidates_truncated" not in result["reason_codes"]
 
     def test_mock_with_no_skills(self, tmp_path):
         result = jev_engine.find_agent_resources("anything", str(tmp_path))
@@ -141,6 +149,67 @@ class TestSearchAgentSkills:
         assert result["matched"] is False
         assert result["count"] == 0
         assert result["resources"] == []
+
+    def test_single_question_and_front_matter_evidence(self, tmp_path, monkeypatch):
+        skills = tmp_path / ".agents" / "skills"
+        for name, description in [("alpha", "release notes drafting"), ("beta", "sqlite index tuning")]:
+            (skills / name).mkdir(parents=True)
+            (skills / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\nbody text\n",
+                encoding="utf-8",
+            )
+
+        seen = {}
+
+        def _spy(state, questions):
+            seen["keys"] = set(questions.keys())
+            seen["criteria"] = dict(questions["primary"].criteria)
+            seen["state"] = state
+            return (
+                _fake_response({
+                    "primary": ChoiceAnswer(
+                        choice=".agents/skills/beta/SKILL.md",
+                        confidence=0.9,
+                        probabilities={
+                            ".agents/skills/alpha/SKILL.md": 0.05,
+                            ".agents/skills/beta/SKILL.md": 0.9,
+                            "none": 0.05,
+                        },
+                    )
+                }),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _spy)
+        result = jev_engine.find_agent_resources("tune the database index", str(tmp_path))
+
+        # secondary/tertiary are gone: one ranking, one question
+        assert seen["keys"] == {"primary"}
+        assert "none" in seen["criteria"]
+        assert seen["criteria"][".agents/skills/beta/SKILL.md"] == "sqlite index tuning"
+        assert seen["state"]["task"] == "tune the database index"
+        assert seen["state"]["candidates_considered"] == 2
+        assert result["file"] == ".agents/skills/beta/SKILL.md"
+        assert result["primary_probability"] == 0.9
+        assert [r["file"] for r in result["ranked"]][0] == ".agents/skills/beta/SKILL.md"
+        # one read per candidate: the returned content is the cached text
+        assert "sqlite index tuning" in result["content"]
+
+    def test_candidate_truncation_reported_and_degrades_action(self, tmp_path, monkeypatch):
+        skills = tmp_path / ".agents" / "skills"
+        for i in range(4):
+            (skills / f"s{i}").mkdir(parents=True)
+            (skills / f"s{i}" / "SKILL.md").write_text(f"skill {i} body", encoding="utf-8")
+
+        monkeypatch.setattr(jev_engine, "MAX_CHOICE_OPTIONS", 2)
+        result = jev_engine.find_agent_resources("skill 1", str(tmp_path))
+        assert result["candidates_considered"] == 4
+        assert result["candidates_evaluated"] == 2
+        assert result["candidates_truncated"] is True
+        assert "candidates_truncated" in result["reason_codes"]
+        assert result["action"] != "auto"
+        assert result["coverage"]["candidate_fields"]["complete"] is False
 
     def test_dict_shaped_answer_sibling_augmentation(self, tmp_path, monkeypatch):
         skills = tmp_path / ".agents" / "skills"
@@ -161,12 +230,6 @@ class TestSearchAgentSkills:
                     "choice": rel_a,
                     "confidence": 0.8,
                     "probabilities": {rel_a: 0.8, rel_b: 0.2},
-                },
-                "secondary": {
-                    "type": "choice",
-                    "choice": "none",
-                    "confidence": 0.5,
-                    "probabilities": {rel_a: 0.0, rel_b: 0.0, "none": 1.0},
                 },
             },
             usage=Usage(input_tokens=10, output_tokens=5),
@@ -247,7 +310,8 @@ class TestSearchTargetFiles:
                         choice="none",
                         confidence=0.8,
                         probabilities={"src/core.py": 0.2, "none": 0.8},
-                    )
+                    ),
+                    "is_relevant": NoulAnswer(noul=0.1),
                 }
             ),
         )
@@ -255,6 +319,61 @@ class TestSearchTargetFiles:
         assert result["matched"] is False
         assert result["files"] == []
         assert result["exists"] in {"absent", "partial"}
+        assert result["relevance_prob"] == 0.1
+
+    def test_confident_choice_with_low_presence_is_partial(self, tmp_path, monkeypatch):
+        # The presence Noul is the whole point: a forced winner among poor options
+        # must not read as a match, even when the Choice is confident.
+        target = tmp_path / "src" / "core.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("def run(): pass", encoding="utf-8")
+
+        monkeypatch.setattr(
+            jev_engine,
+            "execute_system_one",
+            lambda *a, **k: _fake_response(
+                {
+                    "target_file": ChoiceAnswer(
+                        choice="src/core.py",
+                        confidence=0.9,
+                        probabilities={"src/core.py": 0.9, "none": 0.1},
+                    ),
+                    "is_relevant": NoulAnswer(noul=0.2),
+                }
+            ),
+        )
+        result = jev_engine.select_target_files("something unrelated", str(tmp_path))
+        assert result["exists"] == "partial"
+        assert result["matched"] is False
+        assert result["files"] == []
+
+    def test_presence_noul_present_for_every_call(self, tmp_path, monkeypatch):
+        (tmp_path / "a.py").write_text("print('a')", encoding="utf-8")
+        seen = {}
+
+        def _spy(state, questions):
+            seen["keys"] = set(questions.keys())
+            seen["criteria"] = dict(questions["target_file"].criteria)
+            seen["state"] = state
+            return (
+                _fake_response({
+                    "target_file": ChoiceAnswer(
+                        choice="a.py", confidence=0.9, probabilities={"a.py": 0.9, "none": 0.1}
+                    ),
+                    "is_relevant": NoulAnswer(noul=0.8),
+                }),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _spy)
+        jev_engine.select_target_files("print a", str(tmp_path))
+        assert seen["keys"] == {"target_file", "is_relevant"}
+        assert "none" in seen["criteria"]
+        # criteria carry the file's opening content, not one shared sentence
+        assert "print" in seen["criteria"]["a.py"]
+        assert seen["criteria"]["a.py"].startswith("a.py")
+        assert seen["state"]["task"] == "print a"
 
     def test_discover_files_git_returns_none_for_nongit(self, tmp_path):
         assert jev_engine._discover_files_git(tmp_path, {".png"}, 10) is None
@@ -328,6 +447,96 @@ class TestSearchTargetFiles:
         (tmp_path / "file.py").write_text("pass", encoding="utf-8")
         result = jev_engine.select_target_files("", str(tmp_path))
         assert "matched" in result
+
+
+class TestEvidenceBudget:
+    """The Choice has to see real content, and getting it must stay bounded."""
+
+    def test_selected_skill_is_read_exactly_once(self, tmp_path, monkeypatch):
+        skills = tmp_path / ".agents" / "skills" / "alpha"
+        skills.mkdir(parents=True)
+        (skills / "SKILL.md").write_text(
+            "---\ndescription: alpha summary\n---\n" + "body line\n" * 500,
+            encoding="utf-8",
+        )
+        (tmp_path / ".agents" / "skills" / "beta").mkdir(parents=True)
+        (tmp_path / ".agents" / "skills" / "beta" / "SKILL.md").write_text(
+            "---\ndescription: beta summary\n---\nbeta body\n", encoding="utf-8"
+        )
+
+        opens = []
+        real_open = jev_engine.read_head
+
+        def _counting_read(path, *args, **kwargs):
+            opens.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(jev_engine, "read_head", _counting_read)
+        result = jev_engine.find_agent_resources("alpha summary", str(tmp_path))
+        assert result["file"] == ".agents/skills/alpha/SKILL.md"
+        assert len(opens) == len(set(opens)), "a candidate was read more than once"
+        # the returned content is the cached text, not a second read
+        assert "body line" in result["content"]
+
+    def test_target_file_previews_are_bounded(self, tmp_path, monkeypatch):
+        names = [f"mod_{i:03d}.py" for i in range(200)]
+        for name in names:
+            (tmp_path / name).write_text("# module\ndef process(): pass\n", encoding="utf-8")
+        monkeypatch.setattr(jev_engine, "MAX_PREVIEW_READS", 10)
+        monkeypatch.setattr(
+            jev_engine, "_discover_files_git", lambda root, exts, count, dirs=None: names
+        )
+
+        captured = {}
+
+        def _spy(state, questions):
+            captured["criteria"] = dict(questions["target_file"].criteria)
+            return (
+                _fake_response({
+                    "target_file": ChoiceAnswer(
+                        choice=names[0], confidence=0.9, probabilities={**{n: 0.005 for n in names}, names[0]: 0.5, "none": 0.0}
+                    ),
+                    "is_relevant": NoulAnswer(noul=0.9),
+                }),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _spy)
+        result = jev_engine.select_target_files("process", str(tmp_path))
+
+        fields = result["coverage"]["candidate_fields"]
+        assert fields["previews_built"] == 10
+        assert fields["previews_skipped"] == len(names) - 10
+        assert fields["candidates_considered"] == len(names)
+        # skipped candidates keep a selectable path, they are never dropped
+        assert captured["criteria"][names[50]] == names[50]
+        assert "def process" in captured["criteria"][names[0]]
+
+    def test_binary_file_falls_back_to_path(self, tmp_path, monkeypatch):
+        (tmp_path / "logo.png").write_bytes(b"\x89PNG\x00\x00\x00\x00" + b"\x00" * 64)
+        (tmp_path / "app.py").write_text("print('app')\n", encoding="utf-8")
+        monkeypatch.setattr(jev_engine, "_discover_files_git", lambda *a, **k: ["logo.png", "app.py"])
+
+        captured = {}
+
+        def _spy(state, questions):
+            captured.update(questions["target_file"].criteria)
+            return (
+                _fake_response({
+                    "target_file": ChoiceAnswer(
+                        choice="app.py", confidence=0.9, probabilities={"app.py": 0.9, "logo.png": 0.05, "none": 0.05}
+                    ),
+                    "is_relevant": NoulAnswer(noul=0.9),
+                }),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _spy)
+        jev_engine.select_target_files("print", str(tmp_path))
+        assert captured["logo.png"] == "logo.png"
+        assert "print" in captured["app.py"]
 
 
 class TestSelectModelTier:

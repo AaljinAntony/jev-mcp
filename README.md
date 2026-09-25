@@ -34,12 +34,15 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | `D:\mcp\jev-typesafe-mcp\jev_errors.py` | Typed errors + `error_details()` envelope mapping |
 | `D:\mcp\jev-typesafe-mcp\jev_validation.py` | Fail-closed response envelope validation |
 | `D:\mcp\jev-typesafe-mcp\policy.py` | Confidence, policy actions, escape hatches, thresholds |
+| `D:\mcp\jev-typesafe-mcp\candidates.py` | Candidate discovery + evidence previews for the `Choice` criteria |
 | `D:\mcp\jev-typesafe-mcp\limits.py` | Token budget estimation + state fitting/truncation |
 | `D:\mcp\jev-typesafe-mcp\config.py` | Env config parsing + validation (`JEV_MCP_*`) |
 | `D:\mcp\jev-typesafe-mcp\mock.py` | Deterministic offline judge for `JEV_MCP_MOCK=1` |
 | `D:\mcp\jev-typesafe-mcp\jev_logging.py` | Filesystem logging (tool calls, provider rounds, tracebacks) |
 | `D:\mcp\jev-typesafe-mcp\scripts\diag_mcp.py` | Transport-level MCP repro client for any workspace + prompt |
-| `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, mock tools, live smoke |
+| `D:\mcp\jev-typesafe-mcp\scripts\bench_jev.py` | Offline timing/size benchmark with `--assert` regression gates |
+| `D:\mcp\jev-typesafe-mcp\scripts\eval_routing.py` | Routing accuracy/false-positive/token harness over `tests\fixtures\routing_tasks.json` |
+| `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, candidates, mock tools, live smoke |
 | `D:\mcp\jev-typesafe-mcp\requirements.txt` | Pinned Python dependencies (UTF-8) |
 | `D:\mcp\jev-typesafe-mcp\.env` | Local secrets — holds `TYPESAFE_API_KEY` (never committed) |
 | `D:\mcp\jev-typesafe-mcp\.env.example` | Template showing required + optional env keys |
@@ -66,6 +69,7 @@ jev_mcp.py  ── MCPServer("jev-engine") ── 4 tools (typed error envelopes
    ▼
 jev_engine.py  ── execute_system_one ── TypeSafeClient.system_one(state, questions)
    │                │                       (mock branch when JEV_MCP_MOCK=1)
+   │                ├─ candidates()          candidates.py (candidate previews)
    │                ├─ fit_state()            limits.py   (token budget → truncated)
    │                ├─ validate_response()    jev_validation.py (fail-closed)
    │                └─ policy                 policy.py   (confidence/action)
@@ -79,16 +83,21 @@ jevs_settings.json  (enable_model_routing, models, scan_paths)
 ### Decision flow
 
 1. A tool receives a prompt/task/command via MCP.
-2. `jev_engine` fits `state` to the token budget (`limits.fit_state`), calls
+2. For the selection tools, `candidates.py` turns each candidate path into a short
+   evidence string (a `SKILL.md` front-matter `description` where present, else
+   the head of the file), bounded by `limits.MAX_CANDIDATE_CHARS` and the total
+   preview budget. A `Choice` can only pick from the options it is given, so this
+   is what makes the options distinguishable.
+3. `jev_engine` fits `state` to the token budget (`limits.fit_state`), calls
    `TypeSafeClient.system_one(state=..., questions=...)` (or the mock judge)
    using `Noul` / `Choice` primitives.
-3. `jev_validation.validate_response` verifies the response against the
+4. `jev_validation.validate_response` verifies the response against the
    questions **before any policy number is read**. Malformed or
    self-contradictory answers raise `JevResponseError` — they are never read
    as `safe:true`.
-4. `policy.py` maps probabilities to `confidence` and an `action`
+5. `policy.py` maps probabilities to `confidence` and an `action`
    (`auto | review | escalate`); truncated context never yields `auto`.
-5. A JSON-serializable dict is returned with the legacy keys plus
+6. A JSON-serializable dict is returned with the legacy keys plus
    `action/confidence/ranked/model/usage/truncated/coverage`.
 
 ### Result envelope & typed errors
@@ -170,8 +179,9 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
 
 - **Params:** `task` (required), `root_dir` (default `.`)
 - **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jevs_settings.scan_paths`
-- **Jev primitives:** `primary` / `secondary` / `tertiary` (`Choice`, `criteria={path: description}`)
-- **Key capabilities:** probability matching (secondary picks ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`)
+- **Jev primitive:** `primary` (`Choice`, one question). `criteria` carry each document's own summary — a `SKILL.md` contributes its front-matter `description` — not its filename, so the options are actually distinguishable. `ranked` comes from `primary.probabilities`, which is the full ranking; there are no `secondary`/`tertiary` duplicates.
+- **Key capabilities:** sibling expansion (probability ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`) but only when `primary_probability >= 0.5` and for at most 2 siblings
+- **Silent-drop guard:** candidates past `MAX_CHOICE_OPTIONS` are reported in `candidates_considered` / `candidates_evaluated` / `candidates_truncated` + `reason_codes`, and a truncated candidate set forces `action != "auto"`.
 
 ```json
 {
@@ -182,9 +192,11 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
   "summary": "Found 2 relevant agent resource(s): godot-ui-theme, godot-ui-layout",
   "primary_probability": 0.91,
   "ranked": [ { "file": ".agents/skills/godot-ui-theme/SKILL.md", "probability": 0.91 }, ... ],
+  "candidates_considered": 12, "candidates_evaluated": 12, "candidates_truncated": false,
+  "reason_codes": [],
   "action": "auto", "confidence": 0.87, "truncated": false,
-  "coverage": { "complete": true, ... },
-  "model": "jev-latest", "usage": { "input_tokens": 512, "output_tokens": 24 }
+  "coverage": { "complete": true, "candidate_fields": { ... } },
+  "model": "jev-latest", "usage": { "input_tokens": 2400, "output_tokens": 24 }
 }
 ```
 
@@ -194,21 +206,25 @@ Filters the repo tree down to task-relevant files.
 
 - **Params:** `task` (required), `root_dir` (default `.`)
 - **Exclusions:** `.git`, `.godot`, `.import`, `.venv`, `node_modules`, `dist`, `build` + media/binary extensions (`.png`, `.jpg`, `.wav`, `.mp3`, `.zip`, ...)
-- **Jev primitive:** `target_file` (`Choice`, `criteria={path: description}`)
+- **Jev primitives:** `target_file` (`Choice`, `criteria={path: <path + head of file>}`) **and** `is_relevant` (`Noul`). Two independent questions over the same state, one request. The Noul is what stops a forced winner among poor options from reading as a match.
+- **Cost bounds:** at most `MAX_PREVIEW_READS` (120) file reads and `MAX_TOTAL_PREVIEW_CHARS` (40 000) preview characters per call; candidates past the bound keep their path alone and are counted in `coverage.candidate_fields.previews_skipped`.
 
 ```json
 {
   "matched": true, "files": ["src/core/player_controller.gd"],
-  "exists": "answered", "probability": 0.94,
+  "exists": "answered", "probability": 0.94, "relevance_prob": 0.88,
   "ranked": [ { "file": "src/core/player_controller.gd", "probability": 0.94 }, ... ],
+  "candidates_truncated": false,
   "action": "auto", "confidence": 0.9, "truncated": false,
-  "coverage": { "complete": true, ... },
-  "model": "jev-latest", "usage": { "input_tokens": 640, "output_tokens": 16 }
+  "coverage": { "complete": true, "candidate_fields": { ... } },
+  "model": "jev-latest", "usage": { "input_tokens": 12880, "output_tokens": 16 }
 }
 ```
 
-If no file fits, the model can pick the `none` escape hatch: `matched:false`,
-`files:[]`, and `exists` is `absent`/`partial`.
+If no file fits, the model picks the `none` escape hatch: `matched:false`,
+`files:[]`, and `exists` is `absent`/`partial`. A chosen file paired with
+`relevance_prob < 0.5` is reported as `exists: "partial"` and `matched: false` —
+the Choice was confident, but nothing actually had to be read or edited.
 
 ### 4. `select_model_tier` — dynamic model tier routing
 
@@ -328,10 +344,17 @@ crashes OpenCode.
 cd D:\mcp\jev-typesafe-mcp
 
 # Syntax check
-& .\.venv\Scripts\python.exe -m py_compile jev_engine.py jev_mcp.py
+& .\.venv\Scripts\python.exe -m py_compile jev_engine.py jev_mcp.py candidates.py
 
 # Offline test suite (no API key needed — mock mode covers the tools)
 & .\.venv\Scripts\python.exe -m pytest tests -q
+
+# Offline performance gates (deterministic; see docs/perf-baseline.md)
+& .\.venv\Scripts\python.exe scripts\bench_jev.py --assert
+
+# Routing quality: accuracy, false positives, input tokens (mock, then live)
+& .\.venv\Scripts\python.exe scripts\eval_routing.py --mode mock
+& .\.venv\Scripts\python.exe scripts\eval_routing.py --mode live
 
 # Import check
 & .\.venv\Scripts\python.exe -c "import jev_mcp; print('MCP import successful!')"
@@ -354,9 +377,10 @@ Expected outputs:
 
 ```
 py_compile OK
-58 passed
+235 passed, 3 skipped
 MCP import successful!  (server: MCPServer)
 {"safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01, "action": "auto", ...}
+All assert gates passed.
 ```
 
 A `tools/list` handshake against a running `jev_mcp.py` returns exactly four tools:
@@ -379,9 +403,13 @@ A `tools/list` handshake against a running `jev_mcp.py` returns exactly four too
 
 Runs the same tools end-to-end through a **deterministic offline judge**
 (`mock.py`) that returns plausible `Noul`/`Choice` answers from keyword/overlap
-heuristics. Earlier telemetry says the mock exercises the **full validation and
-policy pipeline** with the exact SDK object shapes. It exists for tests, demos,
-and development without an API key — never as a production decision engine.
+heuristics. The mock scores options by inverse-frequency shared terms with the
+task, and answers a presence `Noul` from the same candidate evidence, so it
+behaves sensibly against real candidate previews. It exercises the **full
+validation and policy pipeline** with the exact SDK object shapes. It exists for
+tests, demos, and development without an API key — never as a production
+decision engine: its routing accuracy is far below live Jev (see
+`docs/perf-baseline.md`).
 
 ### Tests
 
