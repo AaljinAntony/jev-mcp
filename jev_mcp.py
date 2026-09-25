@@ -1,6 +1,8 @@
 import os
 import sys
+import atexit
 import time
+import logging
 from pathlib import Path
 
 # Ensure the local directory is in Python's path
@@ -25,6 +27,23 @@ from jev_logging import log_tool_call, log_event, log_exception, log_path
 mcp = FastMCP("jev-engine")
 
 log_event("server_start", pid=os.getpid(), log_file=str(log_path()))
+
+
+def _on_shutdown() -> None:
+    """Flush buffered log records and record a stop event on process exit."""
+    previous = logging.raiseExceptions
+    logging.raiseExceptions = False
+    try:
+        log_event("server_stop", pid=os.getpid())
+        for handler in logging.getLogger("jev_engine").handlers:
+            handler.flush()
+    except Exception:
+        pass
+    finally:
+        logging.raiseExceptions = previous
+
+
+atexit.register(_on_shutdown)
 
 
 def _run(tool: str, fn, **args):

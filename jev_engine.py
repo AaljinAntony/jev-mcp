@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -21,11 +22,13 @@ from jev_errors import (
     JevValidationError,
     error_details,
 )
-from jev_logging import log_round
+from jev_logging import log_round, log_event
 from jev_validation import validate_response
 from limits import fit_state, MAX_CHOICE_OPTIONS, MAX_CONTENT_CHARS
 from mock import mock_system_one
 from policy import (
+    DEFAULT_RISK_THRESHOLD,
+    DEFAULT_ESCALATE_THRESHOLD,
     action_from_confidence,
     confidence_from_probabilities,
     guardrail_safe,
@@ -59,16 +62,45 @@ def _validate_root_dir(root_dir: str) -> Path:
     """Resolve and sanity-check root_dir. Rejects system-level paths."""
     _check_input_length("root_dir", root_dir)
     root = Path(root_dir).resolve()
-    # Block obvious system roots
-    blocked = {Path("/").resolve(), Path("/etc").resolve(), Path("/usr").resolve()}
+
+    blocked_posix = {
+        Path("/").resolve(),
+        Path("/etc").resolve(),
+        Path("/usr").resolve(),
+        Path("/bin").resolve(),
+        Path("/sbin").resolve(),
+    }
+    if root in blocked_posix:
+        raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+
     if os.name == "nt":
-        for drive in "CDEFGH":
-            blocked.add(Path(f"{drive}:\\Windows").resolve())
-            blocked.add(Path(f"{drive}:\\").resolve())
-        sys_root = os.environ.get("SystemRoot") or os.environ.get("windir")
-        if sys_root:
-            blocked.add(Path(sys_root).resolve())
-    if root in blocked or root.parent == root:
+        if root.parent == root or len(root.parts) <= 1:
+            raise JevValidationError(
+                f"root_dir '{root_dir}' points to a filesystem drive root (system directory)."
+            )
+        root_lower = str(root).lower().rstrip("\\")
+        for env_var in [
+            "SystemRoot",
+            "windir",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+        ]:
+            val = os.environ.get(env_var)
+            if val:
+                val_resolved = str(Path(val).resolve()).lower().rstrip("\\")
+                if root_lower == val_resolved or root_lower.startswith(val_resolved + "\\"):
+                    raise JevValidationError(
+                        f"root_dir '{root_dir}' points inside a system directory ({env_var})."
+                    )
+        # The system drive is a volume root, not a system directory: only the
+        # bare drive itself is rejected, never arbitrary data on that volume.
+        drive = os.environ.get("SystemDrive")
+        if drive and root_lower == drive.lower().rstrip("\\"):
+            raise JevValidationError(
+                f"root_dir '{root_dir}' points to a filesystem drive root (system directory)."
+            )
+
+    if root.parent == root:
         raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
     if not root.is_dir():
         raise JevValidationError(f"root_dir '{root_dir}' does not exist or is not a directory.")
@@ -133,6 +165,27 @@ def _apply_jev_settings(settings: dict, jev: dict) -> bool:
     return True
 
 
+_cached_settings: Optional[dict] = None
+_cached_settings_mtimes: dict = {}
+
+
+def _reset_settings_cache() -> None:
+    """Clear the cached settings. Exposed for tests."""
+    global _cached_settings, _cached_settings_mtimes
+    _cached_settings = None
+    _cached_settings_mtimes = {}
+
+
+def _get_files_mtime_signature(files: List[Path]) -> dict:
+    mtimes = {}
+    for f in files:
+        try:
+            mtimes[str(f)] = f.stat().st_mtime
+        except (OSError, FileNotFoundError):
+            mtimes[str(f)] = None
+    return mtimes
+
+
 def load_jev_settings() -> dict:
     """Read Jev settings from jevs_settings.json (project wins over user).
 
@@ -140,31 +193,53 @@ def load_jev_settings() -> dict:
     ~/.config/opencode/jevs_settings.json -> legacy `jev_settings` block in
     opencode.json (project > user). Falls back to defaults when nothing matches:
     routing off, empty model map, built-in scan paths.
+
+    Results are cached and only re-read when a candidate file's mtime changes.
     """
+    global _cached_settings, _cached_settings_mtimes
+
+    settings_files = _find_settings_files()
+    config_files = _find_config_files()
+    current_mtimes = _get_files_mtime_signature(settings_files + config_files)
+
+    if _cached_settings is not None and _cached_settings_mtimes == current_mtimes:
+        return _cached_settings
+
     settings = {
         "enable_model_routing": False,
         "models": {},
         "scan_paths": list(DEFAULT_SCAN_PATHS),
         "source": None,
     }
-    for cfg in _find_settings_files():
+
+    for cfg in settings_files:
         try:
             raw = json.loads(cfg.read_text(encoding="utf-8"))
         except Exception as e:
+            log_event("settings_parse_error", file=str(cfg), error=str(e))
             sys.stderr.write(f"jev_engine: failed reading {cfg}: {e}\n")
             continue
         if _apply_jev_settings(settings, raw.get("jev_settings") or raw):
             settings["source"] = str(cfg)
+            _cached_settings = settings
+            _cached_settings_mtimes = current_mtimes
             return settings
-    for cfg in _find_config_files():
+
+    for cfg in config_files:
         try:
             raw = json.loads(cfg.read_text(encoding="utf-8"))
         except Exception as e:
+            log_event("settings_parse_error", file=str(cfg), error=str(e))
             sys.stderr.write(f"jev_engine: failed reading {cfg}: {e}\n")
             continue
         if _apply_jev_settings(settings, raw.get("jev_settings") or {}):
             settings["source"] = str(cfg)
+            _cached_settings = settings
+            _cached_settings_mtimes = current_mtimes
             return settings
+
+    _cached_settings = settings
+    _cached_settings_mtimes = current_mtimes
     return settings
 
 
@@ -184,13 +259,15 @@ def get_scan_paths(root: Path) -> List[Path]:
 # Module-level cache
 _cached_client: Optional[TypeSafeClient] = None
 _cached_client_key: Optional[tuple] = None
+_client_lock = threading.Lock()
 
 
 def _reset_client_cache() -> None:
     """Clear the cached client. Exposed for tests."""
     global _cached_client, _cached_client_key
-    _cached_client = None
-    _cached_client_key = None
+    with _client_lock:
+        _cached_client = None
+        _cached_client_key = None
 
 
 def get_client() -> Optional[TypeSafeClient]:
@@ -205,29 +282,31 @@ def get_client() -> Optional[TypeSafeClient]:
 
     cfg = get_config()
     if cfg.mock:
-        _cached_client = None
-        _cached_client_key = None
+        with _client_lock:
+            _cached_client = None
+            _cached_client_key = None
         return None
     if not cfg.api_key:
         raise JevConfigError("TYPESAFE_API_KEY environment variable is not configured.")
 
     # Cache key: invalidate when any client-relevant config changes
     cache_key = (cfg.api_key, cfg.timeout_ms, cfg.model)
-    if _cached_client is not None and _cached_client_key == cache_key:
-        return _cached_client
+    with _client_lock:
+        if _cached_client is not None and _cached_client_key == cache_key:
+            return _cached_client
 
-    _cached_client = TypeSafeClient(
-        api_key=cfg.api_key,
-        timeout=cfg.timeout_ms / 1000.0,
-        retry=RetryPolicy(
-            max_retries=2,
-            backoff_initial=0.5,
-            backoff_max=5.0,
-            backoff_jitter=0.25,
-        ),
-    )
-    _cached_client_key = cache_key
-    return _cached_client
+        _cached_client = TypeSafeClient(
+            api_key=cfg.api_key,
+            timeout=cfg.timeout_ms / 1000.0,
+            retry=RetryPolicy(
+                max_retries=2,
+                backoff_initial=0.5,
+                backoff_max=5.0,
+                backoff_jitter=0.25,
+            ),
+        )
+        _cached_client_key = cache_key
+        return _cached_client
 
 
 def execute_system_one(client, state: Any, questions: dict) -> Any:
@@ -345,12 +424,13 @@ def _noul_confidence(prob: float) -> float:
 def _risk_action(prob: float, cfg) -> str:
     """Guardrail action from a risk noul.
 
-    A confident ``destructive_prob >= 0.5`` never runs on its own, and the
-    0.20 boundary matches the backward-compatible ``safe`` thresholds.
+    A confident ``destructive_prob >= DEFAULT_ESCALATE_THRESHOLD`` never runs on
+    its own, and the DEFAULT_RISK_THRESHOLD boundary matches the
+    backward-compatible ``safe`` thresholds.
     """
-    if prob >= 0.50:
+    if prob >= DEFAULT_ESCALATE_THRESHOLD:
         return "escalate"
-    if prob >= 0.20:
+    if prob >= DEFAULT_RISK_THRESHOLD:
         return "review"
     return action_from_confidence(_noul_confidence(prob), cfg.auto_accept, cfg.review_at)
 
@@ -519,7 +599,8 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
         if "-" in primary_name:
             family_prefix = primary_name.rsplit("-", 1)[0] + "-"
             for opt in options:
-                if opt not in selected_keys and family_prefix in opt:
+                opt_parent = Path(opt).parent.name
+                if opt not in selected_keys and opt_parent.startswith(family_prefix):
                     selected_keys.append(opt)
 
     selected_keys = selected_keys[:max_matches]
@@ -606,7 +687,7 @@ def _discover_files_git(
     """Use git ls-files for fast, .gitignore-aware file discovery. Returns None if not a git repo."""
     import subprocess
 
-    if not (root / ".git").exists() and not any((p / ".git").exists() for p in root.parents):
+    if not (root / ".git").exists():
         return None
     try:
         result = subprocess.run(
@@ -647,16 +728,26 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
     # Fast path: use git if available
     candidates = _discover_files_git(root, ignore_exts, MAX_CHOICE_OPTIONS, ignore_dirs)
 
-    # Fallback: manual directory walk
+    # Fallback: manual directory walk, bounded by depth
     if candidates is None:
         candidates = []
-        for p in root.rglob("*"):
-            if any(ignored in p.parts for ignored in ignore_dirs):
+        max_depth = 5
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root)
+            if len(rel_dir.parts) >= max_depth:
+                dirnames.clear()
                 continue
-            if p.is_symlink():
-                continue  # skip symlinks to prevent loops
-            if p.is_file() and p.suffix.lower() not in ignore_exts:
-                candidates.append(p.relative_to(root).as_posix())
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs and not d.startswith(".")]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                p = Path(dirpath) / fname
+                if p.is_symlink():
+                    continue  # skip symlinks to prevent loops
+                if p.suffix.lower() not in ignore_exts:
+                    candidates.append(p.relative_to(root).as_posix())
+                    if len(candidates) >= MAX_CHOICE_OPTIONS:
+                        break
             if len(candidates) >= MAX_CHOICE_OPTIONS:
                 break
 
