@@ -9,6 +9,7 @@ files live in your user profile or project root and must **never** be committed.
 | Example (committed) | Real install location |
 |---|---|
 | `config/opencode.example.json` | `C:\Users\<you>\.config\opencode\opencode.json` |
+| `config/antigravity.example.json` | `C:\Users\<you>\.gemini\config\mcp_config.json` |
 | `config/jevs_settings.example.json` | `<project-root>\jevs_settings.json` (per project) |
 | `config/jev-plugin.example.js` | `C:\Users\<you>\.config\opencode\plugins\jev-plugin.js` |
 
@@ -74,6 +75,34 @@ Rules that follow from that:
 3. **Configure the API key.** Two equivalent options:
    - Set `TYPESAFE_API_KEY` in your environment (used by the `"{env:TYPESAFE_API_KEY}"` interpolation), **or**
    - Create `.env` in the repo from `.env.example` (`Copy-Item .env.example .env`) — the server loads it as a fallback.
+
+### Antigravity IDE setup
+
+1. **Add `jev-engine` to Antigravity's `mcp_config.json`:**
+   Open `C:\Users\<you>\.gemini\config\mcp_config.json` and register the server under `mcpServers`:
+   ```json
+   {
+     "mcpServers": {
+       "jev-engine": {
+         "command": "<REPO_DIR>\\.venv\\Scripts\\python.exe",
+         "args": [
+           "<REPO_DIR>\\jev_mcp.py"
+         ]
+       }
+     }
+   }
+   ```
+   (See `config/antigravity.example.json` for the template).
+
+2. **Configure allowed workspace roots:**
+   Because Antigravity executes the MCP server from the repository root rather than the active workspace, add your project roots to `JEV_MCP_ALLOWED_ROOTS` in `.env`:
+   ```dotenv
+   JEV_MCP_ALLOWED_ROOTS=D:\Projects;D:\Godot_projects;D:\mcp
+   ```
+
+3. **Restart / reload Antigravity:**
+   Reload the window or restart the IDE to pick up the new MCP server.
+
 
 ### Optional env knobs (`JEV_MCP_*`)
 

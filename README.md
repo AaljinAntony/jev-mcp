@@ -51,12 +51,14 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | `D:\mcp\jev-typesafe-mcp\.venv\` | Isolated virtual environment (Python 3.14) |
 | `D:\mcp\jev-typesafe-mcp\README.md` | This document |
 | `D:\mcp\jev-typesafe-mcp\config\opencode.example.json` | Sanitized OpenCode config template (safe to commit — no secrets) |
+| `D:\mcp\jev-typesafe-mcp\config\antigravity.example.json` | Sanitized Antigravity IDE config template (safe to commit — no secrets) |
 | `D:\mcp\jev-typesafe-mcp\config\jevs_settings.example.json` | Sanitized per-project settings template (safe to commit) |
 | `D:\mcp\jev-typesafe-mcp\config\jev-plugin.example.js` | Sanitized plugin template (safe to commit) |
 | `D:\mcp\jev-typesafe-mcp\config\README.md` | Install guide for deploying the examples |
 | `<project-root>\jevs_settings.json` | Per-project Jev settings (`enable_model_routing`, `models`, `scan_paths`) — never commit a copy containing keys |
 | `C:\Users\aalji\.config\opencode\opencode.json` | OpenCode MCP server registration only (no `jev_settings`) |
 | `C:\Users\aalji\.config\opencode\plugins\jev-plugin.js` | Optional OpenCode plugin (hook-based Jev routing + forced model switching) |
+| `C:\Users\<you>\.gemini\config\mcp_config.json` | Antigravity IDE MCP server registration |
 
 ---
 
