@@ -42,19 +42,25 @@ jev_engine._reset_settings_cache()
 # Silence informational round logs during benchmark execution
 jev_logging.get_logger().setLevel(logging.WARNING)
 
-# Generous regression thresholds (3x recorded Phase 1 baseline).
-# Phase 5 tightens these to 1.25x optimized numbers.
+# Regression thresholds: 1.25x the Phase 5 medians recorded in
+# docs/perf-baseline.md (2026-09-26). Tighter than the 3x Phase 1 gates these
+# replaced, so a regression is now a visible failure rather than a footnote.
 THRESHOLDS = {
-    "estimate_tokens_100k": 7.0,
-    "estimate_tokens_750_options": 4.0,
+    "estimate_tokens_100k": 0.5,
+    "estimate_tokens_750_options": 0.4,
     "fit_state_no_trunc": 0.5,
-    "fit_state_trunc": 45.0,
-    "mock_choice_250": 7.0,
-    "mock_system_one_250": 25.0,
-    "find_agent_resources_250": 220.0,
-    "find_agent_resources_250_warm": 220.0,
-    "select_target_files_git": 50.0,
-    "envelope_size_skills": 150_000,
+    "fit_state_trunc": 12.0,
+    "mock_choice_250": 1.5,
+    "mock_system_one_250": 3.0,
+    # find_agent_resources reads a preview per candidate (Phase 3), so the cost
+    # is dominated by 250 file reads rather than by discovery. Cold 113 ms (the
+    # scan cache is cleared per run) vs 82 ms warm; the gap is the walk itself.
+    "find_agent_resources_250": 145.0,
+    "find_agent_resources_250_warm": 105.0,
+    "select_target_files_git": 25.0,
+    # The flat `file`/`content` duplicates are gone: 13.5 kB, 31% of the 44.2 kB
+    # Phase 1 envelope. The gate leaves room for a slightly larger winning doc.
+    "envelope_size_skills": 30_000,
 }
 
 
@@ -198,16 +204,18 @@ def run_benchmarks(runs=5):
                     encoding="utf-8",
                 )
 
-        # 7. find_agent_resources_250
+        # 7. find_agent_resources_250 — COLD: the scan cache is cleared before
+        # every run, so this is the cost of discovering the tree again.
         last_skill_res = None
-        def _call_find_resources():
+        def _call_find_resources_cold():
             nonlocal last_skill_res
+            jev_engine._reset_scan_cache()
             last_skill_res = jev_engine.find_agent_resources(
                 "group-001",
                 root_dir=tmp_dir,
             )
 
-        med, mn, mx = _run_case(_call_find_resources, runs)
+        med, mn, mx = _run_case(_call_find_resources_cold, runs)
         res_bytes = len(json.dumps(last_skill_res)) if last_skill_res else 0
         results.append({
             "case": "find_agent_resources_250",
@@ -217,7 +225,7 @@ def run_benchmarks(runs=5):
             "bytes": res_bytes,
         })
 
-        # 8. find_agent_resources_250_warm (prime warm call, then measure subsequent call)
+        # 8. find_agent_resources_250_warm — same request on a primed cache.
         jev_engine.find_agent_resources("group-001", root_dir=tmp_dir)
         med, mn, mx = _run_case(
             lambda: jev_engine.find_agent_resources("group-001", root_dir=tmp_dir),

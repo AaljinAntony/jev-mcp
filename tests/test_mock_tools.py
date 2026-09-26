@@ -121,7 +121,7 @@ class TestSearchAgentSkills:
         assert "count" in result
         assert "primary" in result
         assert "ranked" in result and isinstance(result["ranked"], list)
-        assert result["ranked"][0]["file"] == result["file"]
+        assert result["ranked"][0]["file"] == result["primary"]["file"]
         assert "action" in result and result["action"] in {"auto", "review", "escalate"}
         assert "confidence" in result
         assert "model" in result and result["model"].endswith("+mock")
@@ -190,11 +190,16 @@ class TestSearchAgentSkills:
         assert seen["criteria"][".agents/skills/beta/SKILL.md"] == "sqlite index tuning"
         assert seen["state"]["task"] == "tune the database index"
         assert seen["state"]["candidates_considered"] == 2
-        assert result["file"] == ".agents/skills/beta/SKILL.md"
+        # The flat `file`/`content` duplicates were removed: `primary` and
+        # `resources[0]` are the only copies of the winning resource.
+        assert "file" not in result
+        assert "content" not in result
+        assert result["primary"]["file"] == ".agents/skills/beta/SKILL.md"
+        assert result["primary"]["file"] == result["resources"][0]["file"]
         assert result["primary_probability"] == 0.9
         assert [r["file"] for r in result["ranked"]][0] == ".agents/skills/beta/SKILL.md"
         # one read per candidate: the returned content is the cached text
-        assert "sqlite index tuning" in result["content"]
+        assert "sqlite index tuning" in result["primary"]["content"]
 
     def test_candidate_truncation_reported_and_degrades_action(self, tmp_path, monkeypatch):
         skills = tmp_path / ".agents" / "skills"
@@ -473,10 +478,10 @@ class TestEvidenceBudget:
 
         monkeypatch.setattr(jev_engine, "read_head", _counting_read)
         result = jev_engine.find_agent_resources("alpha summary", str(tmp_path))
-        assert result["file"] == ".agents/skills/alpha/SKILL.md"
+        assert result["primary"]["file"] == ".agents/skills/alpha/SKILL.md"
         assert len(opens) == len(set(opens)), "a candidate was read more than once"
         # the returned content is the cached text, not a second read
-        assert "body line" in result["content"]
+        assert "body line" in result["primary"]["content"]
 
     def test_target_file_previews_are_bounded(self, tmp_path, monkeypatch):
         names = [f"mod_{i:03d}.py" for i in range(200)]

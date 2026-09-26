@@ -61,6 +61,7 @@ values are read from `TYPESAFE_API_KEY` interpolation plus:
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_LOG_FILE` | `<repo>/logs/jev_engine.log` | Absolute path to the server log; each tool call and provider round is recorded (always written cwd-independently). |
+| `JEV_MCP_LOG_PREVIEW` | `0` | `1` = also log a 1,000-character `result_preview` per tool call. Off by default: the result is serialized twice (here and by the MCP runtime) and a skill result carries kilobytes of file content. The preview is redacted like every other logged value. |
 
 Thresholds must satisfy `0 <= review_at <= auto_accept <= 1` (invalid values
 fail fast with a `CONFIG_ERROR` envelope instead of silently mis-routing).
@@ -172,7 +173,10 @@ To set a project-specific default, add it back:
   `models`, built-in `scan_paths` (`.agents/skills`, `.agents/workflows`,
   `.agents/memory`, `.opencode/skills`, `skills`, `.agents`).
 - `scan_paths` entries are relative to the workspace root and **appended** to the
-  built-in defaults, deduplicated. They union across files.
+  built-in defaults, deduplicated. They union across files. A scan path that is
+  already inside another configured scan path (the built-in `.agents` covers
+  `.agents/skills`, `.agents/workflows` and `.agents/memory`) is collapsed to the
+  ancestor, so those files are walked once instead of four times.
 - `models` entries **union** non-empty values across files, so a project can add
   a tier without deleting the user's others. An explicit `""` **removes** an
   inherited tier — that is how a tier is disabled, and it is no longer

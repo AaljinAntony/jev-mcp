@@ -8,6 +8,7 @@ never auto-accepts on partial context.
 import copy
 import json
 import math
+import re
 
 from jev_errors import JevBudgetError
 
@@ -39,21 +40,34 @@ MAX_TOTAL_PREVIEW_CHARS = 40_000
 #: Bytes read from the head of a file to derive its preview. Previews are capped
 #: at MAX_CANDIDATE_CHARS, so reading further is pure I/O.
 MAX_PREVIEW_READ_CHARS = 16_000
+#: Hard cap on how many files one discovery walk may yield. `rglob` has no depth
+#: bound, so a `node_modules`-style tree under `.agents` was fully traversed
+#: before MAX_CHOICE_OPTIONS ever applied. The overflow is reported, never
+#: silently dropped: a candidate that was never offered cannot be defended.
+MAX_DISCOVERED_FILES = 5_000
 
 TRUNCATION_MARKER = "\n…[truncated]"
 
+#: One compiled pattern instead of a per-character Python loop. `re` over a str is
+#: a C loop; `findall` allocates a list of matched characters, which is tiny for
+#: a mostly-ASCII payload and still far cheaper than 100k Python iterations.
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+
 
 def estimate_tokens(value) -> int:
-    """Rough token estimate: ASCII chars / 4 + non-ASCII chars."""
+    """Rough token estimate: ASCII chars / 4 + non-ASCII chars.
+
+    Counting non-ASCII with a compiled regex keeps this at C speed. A Python-level
+    loop over the characters dominated every other cost in the request path once a
+    Choice carried 250 candidate previews, and `fit_state` calls this 3-4x over
+    the state plus every question value. The arithmetic is unchanged: a pinned
+    test asserts equality with the original per-character loop.
+    """
     text = stringify_state(value)
-    ascii_chars = 0
-    other_chars = 0
-    for char in text:
-        if ord(char) <= 0x7F:
-            ascii_chars += 1
-        else:
-            other_chars += 1
-    return math.ceil(ascii_chars / 4 + other_chars)
+    if not text:
+        return 0
+    non_ascii = len(_NON_ASCII.findall(text))
+    return math.ceil((len(text) - non_ascii) / 4 + non_ascii)
 
 
 def stringify_state(state) -> str:
@@ -157,31 +171,15 @@ def fit_state(state, questions) -> dict:
     }
 
 
-def _char_budget_for_tokens(text: str, token_budget: int) -> int:
-    """Compute the maximum character count that fits within a token budget.
-
-    Since estimate_tokens uses ceil(ascii/4 + non_ascii), the worst case
-    is all non-ASCII (1 token per char) and the best case is all ASCII
-    (4 chars per token). We scan to find the exact cutoff.
-    """
-    if token_budget <= 0:
-        return 0
-    marker_tokens = estimate_tokens(TRUNCATION_MARKER)
-    available = token_budget - marker_tokens
-    if available <= 0:
-        return 0
-
-    tokens_used = 0.0
-    for i, char in enumerate(text):
-        cost = 0.25 if ord(char) <= 0x7F else 1.0
-        if tokens_used + cost > available:
-            return i
-        tokens_used += cost
-    return len(text)
-
-
 def truncate_to_token_budget(text: str, budget: int) -> str:
-    """Truncate text to fit within the estimated token budget."""
+    """Truncate text to fit within the estimated token budget.
+
+    The character cap is found by binary search (as the reference does in
+    `reference/burnigtm-jev-mcp/src/limits.ts:96-112`): O(log n) estimates
+    instead of one full pass per call, and because the search goes through
+    `truncate_text` it inherits the surrogate-pair guard for free — the previous
+    `_char_budget_for_tokens` + manual `end -= 1` dance had to re-derive it.
+    """
     if budget <= 0:
         return ""
     if len(text) <= budget:
@@ -196,8 +194,17 @@ def truncate_to_token_budget(text: str, budget: int) -> str:
             candidate = candidate[:-1]
         return candidate
 
-    max_chars = _char_budget_for_tokens(text, budget)
-    end = max_chars
-    if end > 0 and len(text) > end - 1 and 0xD800 <= ord(text[end - 1]) <= 0xDBFF:
-        end -= 1
-    return text[:end] + TRUNCATION_MARKER
+    # `budget * 4` chars is the worst case for an all-ASCII payload and always
+    # covers the all-non-ASCII one (1 token per char), so it is a valid upper
+    # bound for the search.
+    low, high = 0, min(len(text), budget * 4)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = truncate_text(text, mid)
+        if estimate_tokens(candidate) <= budget:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best

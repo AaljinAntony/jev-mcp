@@ -26,7 +26,6 @@ envelope_size_skills                  -        -        -   44198
 | find_agent_resources_250 | 71.2 ms | 2× faster (~35.6 ms) | 1.25× Phase 5 |
 | find_agent_resources_250_warm | 73.5 ms | 8× faster (cache) (~9.2 ms) | 1.25× Phase 5 |
 | envelope_size_skills | 44198 B | ~50% smaller (~22 kB) | n/a |
-
 ---
 
 # Phase 3 — decision quality (candidate evidence)
@@ -118,4 +117,103 @@ envelope_size_skills                  -        -        -   19684
 | select_target_files_git | 15.7 ms | 20.3 ms | +5 ms for 47 previews |
 
 All `--assert` gates pass.
+
+---
+
+# Phase 5 — performance
+
+Measured: 2026-09-26  ·  Commit: 1ea5b6d (before) → Phase 5 (after)
+Machine unchanged from Phase 1. The two `find_agent_resources` rows now mean
+different things: the **cold** row clears the scan cache before every run (so it
+measures discovery), the **warm** row primes it once. In Phase 1 and Phase 3 both
+rows measured the same warm path, which is why they were within 3 ms of each
+other.
+
+```
+case                          median_ms   min_ms   max_ms   bytes
+estimate_tokens_100k                0.2      0.2      0.2       -
+estimate_tokens_750_options         0.1      0.1      0.1       -
+fit_state_no_trunc                  0.0      0.0      0.0       -
+fit_state_trunc                     4.9      4.8      5.9       -
+mock_choice_250                     0.3      0.3      0.8       -
+mock_system_one_250                 1.3      1.2      2.4       -
+find_agent_resources_250          113.6    110.2    125.0   13509
+find_agent_resources_250_warm      84.4     81.4     86.1   13509
+select_target_files_git            10.8      8.8     19.8       -
+envelope_size_skills                  -        -        -   13509
+```
+
+| Case | Phase 1 | Phase 3 | Phase 5 | Target met |
+|---|---|---|---|---|
+| estimate_tokens_100k | 2.2 ms | 2.2 ms | **0.2 ms** (11×) | yes (target 4×) |
+| estimate_tokens_750_options | 1.2 ms | 1.2 ms | **0.1 ms** | — |
+| fit_state_trunc | 13.9 ms | 14.0 ms | **4.9 ms** (2.8×) | — |
+| mock_choice_250 | 2.0 ms | 0.7 ms | **0.3 ms** | — |
+| mock_system_one_250 | 6.8 ms | 3.6 ms | **1.3 ms** (5.2×) | yes (target 5×) |
+| find_agent_resources_250 | 71.2 ms | 133.9 ms | **113.6 ms** cold | no — see below |
+| find_agent_resources_250_warm | 73.5 ms | 131.1 ms | **84.4 ms** | no — see below |
+| select_target_files_git | 15.7 ms | 20.3 ms | **10.8 ms** | — |
+| envelope_size_skills | 44 198 B | 19 684 B | **13 509 B** | yes (31% of Phase 1) |
+
+`--assert` is now gated at 1.25× these numbers instead of 3× the Phase 1
+baseline: 0.5 / 0.4 / 0.5 / 12 / 1.5 / 3 / 145 / 105 / 25 ms and 30 kB.
+
+## The two Phase 1 targets that were not met, and why
+
+`find_agent_resources_250` (2× vs Phase 1) and `_warm` (8× vs Phase 1) are not
+reachable any more, and the plan's targets were written before Phase 3 landed.
+Phase 3 gave every candidate a real preview so the Choice could actually tell
+them apart; that added 250 file reads and ~60 ms to this call, and it bought
+top-1 accuracy 0.444 → 0.667–0.833 (table above). Measuring against the Phase 1
+71.2 ms would mean deleting the evidence that made the tool work.
+
+Against the honest baseline — Phase 3, 133.9 ms — Phase 5 delivers:
+
+| Change | Effect on this call |
+|---|---|
+| `.agents` + `.agents/skills` + `.agents/workflows` + `.agents/memory` collapsed to one walk | the same 250 files were being discovered **four** times per call |
+| `MAX_DISCOVERED_FILES` bound on the walk | `rglob` had no depth or count limit |
+| scan cache | cold 113.6 ms → warm 84.4 ms (−29 ms, the walk itself) |
+| `file`/`content` removed from the envelope | 19 684 B → 13 509 B |
+| `estimate_tokens` at C speed | 250 previews + 250 criteria no longer re-scanned character by character |
+| mock: one state tokenization + memoized description tokens | 3.6 ms → 1.3 ms of judge time |
+
+The remaining 84 ms is 250 file reads and 250 `markdown_preview` passes
+(`build_criteria` is 66% of the call under `cProfile`) — that is the Phase 3
+trade, and it is bounded by `MAX_TOTAL_CRITERIA_CHARS`.
+
+## What the cache does and does not see
+
+Both scanners cache **paths**, never content, and the signature is a bounded
+directory-mtime list (`scan_cache.SIG_MAX_LEVELS` = 3 levels, 2 000 directories
+max, `MAX_ENTRIES`):
+
+- a skill added, removed or renamed under `.agents/<x>/<y>/` invalidates it;
+- a file *edited in place* does not — and does not need to, because the preview
+  is rebuilt from a fresh read on every call;
+- the `git ls-files` result is additionally keyed on HEAD, the ref, the index
+  mtime and `.gitignore`, **plus** the same directory signature, because
+  `ls-files --others` also reports untracked files that leave HEAD and the index
+  untouched.
+
+A 5-second sliding TTL (`scan_cache.DEFAULT_TTL_S`) bounds staleness for a
+paused sequence. The cost is real and is paid on the cold row above: the
+signature is not free, which is why the markdown cache is close to break-even in
+a tree with one file per directory and a clear win in a tree with many.
+
+## Behaviour changes verified, not assumed
+
+- `estimate_tokens` is bit-identical to the old per-character loop on a pinned
+  corpus (`tests/test_limits.py::TestEstimateTokensExactness`).
+- `mock_system_one` answers are pinned to a golden recorded from the pre-Phase-5
+  implementation and re-verified by running both modules over the same 250-option
+  request (`tests/test_mock_perf.py::GOLDEN`). The optimization is only allowed
+  to change how fast it gets there.
+- Truncation via the binary search returns a **longer** prefix than the old
+  linear scan at the same budget: the old code reserved marker tokens up front
+  and then appended the marker again, double-counting them.
+- Mock `usage.input_tokens` is now `coverage.estimated_tokens.state + .questions`
+  from `fit_state` instead of a re-serialization of `{"state": …, "questions": …}`,
+  so it is slightly smaller (e.g. 15 585 → 15 568 on the 250-option case). The
+  live path is untouched: the provider reports its own usage.
 

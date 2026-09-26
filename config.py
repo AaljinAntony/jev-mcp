@@ -60,6 +60,10 @@ class JevConfig:
     #: Seconds the breaker stays open after an auth failure; a bad key does not
     #: fix itself in 30 seconds.
     auth_cooldown_s: float = DEFAULT_AUTH_COOLDOWN_S
+    #: Opt-in: log a 1,000-character preview of every tool result again. Off by
+    #: default because the result is serialized twice (here and by the MCP
+    #: runtime) and a skill result carries kilobytes of file content.
+    log_preview: bool = False
 
 
 def _num_env(name: str, fallback: float) -> float:
@@ -179,6 +183,7 @@ def get_config() -> JevConfig:
         breaker_threshold=_positive_int_env("JEV_MCP_BREAKER_THRESHOLD", DEFAULT_BREAKER_THRESHOLD),
         breaker_cooldown_s=_positive_float_env("JEV_MCP_BREAKER_COOLDOWN_S", DEFAULT_BREAKER_COOLDOWN_S),
         auth_cooldown_s=_positive_float_env("JEV_MCP_AUTH_COOLDOWN_S", DEFAULT_AUTH_COOLDOWN_S),
+        log_preview=_bool_env("JEV_MCP_LOG_PREVIEW"),
     )
     if config.review_at > config.auto_accept:
         raise JevConfigError("JEV_MCP_REVIEW_AT must not exceed JEV_MCP_AUTO_ACCEPT.")

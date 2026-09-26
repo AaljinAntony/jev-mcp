@@ -194,7 +194,7 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
 - **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jevs_settings.scan_paths`
 - **Jev primitive:** `primary` (`Choice`, one question). `criteria` carry each document's own summary — a `SKILL.md` contributes its front-matter `description` — not its filename, so the options are actually distinguishable. `ranked` comes from `primary.probabilities`, which is the full ranking; there are no `secondary`/`tertiary` duplicates.
 - **Key capabilities:** sibling expansion (probability ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`) but only when `primary_probability >= 0.5` and for at most 2 siblings
-- **Silent-drop guard:** candidates past `MAX_CHOICE_OPTIONS` are reported in `candidates_considered` / `candidates_evaluated` / `candidates_truncated` + `reason_codes`, and a truncated candidate set forces `action != "auto"`.
+- **Silent-drop guard:** candidates past `MAX_CHOICE_OPTIONS` are reported in `candidates_considered` / `candidates_evaluated` / `candidates_truncated` + `reason_codes`, and a truncated candidate set forces `action != "auto"`. Discovery itself is capped at `MAX_DISCOVERED_FILES` (5 000) for the same reason.
 
 ```json
 {
@@ -212,6 +212,11 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
   "model": "jev-latest", "usage": { "input_tokens": 2400, "output_tokens": 24 }
 }
 ```
+
+`primary` **is** `resources[0]`. The flat `file` / `content` keys that duplicated it
+were removed in Phase 5: they serialized the same up-to-6,000-character body a
+third and fourth time in the same JSON document. Read `result["primary"]["file"]`
+(or `resources[0]["file"]`) instead.
 
 ### 3. `search_target_files` — fast workspace file selector
 
@@ -444,7 +449,7 @@ Expected outputs:
 
 ```
 py_compile OK
-235 passed, 3 skipped
+375 passed, 13 skipped
 MCP import successful!  (server: MCPServer)
 {"safe": true, "destructive_prob": 0.01, "git_modify_prob": 0.01, "action": "auto", ...}
 All assert gates passed.
@@ -456,15 +461,31 @@ A `tools/list` handshake against a running `jev_mcp.py` returns exactly four too
 ### Diagnostics & logging
 
 - Server log (JSON lines): `<repo>\logs\jev_engine.log` (override with
-  `JEV_MCP_LOG_FILE`). Records each tool call (args, duration, result size),
-  each provider round, and full tracebacks on failure. Written from an absolute,
-  workspace-independent path.
+  `JEV_MCP_LOG_FILE`). Records each tool call (redacted args, duration, the
+  result's **key set** and coarse list sizes), each provider round, and one
+  full traceback on failure. Written from an absolute, workspace-independent
+  path. Set `JEV_MCP_LOG_PREVIEW=1` to also log a 1,000-character `result_preview`
+  while debugging — off by default because the MCP runtime serializes the result
+  again and a skill result carries kilobytes of file content.
+- Redaction removes the credential and keeps the rest of the line:
+  `curl -H 'Authorization: Bearer sk-…' https://x` keeps its command and URL. It is
+  applied to args, to `result_preview`, and to error messages.
 - Plugin log: `~\.config\opencode\logs\jev-plugin.log` (hook fired, candidates,
   spawn result, skill injection). The installed plugin's Jev query is **async**
   so the `chat.message` hook never blocks opencode.
 - `scripts\diag_mcp.py` reproduces a single tool call over stdio (identical to
   opencode's transport) against any `root_dir` + task; exit 0 = clean, 1 = error
   envelope or transport failure.
+
+### Per-call cost
+
+`search_agent_skills` and `search_target_files` both cache their filesystem
+discovery (`scan_cache.py`): a second identical call costs a few `stat`s instead
+of a full `rglob` of every configured skill directory or a forked
+`git ls-files`. The cache stores **paths only** — file content is re-read on
+every call — and a 5-second sliding TTL bounds staleness. Adding a skill,
+changing `HEAD`/the git index/`.gitignore`, or creating a workspace file all
+invalidate it. See `docs/perf-baseline.md` for the measured before/after.
 
 ### Mock mode (`JEV_MCP_MOCK=1`)
 
@@ -497,6 +518,15 @@ decision engine: its routing accuracy is far below live Jev (see
   post-read re-stat, and the defensive snapshot.
 - `test_client_cache.py` — the cached client is closed on invalidation and keyed
   on everything the SDK reads from the environment.
+- `test_scan_cache.py` — the scanners do not repeat their work: a warm call
+  never re-walks the tree or forks `git ls-files`, a new file invalidates the
+  cache, nested default scan paths collapse, and `MAX_DISCOVERED_FILES` blocks
+  `action: "auto"`.
+- `test_mock_perf.py` — the offline judge's answers are pinned to a golden
+  recorded before the optimization, and the state is tokenized once.
+- `test_logging.py` — `result_keys` instead of a serialized result, the opt-in
+  preview, credential redaction on the result path, and exactly one traceback
+  per failure.
 - `test_live_smoke.py` — skipped unless `TYPESAFE_API_KEY` or `JEV_MCP_LIVE=1`.
 
 `tests/conftest.py` grants `tempfile.gettempdir()` through

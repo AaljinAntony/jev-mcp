@@ -65,6 +65,46 @@ class TestFindAgentResourcesEnvelopeKeys:
         assert res_no_candidates["confidence"] is None
 
 
+class TestSkillEnvelopeHasNoDuplicates:
+    """The 6,000-character resource body must be serialized once, not four times.
+
+    `primary` is `resources[0]`, and the old flat `file`/`content` keys were two
+    more copies of the same blob in the same JSON document. Phase 1 measured
+    44,198 bytes for this envelope (docs/perf-baseline.md).
+    """
+
+    def _workspace(self, tmp_path):
+        for name in ("alpha", "beta"):
+            d = tmp_path / ".agents" / "skills" / name
+            d.mkdir(parents=True)
+            unique = "ALPHA-UNIQUE-BODY-LINE" if name == "alpha" else "BETA-UNIQUE-BODY-LINE"
+            (d / "SKILL.md").write_text(
+                f"---\ndescription: {name} helpers\n---\n{unique}\n" + f"{name} filler line\n" * 900,
+                encoding="utf-8",
+            )
+        return tmp_path
+
+    def test_flat_file_and_content_keys_are_gone(self, tmp_path):
+        res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
+        assert "file" not in res
+        assert "content" not in res
+        assert res["primary"]["file"] == res["resources"][0]["file"]
+        assert res["primary"]["content"] == res["resources"][0]["content"]
+
+    def test_envelope_is_under_60_percent_of_the_phase_1_size(self, tmp_path):
+        res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
+        size = len(json.dumps(res, default=str).encode("utf-8"))
+        phase_1_bytes = 44_198
+        assert res["primary"], "expected a winning resource to measure"
+        assert size < phase_1_bytes * 0.6, f"{size} bytes is not under 60% of {phase_1_bytes}"
+
+    def test_resource_body_appears_exactly_twice(self, tmp_path):
+        res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
+        dumped = json.dumps(res, default=str)
+        # Once in `primary`, once in `resources[0]` — the two documented places.
+        assert dumped.count("ALPHA-UNIQUE-BODY-LINE") == 2
+
+
 class TestSelectTargetFilesEnvelopeKeys:
     def test_keys_identical_across_branches(self, tmp_path, monkeypatch):
         # 1. No candidates branch (empty directory, git disabled)

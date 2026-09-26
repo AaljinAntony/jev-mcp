@@ -8,6 +8,7 @@ and tests/demos only — never a substitute for a real TypeSafe decision.
 
 import math
 import re
+from functools import lru_cache
 
 from typesafe_sdk import (
     ChoiceAnswer,
@@ -48,25 +49,66 @@ _STOPWORDS = {
 }
 
 
-def _overlap(a: str, b: str) -> float:
-    left = set(_tokenize(a))
-    right = [t for t in _tokenize(b) if len(t) > 1]
+def _token_set(text: str) -> frozenset:
+    """The state tokens, computed **once** per request.
+
+    Every judge in this module used to re-tokenize the whole state for each
+    option of each question — hundreds of full passes over a 100k-char state
+    per call. One set is derived here and threaded down instead.
+    """
+    return frozenset(_tokenize(text))
+
+
+def _overlap_set(left, right_text: str) -> float:
+    """Fraction of `right_text`'s meaningful tokens present in `left`."""
+    right = [t for t in _tokenize(right_text) if len(t) > 1]
     if not right:
         return 0.0
     hits = sum(1 for token in right if token in left)
     return hits / len(right)
 
 
+def _overlap(a: str, b: str) -> float:
+    """Overlap between two texts. Kept for callers that have no shared set."""
+    return _overlap_set(_token_set(a), b)
+
+
 def _state_terms(text: str) -> set:
     """The meaningful tokens of the state, once per request."""
-    return {t for t in _tokenize(text) if len(t) > 1 and t not in _STOPWORDS}
+    return _terms_from(_tokenize(text))
+
+
+@lru_cache(maxsize=4096)
+def _description_tokens(description: str) -> frozenset:
+    """Tokens of one candidate description, memoized.
+
+    The same 250 descriptions arrive in every Choice of a request and again on
+    the next call for the same workspace, so this is the difference between
+    tokenizing 250 strings and tokenizing 1,500 of them. Pure function of the
+    string, so the cache cannot change a judgment; the bound keeps it from
+    growing with the workspace.
+    """
+    return frozenset(_tokenize(description))
+
+
+def _terms_from(tokens) -> set:
+    return {t for t in tokens if len(t) > 1 and t not in _STOPWORDS}
+
+
+def _resolve_terms(state_text: str, state_tokens, terms):
+    """The precomputed terms if the caller has them, else derive them once."""
+    if terms is not None:
+        return terms
+    if state_tokens is not None:
+        return _terms_from(state_tokens)
+    return _state_terms(state_text)
 
 
 def _document_frequency(texts) -> dict:
     """How many candidates contain each token."""
     frequency: dict = {}
     for text in texts:
-        for token in set(_tokenize(text)):
+        for token in _description_tokens(text):
             frequency[token] = frequency.get(token, 0) + 1
     return frequency
 
@@ -81,7 +123,7 @@ def _evidence_score(terms: set, description: str, frequency: dict) -> float:
     """
     if not terms:
         return 0.0
-    tokens = set(_tokenize(description))
+    tokens = _description_tokens(description)
     return sum(1.0 / frequency.get(token, 1) for token in terms if token in tokens)
 
 
@@ -96,12 +138,23 @@ def _softmax(scores) -> list:
     return [e / total for e in exps]
 
 
-def _mock_noul(state_text: str, instructions: str, presence: bool = False, options=None, frequency=None) -> float:
+def _mock_noul(
+    state_text: str,
+    instructions: str,
+    presence: bool = False,
+    options=None,
+    frequency=None,
+    state_tokens=None,
+    terms=None,
+) -> float:
     if presence:
         # A presence Noul (one that carries true/false criteria) asks whether any
         # candidate actually fits. Answer it from the candidate evidence itself:
-        # that is the only thing the real model judges against too.
-        terms = _state_terms(state_text)
+        # that is the only thing the real model judges against too. It is checked
+        # *before* the command regexes on purpose — `select_target_files` asks
+        # exactly this question, and a task that happens to contain "delete" must
+        # not turn the presence answer into a confident 0.97.
+        terms = _resolve_terms(state_text, state_tokens, terms)
         frequency = frequency or _document_frequency(options or [])
         best = max((_evidence_score(terms, text, frequency) for text in (options or [])), default=0.0)
         if best < EVIDENCE_MIN_SCORE:
@@ -117,7 +170,8 @@ def _mock_noul(state_text: str, instructions: str, presence: bool = False, optio
         return 0.97
     if re.search(r"git status|git add|git diff|git stash|ls\b|cat |echo |mkdir|touch |pip install", hay):
         return 0.03
-    return _clamp01(0.35 + 0.5 * _overlap(state_text, instructions))
+    left = _token_set(state_text) if state_tokens is None else state_tokens
+    return _clamp01(0.35 + 0.5 * _overlap_set(left, instructions))
 
 
 def _question_attr(question, name):
@@ -161,12 +215,12 @@ def _score_option(terms: set, description: str, frequency: dict, haystack: str, 
     return score
 
 
-def _mock_choice(state_text: str, question, frequency: dict = None) -> ChoiceAnswer:
+def _mock_choice(state_text: str, question, frequency: dict = None, state_tokens=None, terms=None) -> ChoiceAnswer:
     labels = list(question.criteria.keys())
     descriptions = [_as_text(question.criteria.get(label)) for label in labels]
     if frequency is None:
         frequency = _document_frequency([d for l, d in zip(labels, descriptions) if l != "none"])
-    terms = _state_terms(state_text)
+    terms = _resolve_terms(state_text, state_tokens, terms)
     haystack = state_text.lower()
 
     # `none` is the escape hatch, not a competitor. It scores zero and only wins
@@ -189,12 +243,13 @@ def _mock_choice(state_text: str, question, frequency: dict = None) -> ChoiceAns
     )
 
 
-def _mock_score(state_text: str, question) -> ScoreAnswer:
+def _mock_score(state_text: str, question, state_tokens=None) -> ScoreAnswer:
     instructions = _as_text(question.instructions)
     levels = [_as_text(c) for c in question.criteria]
+    left = _token_set(state_text) if state_tokens is None else state_tokens
     scores = []
     for index, level in enumerate(levels):
-        scores.append(_overlap(state_text, f"{instructions} {level}") + index * 0.05)
+        scores.append(_overlap_set(left, f"{instructions} {level}") + index * 0.05)
     probabilities = dict(
         (str(i), p) for i, p in enumerate(_softmax(scores))
     )
@@ -211,13 +266,21 @@ def _mock_score(state_text: str, question) -> ScoreAnswer:
     )
 
 
-def mock_system_one(state, questions, model="jev-latest"):
+def mock_system_one(state, questions, model="jev-latest", input_tokens=None):
     """Deterministic `system_one` judge for the mock mode.
 
     Returns a real `SystemOneResponse` (SDK objects) so the validation layer
     runs against the exact shapes production uses.
+
+    `input_tokens` may be supplied by the caller from `fit_state`'s coverage,
+    which already counted the state and every question value. Recomputing them
+    here re-serialized and re-scanned the whole payload for a number the caller
+    is holding; it is only estimated here when nobody supplied it.
     """
     state_text = stringify_state(state)
+    # One tokenization for the whole request, threaded into every question.
+    state_tokens = _token_set(state_text)
+    terms = _terms_from(state_tokens)
     options = _candidate_evidence(questions)
     frequency = _document_frequency(options)
     answers = {}
@@ -227,20 +290,31 @@ def mock_system_one(state, questions, model="jev-latest"):
             instructions = _as_text(_question_attr(question, "instructions"))
             presence = _question_attr(question, "criteria") is not None
             answers[name] = NoulAnswer(
-                noul=round(_mock_noul(state_text, instructions, presence, options, frequency), 2)
+                noul=round(
+                    _mock_noul(
+                        state_text, instructions, presence, options, frequency,
+                        state_tokens=state_tokens, terms=terms,
+                    ),
+                    2,
+                )
             )
         elif qtype == "choice":
-            answers[name] = _mock_choice(state_text, question, frequency)
+            answers[name] = _mock_choice(
+                state_text, question, frequency, state_tokens=state_tokens, terms=terms
+            )
         elif qtype == "score":
-            answers[name] = _mock_score(state_text, question)
+            answers[name] = _mock_score(state_text, question, state_tokens=state_tokens)
         else:
             raise ValueError(f"mock cannot answer question type {qtype!r}")
+
+    if input_tokens is None:
+        input_tokens = estimate_tokens(state) + estimate_tokens(questions)
 
     res = SystemOneResponse(
         model=f"{model}+mock",
         answers=answers,
         usage=Usage(
-            input_tokens=estimate_tokens({"state": state, "questions": questions}),
+            input_tokens=input_tokens,
             output_tokens=len(questions) * 8,
         ),
     )

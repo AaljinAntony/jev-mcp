@@ -1,3 +1,6 @@
+import json
+import math
+
 import pytest
 
 from jev_errors import JevBudgetError
@@ -73,23 +76,54 @@ class TestFitState:
         assert result["coverage"]["estimated_tokens"]["longest_question"] == 0
 
 
-class TestCharBudgetForTokens:
-    def test_zero_or_negative_budget(self):
-        from limits import _char_budget_for_tokens
-        assert _char_budget_for_tokens("hello", 0) == 0
-        assert _char_budget_for_tokens("hello", -5) == 0
+class TestEstimateTokensExactness:
+    """The regex fast path must be bit-identical to the original Python loop.
 
-    def test_ascii_budget_calculation(self):
-        from limits import _char_budget_for_tokens
-        # marker is 4 tokens. For budget = 10, available = 6. 6 / 0.25 = 24 ascii chars.
-        text = "a" * 100
-        assert _char_budget_for_tokens(text, 10) == 24
+    Spelled out longhand on purpose: the test must not import the function it is
+    verifying.
+    """
 
-    def test_non_ascii_budget_calculation(self):
-        from limits import _char_budget_for_tokens
-        # marker is 4 tokens. For budget = 10, available = 6. 6 / 1.0 = 6 non-ascii chars.
-        text = "é" * 100
-        assert _char_budget_for_tokens(text, 10) == 6
+    @staticmethod
+    def _reference(value) -> int:
+        text = value if isinstance(value, str) else ("" if value is None else json.dumps(value, default=str))
+        ascii_chars = 0
+        other_chars = 0
+        for char in text:
+            if ord(char) <= 0x7F:
+                ascii_chars += 1
+            else:
+                other_chars += 1
+        return math.ceil(ascii_chars / 4 + other_chars)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "abc",
+            "a" * 4000,
+            "中文字" * 500,
+            "mix é 123",
+            "emoji 🎉 test",
+            "\x00\x7f\x80",
+            "\ud83d",                       # lone surrogate
+            "\udc00",                       # lone low surrogate
+            "a\ud83d\ude00b",               # paired surrogate inside ASCII
+            {"k": "é" * 100, "n": [1, 2, 3]},
+            ["🎉", "x", "y"],
+        ],
+    )
+    def test_matches_reference_implementation(self, value):
+        assert estimate_tokens(value) == self._reference(value)
+
+    def test_empty_and_none(self):
+        assert estimate_tokens("") == 0
+        assert estimate_tokens(None) == 0
+
+    def test_fast_path_boundary_lengths(self):
+        # `len(text) <= budget * 4` is the early-out in truncate_to_token_budget;
+        # pin the token count either side of it.
+        for length in (3999, 4000, 4001):
+            assert estimate_tokens("a" * length) == self._reference("a" * length)
 
 
 class TestTruncateToTokenBudget:
@@ -140,3 +174,34 @@ class TestTruncateToTokenBudget:
         # If truncated with marker, the prefix before marker shouldn't end in high surrogate
         prefix = truncated[:-len(TRUNCATION_MARKER)]
         assert not (prefix and 0xD800 <= ord(prefix[-1]) <= 0xDBFF)
+
+    def test_never_exceeds_budget_over_random_inputs(self):
+        import random
+
+        from limits import truncate_to_token_budget
+        rng = random.Random(20260926)
+        alphabets = ["abc ", "é中", "🎉🚀", "a\ud83d\ude00b", "\x00\x7f", "lorem ipsum dolor "]
+        for _ in range(200):
+            alphabet = rng.choice(alphabets)
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 300)))
+            budget = rng.randint(1, 80)
+            truncated = truncate_to_token_budget(text, budget)
+            assert estimate_tokens(truncated) <= budget, (text[:40], budget)
+
+    def test_binary_search_never_splits_a_surrogate_at_the_boundary(self):
+        from limits import truncate_to_token_budget
+        # Every budget whose cut point lands on a surrogate pair boundary.
+        for budget in range(4, 40):
+            text = "a" * 60 + "\U0001F600" * 20
+            truncated = truncate_to_token_budget(text, budget)
+            assert estimate_tokens(truncated) <= budget
+            body = truncated[:-len(TRUNCATION_MARKER)] if truncated.endswith(TRUNCATION_MARKER) else truncated
+            assert not (body and 0xD800 <= ord(body[-1]) <= 0xDBFF), budget
+
+
+class TestLinearScanRemoved:
+    def test_char_budget_for_tokens_is_gone(self):
+        import limits
+        # The binary search in `truncate_to_token_budget` replaced the linear
+        # scan; a stale caller must fail loudly rather than silently re-add it.
+        assert not hasattr(limits, "_char_budget_for_tokens")

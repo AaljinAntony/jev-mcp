@@ -25,12 +25,14 @@ def _grant_tempdir_as_allowed_root(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_module_caches():
-    """Clear the module-level config/client/settings/breaker caches around every test.
+    """Clear the module-level config/client/settings/breaker/scan caches around every test.
 
-    `config.get_config`, `jev_engine.get_client`, `jev_engine.load_jev_settings`
-    and the circuit breaker all memoize process-wide state. Without this, a test
-    that changes the environment (e.g. `JEV_MCP_MOCK`) is silently ignored by
-    whichever test ran after it and cached the previous environment.
+    `config.get_config`, `jev_engine.get_client`, `jev_engine.load_jev_settings`,
+    the circuit breaker and the workspace scan cache all memoize process-wide
+    state. Without this, a test that changes the environment (e.g.
+    `JEV_MCP_MOCK`) is silently ignored by whichever test ran after it and
+    cached the previous environment — and a test that creates files under
+    `tmp_path` would be served another test's stale scan results.
     """
     import config
     import jev_engine
@@ -40,6 +42,7 @@ def _reset_module_caches():
         jev_engine._reset_client_cache()
         jev_engine._reset_settings_cache()
         jev_engine._reset_breaker()
+        jev_engine._reset_scan_cache()
 
     _clear()
     yield

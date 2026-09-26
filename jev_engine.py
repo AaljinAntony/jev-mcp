@@ -41,6 +41,7 @@ from limits import (
     MAX_CANDIDATE_CHARS,
     MAX_CHOICE_OPTIONS,
     MAX_CONTENT_CHARS,
+    MAX_DISCOVERED_FILES,
     MAX_PREVIEW_READS,
     MAX_TOTAL_PREVIEW_CHARS,
     truncate_text,
@@ -58,6 +59,7 @@ from policy import (
     require_complete_context,
     worst_action,
 )
+from scan_cache import ScanCache
 
 DEFAULT_SCAN_PATHS = [
     ".agents/skills",
@@ -375,6 +377,133 @@ def get_scan_paths(root: Path) -> List[Path]:
     return paths
 
 
+# ----------------------------------------------------------------------
+# Workspace scanners
+#
+# Both scanners run on every call and both are pure "give me the paths" work, so
+# their results are cached against a cheap on-disk signature. The cache stores
+# paths, never content: file bytes are re-read per call, so a signature that only
+# sees directory-level changes is safe here.
+# ----------------------------------------------------------------------
+_scan_cache = ScanCache()
+
+
+def _reset_scan_cache() -> None:
+    """Clear the scanner cache. Exposed for tests."""
+    _scan_cache.clear()
+
+
+def _minimal_scan_dirs(dirs: List[Path]) -> List[Path]:
+    """Drop scan dirs already covered by an ancestor in the list.
+
+    `DEFAULT_SCAN_PATHS` lists `.agents/skills`, `.agents/workflows`,
+    `.agents/memory` **and** `.agents`, so every skill file was discovered three
+    or four times per call and the 250-candidate cap was applied after the fact.
+    Directories that do not exist are dropped too: the walk skipped them anyway.
+    """
+    try:
+        resolved = [d.resolve() for d in dirs if d.exists()]
+    except OSError:
+        return list(dirs)
+    return [d for d in resolved if not any(d != o and _is_within(d, o) for o in resolved)]
+
+
+#: How many directory levels below a scan root the signature descends, and how
+#: many directories it will stat at most. The signature has to be *cheaper* than
+#: the walk it guards, which is why it stats directories and never enumerates
+#: files: a `node_modules` under `.agents` must not be paid for twice.
+SIG_MAX_LEVELS = 3
+SIG_MAX_ENTRIES = 2_000
+
+
+def _dir_signature(
+    roots: List[Path],
+    levels: int = SIG_MAX_LEVELS,
+    ignore_dirs: Optional[set] = None,
+    max_entries: int = SIG_MAX_ENTRIES,
+) -> tuple:
+    """`(directory, mtime_ns)` for the directories within `levels` of each root.
+
+    Directories only, never files. Both scanners return *paths*; the bytes behind
+    a candidate are re-read per call by `candidates.read_text_cache` /
+    `read_head`, so a signature that cannot see an in-place file edit is not a
+    correctness problem — the preview picks it up.
+
+    A directory's mtime changes when an entry inside it is added or removed,
+    which is what invalidates a discovery result. Descending `levels` deep covers
+    the layouts these scanners actually walk (`.agents` / `skills` / `<skill>` /
+    `SKILL.md`, `src` / `components` / `*.py`); anything deeper than that is
+    deliberately not tracked, which is why this stays bounded rather than
+    becoming a second full walk.
+    """
+    ignored = ignore_dirs or set()
+    entries: List[tuple] = []
+    stack: List[tuple] = [(Path(root), 0) for root in roots]
+    while stack and len(entries) < max_entries:
+        directory, depth = stack.pop()
+        try:
+            entries.append((str(directory), os.stat(directory).st_mtime_ns))
+        except OSError:
+            entries.append((str(directory), None))
+            continue
+        if depth >= levels:
+            continue
+        try:
+            children = list(os.scandir(directory))
+        except OSError:
+            continue
+        for child in children:
+            name = child.name
+            if name in ignored or name.startswith("."):
+                continue
+            try:
+                if not child.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            stack.append((Path(child.path), depth + 1))
+    entries.sort()
+    return tuple(entries)
+
+
+def _discover_markdown(root: Path, search_dirs: List[Path]):
+    """Return `(rel_path -> Path, discovery_truncated)` for `*.md` candidates.
+
+    Bounded at `MAX_DISCOVERED_FILES`: `rglob` has no depth limit, so one deep
+    vendored tree under `.agents` was fully traversed before the cap applied.
+    Overflow is reported to the caller instead of being dropped silently.
+    """
+    search_dirs = _minimal_scan_dirs(search_dirs)
+    key = ("md", str(root), tuple(str(d) for d in search_dirs))
+    signature = _dir_signature(search_dirs)
+
+    cached = _scan_cache.get(key, lambda: signature)
+    if cached is not None:
+        found, truncated = cached
+        # A copy: the caller must not be able to mutate the shared cache entry.
+        return dict(found), truncated
+
+    found: Dict[str, Path] = {}
+    truncated = False
+    for sdir in search_dirs:
+        for p in sdir.rglob("*.md"):
+            if not p.is_file():
+                continue
+            try:
+                rel = p.relative_to(root).as_posix()
+            except ValueError:
+                continue  # path is outside root, skip it
+            found[rel] = p
+            if len(found) >= MAX_DISCOVERED_FILES:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    _scan_cache.put(key, signature, (found, truncated))
+    return dict(found), truncated
+
+
 # Module-level cache
 _cached_client: Optional[TypeSafeClient] = None
 _cached_client_key: Optional[tuple] = None
@@ -562,12 +691,22 @@ def _breaker_guard(breaker: _Breaker) -> None:
     )
 
 
-def execute_system_one(client, state: Any, questions: dict, timeout_s: Optional[float] = None) -> Any:
+def execute_system_one(
+    client,
+    state: Any,
+    questions: dict,
+    timeout_s: Optional[float] = None,
+    input_tokens: Optional[int] = None,
+) -> Any:
     """Run `system_one`, re-raising SDK failures as typed Jev errors.
 
     `timeout_s` is the *remaining* budget for this tool call, so an attempt that
     starts late in the call cannot run past the deadline (ported from
     `reference/burnigtm-jev-mcp/src/typesafe.ts:13-16`).
+
+    `input_tokens` is the caller's own estimate, forwarded to the offline judge
+    only. The live client ignores it: the provider reports its own usage and
+    inventing one would be a fabricated number in the envelope.
 
     In mock mode (or with a None client) a deterministic offline judge answers,
     so the server and tests run without a network round-trip; that path is
@@ -576,7 +715,9 @@ def execute_system_one(client, state: Any, questions: dict, timeout_s: Optional[
     cfg = get_config()
     model = cfg.model or None
     if cfg.mock or client is None:
-        return mock_system_one(state, questions, model=model or "jev-latest")
+        return mock_system_one(
+            state, questions, model=model or "jev-latest", input_tokens=input_tokens
+        )
 
     breaker = _breaker()
     _breaker_guard(breaker)
@@ -773,11 +914,15 @@ def _request(state_text: str, questions: dict):
     started = time.perf_counter()
     try:
         fitted = fit_state(state_text, questions)
+        # `fit_state` already counted the state and every question value; the
+        # offline judge would otherwise re-serialize and re-count both.
+        counts = fitted["coverage"]["estimated_tokens"]
         res = execute_system_one(
             get_client(),
             state=fitted["state"],
             questions=questions,
             timeout_s=_remaining_seconds(started, cfg),
+            input_tokens=counts["state"] + counts["questions"],
         )
         # The mock judge is CPU-bound Python: a 100k-char state with 250 options
         # can exceed a small budget, and reporting a decision as if it had been
@@ -792,11 +937,14 @@ def _request(state_text: str, questions: dict):
         )
         return res, fitted, cfg
     except Exception as err:
+        # The traceback belongs to whoever owns the failure (jev_mcp._run logs
+        # it once); this record carries the round timing and the type only.
         log_round(
             (time.perf_counter() - started) * 1000,
             question_keys=questions.keys(),
             state_len=len(state_text),
             error=err,
+            traceback=False,
         )
         raise
 
@@ -883,17 +1031,7 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
     root = _validate_root_dir(root_dir)
     search_dirs = get_scan_paths(root)
 
-    candidate_files: Dict[str, Path] = {}
-    for sdir in search_dirs:
-        if not sdir.exists():
-            continue
-        for p in sdir.rglob("*.md"):
-            if p.is_file():
-                try:
-                    rel = p.relative_to(root).as_posix()
-                except ValueError:
-                    continue  # path is outside root, skip it
-                candidate_files[rel] = p
+    candidate_files, discovery_truncated = _discover_markdown(root, search_dirs)
 
     if not candidate_files:
         result = {
@@ -902,8 +1040,6 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
             "resources": [],
             "summary": "No Markdown resources or skills found in candidate directories.",
             "primary": None,
-            "file": None,
-            "content": None,
             "primary_probability": None,
             "ranked": [],
             "candidates_considered": 0,
@@ -922,13 +1058,17 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
         return result
 
     options_all = list(candidate_files.keys())
-    options, candidates_truncated = bound_candidates(options_all, MAX_CHOICE_OPTIONS)
+    options, options_truncated = bound_candidates(options_all, MAX_CHOICE_OPTIONS)
+    # Either bound means a candidate was never offered to the model, so the
+    # result cannot be defended from this evidence alone.
+    candidates_truncated = discovery_truncated or options_truncated
     if candidates_truncated:
         log_event(
             "candidates_truncated",
             tool="find_agent_resources",
             considered=len(options_all),
             kept=len(options),
+            discovery_capped=discovery_truncated,
         )
 
     # One read per candidate, reused for both the criteria preview and the
@@ -1048,9 +1188,10 @@ def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -
     result = {
         "matched": len(resources) > 0,
         "count": len(resources),
+        # `primary` is `resources[0]`. The old flat `file`/`content` keys were a
+        # third and fourth copy of the same up-to-6,000-character blob, and the
+        # MCP runtime serialized every copy on every call.
         "primary": resources[0] if resources else None,
-        "file": resources[0]["file"] if resources else None,
-        "content": resources[0]["content"] if resources else None,
         "resources": resources,
         "summary": f"Found {len(resources)} relevant agent resource(s): {summary_names}",
         "primary_probability": round(primary_prob, 4) if primary_val else None,
@@ -1132,6 +1273,132 @@ TARGET_FILE_INSTRUCTIONS = (
 
 TARGET_FILE_STATE_GOAL = "Identify which single workspace file must be inspected or edited."
 
+#: Depth bound for the non-git walk, and the two caps every path shares.
+MAX_WALK_DEPTH = 5
+
+
+def _git_dir(root: Path) -> Optional[Path]:
+    """The `.git` directory for `root`, following a worktree/submodule pointer."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if dot_git.is_file():
+        try:
+            line = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+        if line.startswith("gitdir:"):
+            target = Path(line.split(":", 1)[1].strip())
+            if not target.is_absolute():
+                target = dot_git.parent / target
+            return target
+    return None
+
+
+def _git_signature(root: Path, git_dir: Path) -> tuple:
+    """HEAD + index mtime + `.gitignore` mtime: the cheap git state fingerprint.
+
+    HEAD is read straight off disk (a few bytes) rather than by forking
+    `git rev-parse`, which would defeat the point of caching the `ls-files`
+    subprocess. An `add`/`rm` moves the index mtime, a commit moves the ref, and
+    a new ignore rule moves `.gitignore` — the three ways the file list changes.
+    """
+    def _mtime(path: Path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+
+    head = None
+    ref = None
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if head.startswith("ref:"):
+            ref_path = git_dir / head.split(":", 1)[1].strip()
+            ref = ref_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not ref:
+                # packed-refs: fall back to its mtime rather than its contents
+                ref = f"packed:{_mtime(git_dir / 'packed-refs')}"
+    except OSError:
+        pass
+    return (str(root), head, ref, _mtime(git_dir / "index"), _mtime(root / ".gitignore"))
+
+
+def _prune_dirnames(root: Path, dirpath: str, dirnames: List[str], ignore_dirs: set, max_depth: int) -> bool:
+    """Prune a directory list the same way for the walk and for its signature.
+
+    Returns True when this directory is at the depth limit, i.e. the caller must
+    not consider any file inside it.
+    """
+    rel = Path(dirpath).relative_to(root)
+    if len(rel.parts) >= max_depth:
+        dirnames.clear()
+        return True
+    dirnames[:] = [d for d in dirnames if d not in ignore_dirs and not d.startswith(".")]
+    return False
+
+
+def _walk_files(root: Path, ignore_exts: set, ignore_dirs: set, max_count: int, max_depth: int) -> List[str]:
+    """Directory walk fallback for a non-git root. Bounded by depth and count."""
+    candidates: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if _prune_dirnames(root, dirpath, dirnames, ignore_dirs, max_depth):
+            continue
+        for fname in filenames:
+            if fname.startswith("."):
+                continue
+            p = Path(dirpath) / fname
+            if p.is_symlink():
+                continue  # skip symlinks to prevent loops
+            if p.suffix.lower() not in ignore_exts:
+                candidates.append(p.relative_to(root).as_posix())
+                if len(candidates) >= max_count:
+                    return candidates
+    return candidates
+
+
+def _discover_candidates(
+    root: Path,
+    ignore_exts: set,
+    max_count: int,
+    ignore_dirs: set,
+    max_depth: int = MAX_WALK_DEPTH,
+) -> List[str]:
+    """Workspace file candidates, from git when possible, else from a walk.
+
+    Both paths are cached against their on-disk signature, so a second identical
+    call costs a handful of `stat`s instead of a forked `git ls-files` or a full
+    tree walk.
+    """
+    key = (
+        "files",
+        str(root),
+        tuple(sorted(ignore_exts)),
+        max_count,
+        tuple(sorted(ignore_dirs)),
+        max_depth,
+    )
+    git_dir = _git_dir(root)
+    # The git fingerprint alone is not enough: `ls-files --others` also reports
+    # untracked files, and creating one leaves HEAD and the index untouched. The
+    # bounded directory tree is the second half of the signature, so a new file
+    # invalidates the cache in a git repo too. It still costs a directory walk
+    # rather than a process fork, which is the expensive part.
+    signature = (
+        _git_signature(root, git_dir) if git_dir is not None else None,
+        _dir_signature([root], ignore_dirs=ignore_dirs),
+    )
+
+    cached = _scan_cache.get(key, lambda: signature)
+    if cached is not None:
+        return list(cached)
+
+    candidates = _discover_files_git(root, ignore_exts, max_count, ignore_dirs)
+    if candidates is None:
+        candidates = _walk_files(root, ignore_exts, ignore_dirs, max_count, max_depth)
+    _scan_cache.put(key, signature, list(candidates))
+    return list(candidates)
+
 
 def _preview_criteria(root: Path, candidates: List[str]):
     """Criteria for the workspace files: `path`, then a preview of its head.
@@ -1181,31 +1448,8 @@ def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) ->
     ignore_dirs = {".git", ".godot", ".import", ".venv", "node_modules", "dist", "build"}
     ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".wav", ".ogg", ".mp3", ".ttf", ".import", ".zip"}
 
-    # Fast path: use git if available
-    candidates = _discover_files_git(root, ignore_exts, MAX_CHOICE_OPTIONS, ignore_dirs)
-
-    # Fallback: manual directory walk, bounded by depth
-    if candidates is None:
-        candidates = []
-        max_depth = 5
-        for dirpath, dirnames, filenames in os.walk(root):
-            rel_dir = Path(dirpath).relative_to(root)
-            if len(rel_dir.parts) >= max_depth:
-                dirnames.clear()
-                continue
-            dirnames[:] = [d for d in dirnames if d not in ignore_dirs and not d.startswith(".")]
-            for fname in filenames:
-                if fname.startswith("."):
-                    continue
-                p = Path(dirpath) / fname
-                if p.is_symlink():
-                    continue  # skip symlinks to prevent loops
-                if p.suffix.lower() not in ignore_exts:
-                    candidates.append(p.relative_to(root).as_posix())
-                    if len(candidates) >= MAX_CHOICE_OPTIONS:
-                        break
-            if len(candidates) >= MAX_CHOICE_OPTIONS:
-                break
+    # Fast path: git if available, else a bounded walk. Both are cached.
+    candidates = _discover_candidates(root, ignore_exts, MAX_CHOICE_OPTIONS, ignore_dirs)
 
     if not candidates:
         result = {

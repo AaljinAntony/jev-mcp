@@ -6,59 +6,49 @@ from unittest.mock import patch
 from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
 import jev_engine
 from config import ensure_dotenv
-from jev_logging import _redact, _SECRET_MARKERS
+from jev_logging import _redact
 
 
 class TestLogRedaction:
-    """Tests for Task 8B: Improved log redaction."""
+    """Redaction removes the credential and keeps the field around it."""
 
-    def test_marker_redaction(self):
-        # All secret markers should trigger redaction
-        assert _redact("sk-abcdef123456") == "<redacted>"
-        assert _redact("ts_secretkey999") == "<redacted>"
-        assert _redact("apikey_12345") == "<redacted>"
-        assert _redact("api_key=mysecret") == "<redacted>"
-        assert _redact("api_key:mysecret") == "<redacted>"
-        assert _redact("typesafe_api_key_test") == "<redacted>"
-        assert _redact("Bearer eyJhbGciOi...") == "<redacted>"
-        assert _redact("Authorization: Bearer foo") == "<redacted>"
+    def test_credential_is_removed_and_context_survives(self):
+        out = _redact("curl -H 'Authorization: Bearer sk-abc123def456' https://example.test/x")
+        assert "sk-abc123def456" not in out
+        assert "<redacted>" in out
+        assert "curl" in out and "https://example.test/x" in out
+
+    def test_key_shaped_tokens_are_redacted(self):
+        assert "sk-abcdef123456" not in _redact("sk-abcdef123456")
+        assert "apikey_1234567890" not in _redact("apikey_1234567890")
+        assert "SUPERSECRET" not in _redact("api_key=SUPERSECRET")
+        assert "SUPERSECRET" not in _redact("api_key: SUPERSECRET")
 
     def test_case_insensitivity(self):
-        assert _redact("SK-Upper-Case") == "<redacted>"
-        assert _redact("TS_PROJECT_SECRET") == "<redacted>"
-        assert _redact("BEARER token123") == "<redacted>"
-        assert _redact("AUTHORIZATION: basic xxx") == "<redacted>"
+        assert "SK-UPPER-CASE" not in _redact("SK-UPPER-CASE")
+        assert "TS_PROJECT_SECRET" not in _redact("TS_PROJECT_SECRET")
+        assert "eyJhbGciOi" not in _redact("Bearer eyJhbGciOiJIUzI1NiJ9")
+        assert "dXNlcjpwYXNz" not in _redact("AUTHORIZATION: dXNlcjpwYXNzd29yZA")
 
-    def test_heuristic_long_alphanumeric_keys(self):
-        # > 40 chars alphanumeric (allowing - and _)
-        key_41 = "a" * 41
-        assert _redact(key_41) == "<redacted>"
+    def test_long_non_secrets_survive(self):
+        # The removed heuristic redacted any 41-char alphanumeric run, which
+        # threw away commit SHAs, hashes and long identifiers for no reason.
+        long_token = "a" * 41
+        assert _redact(long_token) == long_token
 
-        key_with_hyphens = "abcde-12345-fghij-67890-klmno-12345-pqrst-67890"
-        assert len(key_with_hyphens) > 40
-        assert _redact(key_with_hyphens) == "<redacted>"
-
-        key_with_underscores = "sec_12345_67890_abcde_fghij_klmno_pqrst_uvwxyz_99"
-        assert len(key_with_underscores) > 40
-        assert _redact(key_with_underscores) == "<redacted>"
-
-    def test_heuristic_does_not_redact_non_secrets(self):
-        # 40 chars exactly (e.g., git commit SHA) should not be redacted by heuristic
         commit_sha = "0123456789abcdef0123456789abcdef01234567"
-        assert len(commit_sha) == 40
         assert _redact(commit_sha) == commit_sha
 
-        # Sentences > 40 chars with spaces
         sentence = "This is a normal log message describing an operation that took place in workspace"
-        assert len(sentence) > 40
         assert _redact(sentence) == sentence
 
-        # File paths > 40 chars with slashes and periods
         filepath = "d:/mcp/jev-typesafe-mcp/subdir/another/file.txt"
-        assert len(filepath) > 40
         assert _redact(filepath) == filepath
 
-        # Short strings
+        # A word that merely *ends* in a key prefix is not a key.
+        assert _redact("disk-backup-options-configured") == "disk-backup-options-configured"
+
+    def test_short_strings_untouched(self):
         assert _redact("hello") == "hello"
         assert _redact("status_ok") == "status_ok"
 
