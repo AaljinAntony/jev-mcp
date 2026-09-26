@@ -99,7 +99,19 @@ $env:JEV_MCP_ALLOWED_ROOTS="D:\work\other-project;D:\work\shared"
 5. **(Optional) plugin:** copy `config\jev-plugin.example.js` to
    `$env:USERPROFILE\.config\opencode\plugins\jev-plugin.js`.
    The plugin never writes to the conversation; it logs diagnostics to
-   `~\.config\opencode\logs\jev-plugin.log`.
+   `~\.config\opencode\logs\jev-plugin.log` (rotating at 2 MB, and never
+   containing prompt text — only its length and a short digest).
+   It reuses the same `jev_mcp.py` you configured above, spawned once per
+   session and driven as a stdio MCP client, so no second server implementation
+   exists to drift. Run `node tests\test_plugin.mjs` after every copy: its last
+   check fails if the installed file no longer matches the committed example.
+
+   To keep skills outside the project, opt in explicitly (forwarded to the
+   server as `JEV_MCP_ALLOWED_ROOTS`):
+
+   ```powershell
+   $env:JEV_PLUGIN_SCAN_ROOTS="$env:USERPROFILE\.config\opencode\skills"
+   ```
 
 6. **Restart OpenCode** so the MCP server and settings are re-read, then run the
    verification commands from the main `README.md`.
@@ -111,11 +123,17 @@ $env:JEV_MCP_ALLOWED_ROOTS="D:\work\other-project;D:\work\shared"
 (`C:\Users\<you>\.config\opencode\plugins\jev-plugin.js`):
 
 - The `chat.message` hook must **never** block the opencode process. The plugin's
-  Jev query is now an **async** `spawn` + `await` (4 s cap), not a synchronous
-  `spawnSync`. A blocking call inside the hook is what trips opencode into the
-  error popup and task auto-stop.
+  Jev query is a **non-blocking** async stdio JSON-RPC round trip against a
+  long-lived `jev_mcp.py` child (20 s per-request cap), not a synchronous spawn. A
+  blocking call inside the hook is what trips opencode into the error popup and
+  task auto-stop. Injecting a skill **edits the existing user text part** rather
+  than pushing a new one, because opencode validates every part against `PartV2`
+  at save time and a bare `{type:"text", text}` crashes `createUserMessage`.
 - Check the traces to see who failed:
-  - `~\.config\opencode\logs\jev-plugin.log` — hook fired? candidates found? spawn result?
+  - `~\.config\opencode\logs\jev-plugin.log` — hook fired? `client started`?
+    per-tool `action`/`confidence`? injected or skipped, and why? A second
+    message must **not** log a second `client started`: that is the
+    connection-reuse proof.
   - `<repo>\logs\jev_engine.log` — was the tool even invoked? current tool call, duration, envelope.
 - Reproduce a tool failure over the real transport (same as opencode) with:
 
@@ -194,6 +212,12 @@ for the reply — a hard switch, not a recommendation). `select_model_tier` rema
 available as an MCP tool for explicit/on-demand queries. When routing is **off**
 (the default), nothing is changed and opencode uses its `"model"` config /
 window-selected model.
+
+Both the switch and the skill injection require the server to return
+`action: "auto"` with `confidence >= 0.6`, a well-formed `provider/model` id, and
+an existing `output.message.model`. A `review` or `escalate` decision changes
+nothing — the hook logs why, and opencode carries on with the window model and no
+injected skill.
 
 ## Security
 

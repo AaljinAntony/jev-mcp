@@ -12,21 +12,36 @@
  *      `lastUser.model`, so this is a real, forced switch — not a recommendation.
  *      When routing is off, the message model is left untouched (opencode.json /
  *      window-selected model wins).
- *   2. Skill routing: scans the configured skill dirs for Markdown, asks Jev which
- *      file is most relevant, and injects its content into the conversation.
+ *   2. Skill routing: asks Jev which Markdown file under the workspace is most
+ *      relevant, and injects its content into the conversation.
+ *
+ * Both decisions are made by the jev-engine MCP server over a **stdio JSON-RPC
+ * connection**, not by an inline Python program. That matters for correctness as
+ * much as latency: the server owns `fit_state` token budgeting, fail-closed
+ * response validation, the policy thresholds, the escape hatch and the error
+ * taxonomy. A plugin that asked the model directly got none of those, so a
+ * malformed response read as a confident pick. One child is spawned lazily and
+ * reused for the whole opencode session.
+ *
+ * No `@modelcontextprotocol/sdk` is available inside opencode's plugin sandbox,
+ * so the client is hand-rolled: newline-delimited JSON-RPC 2.0 over the child's
+ * stdin/stdout, which is exactly what `scripts/diag_mcp.py` speaks.
  *
  * Settings are read from `jevs_settings.json` (project > user) with a legacy
  * fallback to the `jev_settings` block in opencode.json. All errors are swallowed:
  * the hook never crashes OpenCode.
  */
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+/** Repo root of *this copy* — never a hardcoded drive letter, so the
+ *  copy-into-`config/`-and-install workflow keeps working. */
 const REPO_ROOT = path.resolve(__dirname, "..");
 
 const DEFAULT_SCAN_PATHS = [
@@ -38,22 +53,51 @@ const DEFAULT_SCAN_PATHS = [
   ".agents",
 ];
 
-const MAX_INJECT_CHARS = 6000; // Match jev_engine MAX_CONTENT_CHARS
-const MAX_PROMPT_CHARS = 100_000; // Guard against runaway user prompts
-const CHILD_KILL_MS = 12_000; // Backstop only; must exceed the Python retry budget
+const MAX_INJECT_CHARS = 6000; // Match limits.MAX_CONTENT_CHARS
+const MAX_PROMPT_CHARS = 100_000; // Longer prompts are skipped, not sent
+
+/**
+ * Confidence floor for *both* effects (model switch and skill injection).
+ *
+ * Why 0.6 and not JEV_MCP_AUTO_ACCEPT (0.8)? The server already downgraded the
+ * decision to `review` below 0.8, so by the time we see `action === "auto"` the
+ * stricter bar is met. This 0.6 is a second, independent floor so a future
+ * server-side threshold change cannot silently start injecting on weak judgments.
+ */
+const PLUGIN_MIN_CONFIDENCE = 0.6;
+
+const INIT_TIMEOUT_MS = 10_000;
+const TOOL_TIMEOUT_MS = 20_000;
+const CLIENT_IDLE_MS = 5 * 60_000; // Don't hold a Python process for a whole session
+const CLIENT_KILL_GRACE_MS = 2000; // Let the server flush its log on the way out
+const MAX_BUFFER_BYTES = 8 * 1024 * 1024; // A server that never sends \n must not eat RAM
+const CIRCUIT_FAILURES = 3; // Mirrors JEV_MCP_BREAKER_THRESHOLD
+const CIRCUIT_COOLDOWN_MS = 60_000; // Mirrors JEV_MCP_BREAKER_COOLDOWN_S
+
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Log directory. Overridable so the test suite can assert rotation. */
+function logDir() {
+  return process.env.JEV_PLUGIN_LOG_DIR || path.join(os.homedir(), ".config", "opencode", "logs");
+}
 
 // Dedicated plugin log (opencode may swallow console output). Best effort only.
 function pluginLog(msg) {
   try {
-    const dir = path.join(os.homedir(), ".config", "opencode", "logs");
+    const dir = logDir();
     fs.mkdirSync(dir, { recursive: true });
     const logFile = path.join(dir, "jev-plugin.log");
 
     // Rotate once past 2MB so the log cannot grow without bound.
     if (fs.existsSync(logFile)) {
-      const stats = fs.statSync(logFile);
-      if (stats.size > 2 * 1024 * 1024) {
-        const backupFile = path.join(dir, "jev-plugin.log.1");
+      let size = 0;
+      try {
+        size = fs.statSync(logFile).size;
+      } catch {
+        size = 0;
+      }
+      if (size > LOG_MAX_BYTES) {
+        const backupFile = `${logFile}.1`;
         try {
           if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
           fs.renameSync(logFile, backupFile);
@@ -67,6 +111,18 @@ function pluginLog(msg) {
   }
 }
 
+/**
+ * Log a user prompt without logging it.
+ *
+ * The first 80 characters of every prompt used to go to disk verbatim. That is a
+ * privacy leak (it is also how the log grew without bound), so a prompt is now
+ * only ever identified by its length and a short digest.
+ */
+function describeText(text) {
+  const digest = crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
+  return `len=${text.length} sha256=${digest}`;
+}
+
 function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -76,20 +132,74 @@ function readJson(file) {
   }
 }
 
+function realOrSelf(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
 /**
- * Locate and read Jev settings: jevs_settings.json first, then legacy
- * opencode.json `jev_settings`, plus the Python interpreter and API key.
+ * True when `target` is `root` or lives inside it.
+ *
+ * Containment is a `path.relative` walk, never a `startsWith` on the string, so a
+ * sibling like `<root>-evil` is refused. Both sides are resolved through
+ * `realpath`, so a symlink pointing out of the workspace is refused too.
  */
-function loadSettings() {
-  const cwd = process.cwd();
+function isInside(root, target) {
+  const rel = path.relative(realOrSelf(root), realOrSelf(target));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * Locate the `[python, server]` argv for jev-engine.
+ *
+ * `opencode.json`'s `mcp["jev-engine"].command` is authoritative — a host that
+ * launches the server that way is the same host the plugin must reuse. Only the
+ * server script must exist on disk; the interpreter may legitimately be a bare
+ * `python` resolved through PATH.
+ */
+function resolveServerCommand(configPaths) {
+  for (const p of configPaths) {
+    if (!p || !fs.existsSync(p)) continue;
+    const cmd = readJson(p)?.mcp?.["jev-engine"]?.command;
+    if (!Array.isArray(cmd) || cmd.length < 2) continue;
+    const [pythonPath, serverPath] = cmd;
+    if (typeof pythonPath !== "string" || typeof serverPath !== "string") continue;
+    if (!pythonPath || !serverPath) continue;
+    if (fs.existsSync(serverPath)) return { pythonPath, serverPath };
+    pluginLog(`opencode.json mcp["jev-engine"].command points at a missing server: ${serverPath}`);
+  }
+
+  const fallbacks = [
+    [path.join(REPO_ROOT, ".venv", "Scripts", "python.exe"), path.join(REPO_ROOT, "jev_mcp.py")],
+    [path.join(REPO_ROOT, ".venv", "bin", "python"), path.join(REPO_ROOT, "jev_mcp.py")],
+  ];
+  for (const [pythonPath, serverPath] of fallbacks) {
+    if (fs.existsSync(pythonPath) && fs.existsSync(serverPath)) return { pythonPath, serverPath };
+  }
+  return { pythonPath: "python", serverPath: path.join(REPO_ROOT, "jev_mcp.py") };
+}
+
+/**
+ * Read Jev settings: `jevs_settings.json` (project > user), then the legacy
+ * `jev_settings` block in opencode.json, plus the server command.
+ *
+ * The API key is deliberately NOT read here — the server loads it from its own
+ * env or `.env`, and the opencode MCP `environment` block injects it. One fewer
+ * copy of a credential path, and one fewer place for a quoting bug to hide.
+ */
+function loadSettings(cwd) {
+  const base = cwd || process.cwd();
   const settingsPaths = [
-    path.join(cwd, "jevs_settings.json"),
-    path.join(cwd, ".opencode", "jevs_settings.json"),
+    path.join(base, "jevs_settings.json"),
+    path.join(base, ".opencode", "jevs_settings.json"),
     path.join(os.homedir(), ".config", "opencode", "jevs_settings.json"),
   ];
   const configPaths = [
-    path.join(cwd, "opencode.json"),
-    path.join(cwd, ".opencode", "opencode.json"),
+    path.join(base, "opencode.json"),
+    path.join(base, ".opencode", "opencode.json"),
     path.join(os.homedir(), ".config", "opencode", "opencode.json"),
   ];
 
@@ -116,59 +226,13 @@ function loadSettings() {
 
   jev = jev || {};
 
-  // Python interpreter: mcp command -> default venv
-  let pythonPath = null;
-  for (const p of configPaths) {
-    if (!fs.existsSync(p)) continue;
-    const cmd = readJson(p)?.mcp?.["jev-engine"]?.command;
-    if (Array.isArray(cmd) && cmd[0] && fs.existsSync(cmd[0])) {
-      pythonPath = cmd[0];
-      break;
-    }
-    if (typeof cmd === "string" && fs.existsSync(cmd)) {
-      pythonPath = cmd;
-      break;
-    }
-  }
-  if (!pythonPath || !fs.existsSync(pythonPath)) {
-    const defaultVenvPy = path.join(REPO_ROOT, ".venv", "Scripts", "python.exe");
-    // Also try Unix-style venv path
-    const defaultVenvPyUnix = path.join(REPO_ROOT, ".venv", "bin", "python");
-    const cwdVenvPy = path.join(cwd, ".venv", "Scripts", "python.exe");
-    const cwdVenvPyUnix = path.join(cwd, ".venv", "bin", "python");
-    if (fs.existsSync(defaultVenvPy)) {
-      pythonPath = defaultVenvPy;
-    } else if (fs.existsSync(defaultVenvPyUnix)) {
-      pythonPath = defaultVenvPyUnix;
-    } else if (fs.existsSync(cwdVenvPy)) {
-      pythonPath = cwdVenvPy;
-    } else if (fs.existsSync(cwdVenvPyUnix)) {
-      pythonPath = cwdVenvPyUnix;
-    } else {
-      pythonPath = "python";
-    }
-  }
-
-  // API key: process env -> repo .env
-  let apiKey = process.env.TYPESAFE_API_KEY || "";
-  if (!apiKey) {
-    const envFile = path.join(REPO_ROOT, ".env");
-    const cwdEnvFile = path.join(cwd, ".env");
-    const targetEnv = fs.existsSync(envFile) ? envFile : fs.existsSync(cwdEnvFile) ? cwdEnvFile : null;
-    if (targetEnv) {
-      const match = fs.readFileSync(targetEnv, "utf-8").match(/TYPESAFE_API_KEY\s*=\s*['"]?([^'"\s\n]+)['"]?/);
-      if (match) apiKey = match[1].trim();
-    }
-  }
-
   const configuredPaths = Array.isArray(jev.scan_paths)
-    ? jev.scan_paths.filter((p) => typeof p === "string")
+    ? jev.scan_paths.filter((p) => typeof p === "string" && p.trim())
     : [];
   const scanPaths = Array.from(new Set([...DEFAULT_SCAN_PATHS, ...configuredPaths]));
 
   return {
-    pythonPath,
-    apiKey,
+    ...resolveServerCommand(configPaths),
     enable_model_routing: Boolean(jev.enable_model_routing),
     models:
       jev.models && typeof jev.models === "object" && !Array.isArray(jev.models)
@@ -176,6 +240,23 @@ function loadSettings() {
         : {},
     scanPaths,
   };
+}
+
+/**
+ * Environment for the child process.
+ *
+ * `JEV_PLUGIN_SCAN_ROOTS` is the plugin's opt-in for skill directories kept
+ * outside the project (e.g. `~/.config/opencode/skills`); it is forwarded to the
+ * server's own allowlist so both sides agree on what may be read.
+ */
+function childEnv() {
+  const env = { ...process.env };
+  const scanRoots = (process.env.JEV_PLUGIN_SCAN_ROOTS || "").trim();
+  if (scanRoots) {
+    const existing = (process.env.JEV_MCP_ALLOWED_ROOTS || "").trim();
+    env.JEV_MCP_ALLOWED_ROOTS = existing ? `${existing}${path.delimiter}${scanRoots}` : scanRoots;
+  }
+  return env;
 }
 
 /**
@@ -204,6 +285,24 @@ function scanResourceFiles(dir, depth = 0, maxDepth = 6) {
 }
 
 /**
+ * Confine the configured scan paths to the workspace.
+ *
+ * `scan_paths` comes from `jevs_settings.json`, which the README documents as
+ * safe to commit and share. Resolved against the CWD with no containment check, an
+ * untrusted repository could name `../../../../Users/victim` and get arbitrary
+ * `.md` files read and injected. Everything outside the workspace is dropped.
+ */
+function resolveSearchDirs(settings, cwd) {
+  const allowOutside = process.env.JEV_PLUGIN_ALLOW_OUTSIDE === "1";
+  const dirs = settings.scanPaths.map((p) => path.resolve(cwd, p));
+  const kept = dirs.filter((d) => isInside(cwd, d) || allowOutside);
+  if (kept.length !== dirs.length) {
+    pluginLog(`dropped ${dirs.length - kept.length} scan path(s) outside cwd`);
+  }
+  return Array.from(new Set(kept));
+}
+
+/**
  * Extract prompt text across OpenCode hook payload variations
  */
 function extractUserPrompt(input, output) {
@@ -226,157 +325,6 @@ function extractUserPrompt(input, output) {
   }
 
   return "";
-}
-
-/**
- * Query Jev via the configured Python environment using the current
- * TypeSafeClient.system_one(...) API. Returns { tier?, target? }.
- *
- * TODO: This spawns a new Python process per message, which is slow (~1-3s).
- * A better approach would be to call the jev-engine MCP server's tools
- * (search_agent_skills, select_model_tier) via the MCP protocol, reusing
- * the already-running server's client, connection pool, and retry logic.
- * This requires the plugin to act as an MCP client over stdio.
- *
- * Async: spawns a child and awaits its exit so the hook NEVER blocks the
- * opencode process (a blocking spawnSync here is what trips opencode's task
- * loop into "Unexpected error occurred" + auto-stop). Capped at 4s.
- */
-function queryJev(pythonPath, apiKey, task, candidates, wantTier) {
-  const pythonScript = `
-import sys, json, os
-
-try:
-    from typesafe_sdk import TypeSafeClient, Choice, RetryPolicy
-except ImportError as e:
-    sys.stderr.write(f"IMPORT_ERROR: {e}")
-    sys.exit(2)
-
-def get_val(ans):
-    if ans is None:
-        return None
-    source = ans if isinstance(ans, dict) else ans
-    for attr in ("choice", "value", "key", "selected"):
-        v = source.get(attr) if isinstance(source, dict) else getattr(source, attr, None)
-        if v is not None:
-            return v
-    return ans
-
-try:
-    payload = json.loads(sys.stdin.read())
-    task = payload.get("task", "")
-    candidates = payload.get("candidates", [])
-    want_tier = payload.get("want_tier", False)
-
-    questions = {}
-    if want_tier:
-        questions["tier"] = Choice(
-            criteria={
-                "fast": "Typos, simple lookups, docstrings, boilerplate",
-                "balanced": "Standard bugs, test cases, isolated feature changes",
-                "frontier": "Multi-file refactors, architecture design, complex algorithmic logic",
-            },
-            instructions="Select the appropriate model capability tier for this task.",
-        )
-    if candidates:
-        questions["target"] = Choice(
-            criteria={c: f"Agent resource: {c}" for c in candidates[:250]},
-            instructions="Select the primary matching agent skill, workflow, or memory document.",
-        )
-
-    if not questions:
-        print(json.dumps({}))
-        sys.exit(0)
-
-    client = TypeSafeClient(
-        api_key=os.environ.get("TYPESAFE_API_KEY"),
-        timeout=3.0,
-        retry=RetryPolicy(
-            max_retries=2,
-            backoff_initial=0.5,
-            backoff_max=5.0,
-            backoff_jitter=0.25,
-        ),
-    )
-    res = client.system_one(state=f"User Task: {task}", questions=questions)
-    answers = getattr(res, "answers", {})
-    out = {}
-    if want_tier:
-        out["tier"] = get_val(answers.get("tier"))
-    if candidates:
-        out["target"] = get_val(answers.get("target"))
-    print(json.dumps({k: v for k, v in out.items() if v}))
-except Exception as e:
-    sys.stderr.write(f"QUERY_ERROR: {e}")
-    sys.exit(1)
-`;
-  const childEnv = { ...process.env };
-  if (apiKey) childEnv.TYPESAFE_API_KEY = apiKey;
-
-  return new Promise((resolve) => {
-    let proc;
-    try {
-      proc = spawn(pythonPath, ["-c", pythonScript], {
-        env: childEnv,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err) {
-      pluginLog(`queryJev spawn threw: ${err.message}`);
-      resolve(null);
-      return;
-    }
-
-    // Hard kill is a backstop only. It must outlast the in-Python budget
-    // (3s timeout x (1 + 2 retries) + backoff), otherwise every retry path
-    // would be killed before it can report a result.
-    const timer = setTimeout(() => {
-      pluginLog(`queryJev timed out (${CHILD_KILL_MS}ms), killing child`);
-      proc.kill();
-    }, CHILD_KILL_MS);
-
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => (stdout += d));
-    proc.stderr.on("data", (d) => (stderr += d));
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      try {
-        proc.kill();
-      } catch {}
-      pluginLog(`queryJev child error: ${err.message}`);
-      resolve(null);
-    });
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0 && stdout) {
-        try {
-          resolve(JSON.parse(stdout.trim()));
-          return;
-        } catch (err) {
-          pluginLog(`queryJev JSON parse failed: ${err.message}`);
-        }
-      }
-      const stderrTrimmed = String(stderr).trim().slice(0, 300);
-      pluginLog(`queryJev failed (status ${code}): ${stderrTrimmed}`);
-
-      // Surface import errors so the user knows the SDK is missing
-      if (code === 2 && stderrTrimmed.includes("IMPORT_ERROR")) {
-        console.warn(
-          `[jev-plugin] ⚠️  TypeSafe SDK not found in Python environment. ` +
-          `Skills and model routing are disabled. Check your venv path.`
-        );
-      }
-
-      resolve(null);
-    });
-
-    try {
-      proc.stdin.write(JSON.stringify({ task, candidates, want_tier: Boolean(wantTier) }));
-      proc.stdin.end();
-    } catch (err) {
-      pluginLog(`queryJev stdin write failed: ${err.message}`);
-    }
-  });
 }
 
 /**
@@ -425,81 +373,528 @@ function injectIntoUserMessage(output, notice) {
   return false;
 }
 
+/** True only for a decision the server is willing to act on without review. */
+function isConfident(res) {
+  if (!res || res.action !== "auto") return false;
+  const confidence = typeof res.confidence === "number" ? res.confidence : 0;
+  return confidence >= PLUGIN_MIN_CONFIDENCE;
+}
+
+/**
+ * Pull the `{code, message, retryable}` envelope out of an MCP tool error.
+ *
+ * The MCP runtime reports a tool failure as text of the form
+ * `Error executing tool <name>: {"error": {...}}`, so the JSON has to be cut out
+ * from under the prefix rather than parsed from the whole string.
+ */
+function parseEnvelope(text) {
+  if (typeof text !== "string") return null;
+  let json = null;
+  if (text.trimStart().startsWith("{")) {
+    json = text;
+  } else {
+    const idx = text.indexOf(": {");
+    if (idx >= 0) json = text.slice(idx + 2);
+  }
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === "object" && parsed.error ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A minimal stdio JSON-RPC client for the jev-engine MCP server.
+ *
+ * Newline-delimited JSON-RPC 2.0 over a child process's stdin/stdout — the same
+ * wire format `scripts/diag_mcp.py` speaks. One instance is reused for a whole
+ * opencode session, so the per-message cost is one HTTPS round trip on a warm
+ * connection instead of an interpreter start, an SDK import and a new HTTPS
+ * round trip.
+ */
+class JevMcpClient {
+  constructor(pythonPath, serverPath, options = {}) {
+    this.pythonPath = pythonPath;
+    this.serverPath = serverPath;
+    this.args = Array.isArray(options.args) ? options.args : [];
+    this.env = options.env || process.env;
+    this.log = typeof options.log === "function" ? options.log : pluginLog;
+    this.idleMs = Number.isFinite(options.idleMs) ? options.idleMs : CLIENT_IDLE_MS;
+    this.killGraceMs = Number.isFinite(options.killGraceMs) ? options.killGraceMs : CLIENT_KILL_GRACE_MS;
+    this.maxBufferBytes = Number.isFinite(options.maxBufferBytes) ? options.maxBufferBytes : MAX_BUFFER_BYTES;
+
+    this.proc = null;
+    this.buffer = "";
+    this.nextId = 1;
+    this.pending = new Map();
+    this.ready = null;
+    this.idleTimer = null;
+    /** One in-flight hook at a time; see `runQueries`. */
+    this.busy = false;
+    this.consecutiveFailures = 0;
+    this.breakerOpenUntil = 0;
+  }
+
+  /** Spawn lazily, once, and reuse. Idempotent. */
+  start() {
+    if (this.proc && this.ready) return this.ready;
+
+    this.ready = new Promise((resolve, reject) => {
+      let proc;
+      try {
+        proc = spawn(this.pythonPath, [...this.args, this.serverPath], {
+          env: this.env,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err) {
+        this.ready = null;
+        reject(new Error(`spawn failed: ${err.message}`));
+        return;
+      }
+      this.proc = proc;
+      this.log(`client started pid=${proc.pid} server=${this.serverPath}`);
+
+      proc.stdout.on("data", (chunk) => this.onData(chunk));
+      // stderr MUST be drained: a full pipe buffer would block the server's
+      // logging mid-call and deadlock the request.
+      proc.stderr.on("data", (d) => {
+        const text = String(d).trim();
+        if (text) this.log(`server stderr: ${text.slice(-300)}`);
+      });
+      proc.on("error", (err) => this.failAll(err));
+      proc.on("exit", (code, signal) => {
+        this.log(`server exited code=${code} signal=${signal}`);
+        if (this.proc === proc) this.proc = null;
+        this.failAll(new Error(`jev-engine exited (${code ?? signal})`));
+        this.ready = null;
+        this.clearIdle();
+      });
+
+      // stdout is JSON-RPC only; the server logs to stderr and to its own file.
+      this.send(
+        {
+          jsonrpc: "2.0",
+          id: this.nextId++,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "jev-plugin", version: "1" },
+          },
+        },
+        INIT_TIMEOUT_MS
+      )
+        .then((res) => {
+          this.notify("notifications/initialized");
+          resolve(res);
+        })
+        .catch((err) => {
+          this.ready = null;
+          this.stop(`handshake failed: ${err.message}`);
+          reject(err);
+        });
+    });
+
+    return this.ready;
+  }
+
+  /** Fire-and-forget notification. */
+  notify(method, params) {
+    if (!this.proc) return;
+    try {
+      this.proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+    } catch (err) {
+      this.log(`notify ${method} failed: ${err.message}`);
+    }
+  }
+
+  send(message, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timer =
+        Number.isFinite(timeoutMs) && timeoutMs > 0
+          ? setTimeout(() => {
+              this.pending.delete(message.id);
+              reject(new Error(`${message.method} timed out after ${timeoutMs}ms`));
+            }, timeoutMs)
+          : null;
+      this.pending.set(message.id, { resolve, reject, timer });
+      try {
+        this.proc.stdin.write(`${JSON.stringify(message)}\n`);
+      } catch (err) {
+        this.pending.delete(message.id);
+        if (timer) clearTimeout(timer);
+        reject(new Error(`stdin write failed: ${err.message}`));
+      }
+    });
+  }
+
+  async request(method, params, timeoutMs = TOOL_TIMEOUT_MS) {
+    await this.start();
+    return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, timeoutMs);
+  }
+
+  /** Frame on newlines and dispatch by request id. */
+  onData(chunk) {
+    this.buffer += chunk.toString("utf-8");
+    let idx;
+    while ((idx = this.buffer.indexOf("\n")) >= 0) {
+      const line = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + 1);
+      if (!line) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        this.log(`unparseable line: ${line.slice(0, 200)}`);
+        continue;
+      }
+      if (msg.id !== undefined && msg.method) {
+        // A server-initiated request (ping, roots/list, ...). Answer rather than
+        // leave the server blocked on a response it will wait for.
+        this.reply(msg.id, { error: { code: -32601, message: `method not found: ${msg.method}` } });
+        continue;
+      }
+      const entry = msg.id !== undefined ? this.pending.get(msg.id) : undefined;
+      if (!entry) continue;
+      this.pending.delete(msg.id);
+      if (entry.timer) clearTimeout(entry.timer);
+      if (msg.error) entry.reject(new Error(msg.error?.message || "rpc error"));
+      else entry.resolve(msg.result);
+    }
+
+    if (this.buffer.length > this.maxBufferBytes) {
+      this.log(`response buffer exceeded ${this.maxBufferBytes} bytes; killing child`);
+      this.stop("buffer overflow");
+    }
+  }
+
+  reply(id, payload) {
+    if (!this.proc) return;
+    try {
+      this.proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...payload })}\n`);
+    } catch (err) {
+      this.log(`reply failed: ${err.message}`);
+    }
+  }
+
+  /** Unwrap the MCP result shape and return the parsed tool body. */
+  async callTool(name, args, timeoutMs = TOOL_TIMEOUT_MS) {
+    const result = await this.request("tools/call", { name, arguments: args }, timeoutMs);
+    const text = (result?.content || []).find((c) => c && c.type === "text")?.text;
+
+    if (result?.isError) {
+      const envelope = parseEnvelope(text);
+      const err = new Error(
+        envelope?.error?.message || `${name} failed: ${String(text || "no detail").slice(0, 200)}`
+      );
+      err.envelope = envelope || null;
+      err.code = envelope?.error?.code || null;
+      err.retryable = Boolean(envelope?.error?.retryable);
+      throw err;
+    }
+
+    // `structuredContent` first when the server offers it; otherwise the text
+    // body, which is the JSON document itself.
+    if (result?.structuredContent && typeof result.structuredContent === "object") {
+      return result.structuredContent;
+    }
+    if (typeof text !== "string" || !text.trim()) throw new Error(`${name} returned no text content`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`${name} returned non-JSON: ${text.slice(0, 200)}`);
+    }
+  }
+
+  failAll(err) {
+    const entries = Array.from(this.pending.values());
+    this.pending.clear();
+    for (const entry of entries) {
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.reject(err);
+    }
+  }
+
+  /**
+   * Reject everything pending, then shut the child down. Without rejecting first,
+   * a killed child leaves promises that never settle and the hook hangs.
+   */
+  stop(reason = "stopped") {
+    this.clearIdle();
+    const proc = this.proc;
+    this.proc = null;
+    this.ready = null;
+    this.buffer = "";
+    this.busy = false;
+    this.failAll(new Error(`jev-engine client ${reason}`));
+    if (!proc) return;
+    this.log(`client stopped (${reason})`);
+    try {
+      proc.stdin.end();
+    } catch {}
+    if (this.killGraceMs <= 0) {
+      try {
+        proc.kill();
+      } catch {}
+      return;
+    }
+    // Close stdin first so the server can run its shutdown logging, but do not
+    // wait forever for it.
+    const killTimer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {}
+    }, this.killGraceMs);
+    if (typeof killTimer.unref === "function") killTimer.unref();
+  }
+
+  clearIdle() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  /** Arm the idle shutdown; cancelled by the next call. */
+  armIdle() {
+    this.clearIdle();
+    if (!(this.idleMs > 0)) return;
+    this.idleTimer = setTimeout(() => this.stop("idle"), this.idleMs);
+    if (typeof this.idleTimer.unref === "function") this.idleTimer.unref();
+  }
+
+  breakerOpen() {
+    return Date.now() < this.breakerOpenUntil;
+  }
+
+  recordSuccess() {
+    this.consecutiveFailures = 0;
+    this.breakerOpenUntil = 0;
+  }
+
+  recordFailure(err) {
+    this.consecutiveFailures += 1;
+    if (this.consecutiveFailures >= CIRCUIT_FAILURES) {
+      this.breakerOpenUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
+      this.log(
+        `circuit breaker opened for ${CIRCUIT_COOLDOWN_MS}ms after ` +
+          `${this.consecutiveFailures} consecutive failures (last: ${err?.message || "unknown"})`
+      );
+      this.stop("circuit breaker open");
+    }
+  }
+
+  /** The user aborted the message: fail the pending work now, not at the timeout. */
+  abort(reason = "aborted") {
+    if (!this.pending.size) return;
+    this.log(`aborting ${this.pending.size} in-flight request(s): ${reason}`);
+    this.failAll(new Error(`jev-engine request ${reason}`));
+    this.stop(reason);
+  }
+
+  /** Called by the hook once it is done with the client for this message. */
+  release() {
+    this.busy = false;
+    this.armIdle();
+  }
+}
+
+/** The session-wide client. Rebuilt only if the configured command changes. */
+let activeClient = null;
+let activeClientKey = null;
+
+function getClient(settings) {
+  const key = `${settings.pythonPath} ${settings.serverPath}`;
+  if (activeClient && activeClientKey !== key) {
+    activeClient.stop("server command changed");
+    activeClient = null;
+    activeClientKey = null;
+  }
+  if (!activeClient) {
+    activeClient = new JevMcpClient(settings.pythonPath, settings.serverPath, { env: childEnv() });
+    activeClientKey = key;
+  }
+  return activeClient;
+}
+
+/**
+ * Run the two tool calls for one message.
+ *
+ * - One in-flight call per session: a stale skill injection for a superseded
+ *   message is worse than none, so a concurrent message is skipped, not queued.
+ * - The two calls are independent, so they run concurrently and a failure in one
+ *   does not discard the other.
+ * - The circuit breaker mirrors the server's own, so an outage is not paid twice
+ *   per message.
+ */
+async function runQueries(client, { task, cwd, wantTier, signal }) {
+  if (client.busy) {
+    client.log("skip: a jev query is already in flight for this session");
+    return {};
+  }
+  if (client.breakerOpen()) {
+    client.log("skip: circuit breaker is open");
+    return {};
+  }
+  if (signal?.aborted) {
+    client.log("skip: message was already aborted");
+    return {};
+  }
+
+  client.busy = true;
+  const onAbort = () => client.abort("aborted by user");
+  if (typeof signal?.addEventListener === "function") {
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  const safeCall = async (name, args) => {
+    try {
+      const res = await client.callTool(name, args, TOOL_TIMEOUT_MS);
+      client.recordSuccess();
+      return res;
+    } catch (err) {
+      client.recordFailure(err);
+      client.log(`${name} failed: ${err.message}`);
+      return null;
+    }
+  };
+
+  try {
+    const [tierRes, skillsRes] = await Promise.all([
+      wantTier ? safeCall("select_model_tier", { task }) : null,
+      safeCall("search_agent_skills", { task, root_dir: cwd }),
+    ]);
+    if (tierRes) client.log(`select_model_tier action=${tierRes.action} confidence=${tierRes.confidence}`);
+    if (skillsRes) {
+      client.log(
+        `search_agent_skills action=${skillsRes.action} confidence=${skillsRes.confidence} ` +
+          `primary=${skillsRes.primary?.file}`
+      );
+    }
+    return { tierRes, skillsRes };
+  } finally {
+    if (typeof signal?.removeEventListener === "function") signal.removeEventListener("abort", onAbort);
+    client.release();
+  }
+}
+
+/**
+ * Force the model switch, if the server's decision is worth acting on.
+ * Returns true when `output.message.model` was replaced.
+ */
+function applyTier(tierRes, settings, output) {
+  const tier = tierRes?.recommended_tier;
+  if (!tier) return false;
+
+  const modelId = settings.models?.[tier];
+  if (!modelId) {
+    pluginLog(`tier ${tier} has no configured model id; skipping switch`);
+    return false;
+  }
+  if (!isConfident(tierRes)) {
+    pluginLog(`tier ${tier} not applied: action=${tierRes.action} confidence=${tierRes.confidence}`);
+    return false;
+  }
+  const parts = splitModelId(modelId);
+  if (!parts) {
+    pluginLog(`skipping switch: '${modelId}' is not in 'provider/model' format`);
+    return false;
+  }
+  if (!output?.message?.model) {
+    pluginLog("no output.message.model to switch; skipping");
+    return false;
+  }
+  output.message.model = parts;
+  pluginLog(`forced model switch -> ${tier}: ${parts.providerID}/${parts.modelID}`);
+  return true;
+}
+
+/**
+ * Inject the selected skill into the user's message, if the decision is worth
+ * acting on. Returns true when the message text was changed.
+ */
+function injectSkill(skillsRes, cwd, output) {
+  const primary = skillsRes?.primary;
+  if (!primary?.file || typeof primary.content !== "string") return false;
+
+  if (!isConfident(skillsRes)) {
+    pluginLog(
+      `skill ${primary.file} not injected: action=${skillsRes.action} confidence=${skillsRes.confidence}`
+    );
+    return false;
+  }
+
+  // Defence in depth: the server already refuses to read outside its roots, but
+  // `primary.file` is a path this hook is about to act on, so re-check it here.
+  const fullPath = path.resolve(cwd, primary.file);
+  if (!isInside(cwd, fullPath)) {
+    pluginLog(`refusing to inject out-of-workspace file: ${primary.file}`);
+    return false;
+  }
+
+  let content = primary.content;
+  if (content.length > MAX_INJECT_CHARS) {
+    content = content.slice(0, MAX_INJECT_CHARS) + "\n…[truncated]";
+    pluginLog(`truncated skill ${primary.file} to ${MAX_INJECT_CHARS} chars`);
+  }
+
+  const injected = injectIntoUserMessage(
+    output,
+    `\n\n[Active Capability / Skill: ${primary.file}]\n${content}\n`
+  );
+  pluginLog(`inject ${injected ? "ok" : "skipped"}: ${primary.file} (${content.length} chars)`);
+  return injected;
+}
+
 export const JevPlugin = async () => ({
   "chat.message": async (input, output) => {
     try {
-      let promptText = extractUserPrompt(input, output);
+      const promptText = extractUserPrompt(input, output);
       if (!promptText) return;
       if (promptText.length > MAX_PROMPT_CHARS) {
-        promptText = promptText.slice(0, MAX_PROMPT_CHARS) + "\n…[truncated]";
-        pluginLog("User prompt exceeded 100k chars; truncated for Jev evaluation.");
+        pluginLog(`prompt over ${MAX_PROMPT_CHARS} chars; skipping (${describeText(promptText)})`);
+        return;
       }
 
       const cwd = process.cwd();
-      const settings = loadSettings();
+      const settings = loadSettings(cwd);
 
-      const configuredModels = Object.values(settings.models).filter((id) => typeof id === "string" && id.trim());
+      const configuredModels = Object.values(settings.models).filter(
+        (id) => typeof id === "string" && id.trim()
+      );
       const wantTier = settings.enable_model_routing && configuredModels.length > 0;
 
-      // Resolve scan paths relative to the current working workspace
-      const searchDirs = settings.scanPaths.map((p) => path.resolve(cwd, p));
-      const allFiles = searchDirs.flatMap((d) => scanResourceFiles(d));
+      // Cheap local pre-check: no skills on disk and no routing means no call.
+      const searchDirs = resolveSearchDirs(settings, cwd);
+      const hasSkills = searchDirs.some((d) => fs.existsSync(d) && scanResourceFiles(d).length > 0);
+      if (!wantTier && !hasSkills) return;
 
-      const fileMap = new Map();
-      for (const file of allFiles) {
-        const rel = path.relative(cwd, file).replace(/\\/g, "/");
-        fileMap.set(rel, file);
-      }
-      const candidates = Array.from(fileMap.keys());
+      pluginLog(
+        `chat.message: prompt ${describeText(promptText)} wantTier=${wantTier} ` +
+          `skillDirs=${searchDirs.length} cwd=${cwd}`
+      );
 
-      if (!wantTier && candidates.length === 0) return;
+      const client = getClient(settings);
+      const started = Date.now();
+      const { tierRes, skillsRes } = await runQueries(client, {
+        task: promptText,
+        cwd,
+        wantTier,
+        signal: input?.signal ?? output?.signal,
+      });
+      const elapsed = Date.now() - started;
 
-      pluginLog(`chat.message fired: prompt="${promptText.slice(0, 80)}" wantTier=${wantTier} candidates=${candidates.length} cwd=${cwd}`);
-
-      const startTime = Date.now();
-      const result = await queryJev(settings.pythonPath, settings.apiKey, promptText, candidates, wantTier);
-      const elapsed = Date.now() - startTime;
-      pluginLog(`queryJev returned in ${elapsed}ms tier=${result?.tier} target=${result?.target}`);
-
-      // 1. Forced model switch (only when routing is enabled)
-      if (wantTier && result?.tier) {
-        const modelId = settings.models[result.tier];
-        const parts = modelId ? splitModelId(modelId) : null;
-        if (parts && output?.message?.model) {
-          output.message.model = parts;
-          pluginLog(`Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID}`);
-          console.log(
-            `[jev-plugin] ⚡ Forced model switch → ${result.tier}: ${parts.providerID}/${parts.modelID} in ${elapsed}ms`
-          );
-        } else if (modelId && !parts) {
-          pluginLog(`Skipping forced model switch: '${modelId}' is not in 'provider/model' format.`);
-        }
-      }
-
-      // 2. Skill injection — schema-safe (see injectIntoUserMessage)
-      const selectedRel = result?.target;
-      if (selectedRel && fileMap.has(selectedRel)) {
-        const fullPath = fileMap.get(selectedRel);
-        let content = fs.readFileSync(fullPath, "utf-8");
-
-        // Truncate to prevent bloating the LLM context
-        if (content.length > MAX_INJECT_CHARS) {
-          content = content.slice(0, MAX_INJECT_CHARS) + "\n…[truncated]";
-          pluginLog(`Truncated skill ${selectedRel} from ${fs.statSync(fullPath).size} to ${MAX_INJECT_CHARS} chars`);
-        }
-
-        console.log(`[jev-plugin] ⚡ Selected ${selectedRel} in ${elapsed}ms`);
-        pluginLog(`Injecting skill ${selectedRel} (${content.length} chars)`);
-
-        const injectedNotice = `\n\n[Active Capability / Skill: ${selectedRel}]\n${content}\n`;
-
-        const injected = injectIntoUserMessage(output, injectedNotice);
-        pluginLog(
-          `inject ${injected ? "ok" : "skipped"}; parts=${JSON.stringify(
-            (output?.parts || []).map((p) => p && p.type)
-          )}`
+      if (tierRes && applyTier(tierRes, settings, output)) {
+        console.log(
+          `[jev-plugin] ⚡ Forced model switch → ${tierRes.recommended_tier} in ${elapsed}ms`
         );
       }
+      if (skillsRes && injectSkill(skillsRes, cwd, output)) {
+        console.log(`[jev-plugin] ⚡ Injected ${skillsRes.primary.file} in ${elapsed}ms`);
+      }
+      pluginLog(`chat.message done in ${elapsed}ms`);
     } catch (err) {
       pluginLog(`hook errored (bypassed safely): ${err.message}`);
       console.warn("[jev-plugin] Execution bypassed safely:", err.message);
@@ -508,5 +903,23 @@ export const JevPlugin = async () => ({
 });
 
 JevPlugin.splitModelId = splitModelId;
+JevPlugin.isInside = isInside;
+JevPlugin.isConfident = isConfident;
+JevPlugin.scanResourceFiles = scanResourceFiles;
+JevPlugin.pluginLog = pluginLog;
+JevPlugin.describeText = describeText;
+JevPlugin.resolveServerCommand = resolveServerCommand;
+JevPlugin.loadSettings = loadSettings;
+JevPlugin.resolveSearchDirs = resolveSearchDirs;
+JevPlugin.extractUserPrompt = extractUserPrompt;
+JevPlugin.applyTier = applyTier;
+JevPlugin.injectSkill = injectSkill;
+JevPlugin.injectIntoUserMessage = injectIntoUserMessage;
+JevPlugin.parseEnvelope = parseEnvelope;
+JevPlugin.runQueries = runQueries;
+JevPlugin.getClient = getClient;
+JevPlugin.JevMcpClient = JevMcpClient;
+JevPlugin.MAX_INJECT_CHARS = MAX_INJECT_CHARS;
+JevPlugin.PLUGIN_MIN_CONFIDENCE = PLUGIN_MIN_CONFIDENCE;
 
 export default JevPlugin;

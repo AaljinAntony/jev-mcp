@@ -217,3 +217,49 @@ a tree with one file per directory and a clear win in a tree with many.
   so it is slightly smaller (e.g. 15 585 → 15 568 on the 250-option case). The
   live path is untouched: the provider reports its own usage.
 
+
+---
+
+# Phase 6 - the plugin as a stdio MCP client
+
+Measured: 2026-09-26  |  Commit: (this change)  |  Phase: 6
+Harness: the `chat.message` hook itself, driven from Node against the real
+`jev_mcp.py` with `JEV_MCP_MOCK=1` (so the number is engine work, not network).
+
+## Per-message plugin cost
+
+| | before (inline Python per message) | after (one reused MCP child) |
+|---|---|---|
+| cold, first message of a session | ~1.3 s | **933 ms** (spawn + `initialize` + one call) |
+| warm, every message after | ~1.3 s | **13-14 ms** |
+| interpreter start + `import typesafe_sdk` | ~360 ms **per message** | once per session |
+| child processes per message | 1 | 0 |
+
+Component costs behind those numbers, same machine:
+
+```
+bare interpreter (python -c pass)            42 ms
+  + import typesafe_sdk                     358 ms   (~316 ms of import)
+  + import jev_mcp (whole server stack)     953 ms   (paid once, on spawn)
+```
+
+The per-message saving is the ~360 ms of interpreter start and SDK import that
+the old `python -c "<inline program>"` paid on **every** message. The one-off
+cost of the longer server import stack is amortised across the whole session, and
+the server additionally keeps its client and settings caches warm, which the
+per-message process threw away each time.
+
+This is the mock engine, so 13-14 ms is the floor: it is JSON-RPC framing plus the
+offline judge. A live call adds one HTTPS round trip to both columns; the
+difference between them is unchanged.
+
+## What else the transport bought
+
+Not latency - correctness. The old inline program reimplemented the decision path
+and inherited none of it: no `fit_state` budgeting, no `validate_response`
+fail-closed check, no `action_from_confidence` threshold, no `candidates_truncated`
+awareness, no `none` escape-hatch semantics, no error taxonomy. A malformed
+provider response therefore read as a confident pick, and a low-confidence
+judgment still injected a skill into the model's context. Driving the real server
+means the plugin now applies the server's own `action` / `confidence` verdict
+(both effects require `auto` and >= 0.6) instead of "whatever `choice` returned".

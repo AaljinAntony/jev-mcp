@@ -42,6 +42,7 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | `D:\mcp\jev-typesafe-mcp\scripts\diag_mcp.py` | Transport-level MCP repro client for any workspace + prompt |
 | `D:\mcp\jev-typesafe-mcp\scripts\bench_jev.py` | Offline timing/size benchmark with `--assert` regression gates |
 | `D:\mcp\jev-typesafe-mcp\scripts\eval_routing.py` | Routing accuracy/false-positive/token harness over `tests\fixtures\routing_tasks.json` |
+| `D:\mcp\jev-typesafe-mcp\scripts\stub_mcp.js` | Stub stdio MCP server used by `tests\test_plugin.mjs` (no Python, no API key) |
 | `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, candidates, mock tools, live smoke |
 | `D:\mcp\jev-typesafe-mcp\requirements.txt` | Pinned Python dependencies (UTF-8) |
 | `D:\mcp\jev-typesafe-mcp\.env` | Local secrets — holds `TYPESAFE_API_KEY` (never committed) |
@@ -370,32 +371,71 @@ An auxiliary OpenCode hook (`chat.message`) that does two things per user messag
    next reply from `lastUser.model`, so this is a real, forced switch — not a
    recommendation. When routing is off, the message model is left untouched and
    opencode uses its `"model"` config / window-selected model.
-2. **Skill routing** — scans the configured skill dirs for Markdown, asks Jev which
-   single file is most relevant, and **injects its content** into the conversation
-   context (`[Active Capability / Skill: <path>]`).
+2. **Skill routing** — asks Jev which single Markdown file under the workspace is
+   most relevant, and **injects its content** into the conversation context
+   (`[Active Capability / Skill: <path>]`).
+
+Both decisions are gated on the server's own verdict: `action == "auto"` **and**
+`confidence >= 0.6`. A `review` / `escalate` decision injects nothing and switches
+nothing — a weak judgment must not put a possibly-irrelevant skill into the
+model's context, where it is indistinguishable from something the user asked for.
+The 0.6 is deliberately below the server's `JEV_MCP_AUTO_ACCEPT` (0.8): by the
+time the server says `auto` the stricter bar is already met, so 0.6 is a second,
+independent floor that a future server-side threshold change cannot silently
+remove.
 
 ### How it works
 
 1. Reads settings from `jevs_settings.json` (project → `.opencode/jevs_settings.json`
    → user `~/.config/opencode/jevs_settings.json`), with a legacy fallback to the
    `jev_settings` block in `opencode.json`.
-2. Extracts the Python interpreter from `mcp["jev-engine"].command` (falls back to
-   `D:\mcp\jev-typesafe-mcp\.venv\Scripts\python.exe`).
-3. Loads `TYPESAFE_API_KEY` from the process env, else from `D:\mcp\jev-typesafe-mcp\.env`.
-4. Uses `scan_paths` (defaults + configured extras).
-5. Spawns Python via `spawnSync` with the current `TypeSafeClient.system_one(...)`
-   API and either forces the model switch, injects the winning skill, or both.
+2. Takes the `[python, server]` argv from `mcp["jev-engine"].command` (falling
+   back to `<repo>\.venv\Scripts\python.exe <repo>\jev_mcp.py`).
+3. Returns early when there is nothing to do — routing off and no Markdown under
+   the configured skill dirs costs no process and no API call.
+4. Spawns **one** `jev_mcp.py` child and drives it as an **MCP client**:
+   newline-delimited JSON-RPC 2.0 over stdio, `initialize` then `tools/call
+   search_agent_skills` (+ `select_model_tier` when routing is on). No MCP SDK is
+   available in opencode's plugin sandbox, so the ~200-line client is hand-rolled
+   against the same wire format `scripts/diag_mcp.py` speaks.
+
+The child is reused for the whole session and shut down after 5 idle minutes, so
+the steady-state cost per message is one HTTPS round trip on a warm pooled
+connection — no interpreter start, no SDK import. See `docs/perf-baseline.md`.
+
+**The API key is never read by the plugin.** The server loads `TYPESAFE_API_KEY`
+from its own env or `.env`, and the MCP `environment` block injects it. That
+removes the plugin's `.env` regex, which used to capture a quoted key *with* its
+quotes — a guaranteed 401.
+
+**The plugin is not trusted with paths it was handed.** `scan_paths` comes from
+`jevs_settings.json`, which is documented as safe to commit and share. Resolved
+against the working directory with no containment check, an untrusted repository
+could name `../../../../Users/victim` and have arbitrary `.md` files read and
+injected. Scan paths are therefore confined to the workspace with a
+`path.relative` check (never `startsWith`, so `<root>-evil` is refused), symlinks
+are resolved before the check, and the selected file is re-checked before it is
+injected. To keep skills outside the project, opt in explicitly:
+
+```powershell
+$env:JEV_PLUGIN_SCAN_ROOTS="$env:USERPROFILE\.config\opencode\skills"
+```
+
+which the plugin forwards to the server as `JEV_MCP_ALLOWED_ROOTS`, so both sides
+agree on what may be read.
+
+**Resilience.** One in-flight query per session (a concurrent message is skipped
+and logged, not queued — a stale injection is worse than none), a 3-failure /
+60-second circuit breaker mirroring the server's own, per-request timeouts, an
+idle shutdown, and support for aborting a message the user cancelled.
 
 All errors are caught and logged ("Execution bypassed safely") — the hook never
-crashes OpenCode.
+crashes OpenCode. The plugin log rotates at 2 MB and records a prompt's **length
+and digest only**, never its text.
 
-The hook talks to the TypeSafe API directly and does **not** pass a `root_dir`,
-so the `root_dir` allowlist does not affect the default flow. It becomes relevant
-if the plugin ever forwards a configured scan root: that root must then be inside
-the working directory, one of its ancestors, or listed in
-`JEV_MCP_ALLOWED_ROOTS`. Note also that the hook is called on **every** message,
-which is exactly why a failing provider now opens a circuit breaker instead of
-paying the retry budget each time.
+The hook always passes the working directory as `root_dir`, which the server
+confines to the process CWD and its ancestors. Skills kept outside the workspace
+only become reachable through `JEV_MCP_ALLOWED_ROOTS` above.
 
 ---
 
@@ -420,6 +460,9 @@ cd D:\mcp\jev-typesafe-mcp
 
 # Offline test suite (no API key needed — mock mode covers the tools)
 & .\.venv\Scripts\python.exe -m pytest tests -q
+
+# Offline plugin tests (spawns scripts\stub_mcp.js; no API key, no opencode)
+node tests\test_plugin.mjs
 
 # Offline performance gates (deterministic; see docs/perf-baseline.md)
 & .\.venv\Scripts\python.exe scripts\bench_jev.py --assert
@@ -470,9 +513,9 @@ A `tools/list` handshake against a running `jev_mcp.py` returns exactly four too
 - Redaction removes the credential and keeps the rest of the line:
   `curl -H 'Authorization: Bearer sk-…' https://x` keeps its command and URL. It is
   applied to args, to `result_preview`, and to error messages.
-- Plugin log: `~\.config\opencode\logs\jev-plugin.log` (hook fired, candidates,
-  spawn result, skill injection). The installed plugin's Jev query is **async**
-  so the `chat.message` hook never blocks opencode.
+- Plugin log: `~\.config\opencode\logs\jev-plugin.log` (hook fired, client
+  lifecycle, per-tool `action`/`confidence`, injection decision). It rotates at
+  2 MB and never contains user prompt text — only its length and a short digest.
 - `scripts\diag_mcp.py` reproduces a single tool call over stdio (identical to
   opencode's transport) against any `root_dir` + task; exit 0 = clean, 1 = error
   envelope or transport failure.
