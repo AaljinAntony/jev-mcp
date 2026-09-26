@@ -384,7 +384,7 @@ except Exception as e:
  * Returns null for anything not strictly in that format, so callers can
  * skip the model switch instead of forcing a bogus model object.
  */
-export function splitModelId(modelId) {
+function splitModelId(modelId) {
   if (typeof modelId !== "string" || !modelId) return null;
   const slash = modelId.indexOf("/");
   if (slash > 0 && slash < modelId.length - 1) {
@@ -506,5 +506,7 @@ export const JevPlugin = async () => ({
     }
   },
 });
+
+JevPlugin.splitModelId = splitModelId;
 
 export default JevPlugin;

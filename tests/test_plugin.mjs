@@ -99,7 +99,7 @@ await hook({}, {});
 console.log("chat.message hook safe invocation passed.");
 
 console.log("--- 6. Testing splitModelId provider/model parsing ---");
-const splitModelId = pluginModule.splitModelId;
+const splitModelId = pluginModule.splitModelId ?? pluginModule.JevPlugin.splitModelId;
 assert.strictEqual(typeof splitModelId, "function", "Plugin should export splitModelId");
 
 assert.deepStrictEqual(splitModelId("anthropic/claude-3-5-sonnet"), {

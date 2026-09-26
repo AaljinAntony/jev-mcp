@@ -69,6 +69,9 @@ jev_mcp.py  ── MCPServer("jev-engine") ── 4 tools (typed error envelopes
    ▼
 jev_engine.py  ── execute_system_one ── TypeSafeClient.system_one(state, questions)
    │                │                       (mock branch when JEV_MCP_MOCK=1)
+   │                │                       (circuit breaker: fail fast while the
+   │                │                        provider is down instead of retrying
+   │                │                        the full budget on every call)
    │                ├─ candidates()          candidates.py (candidate previews)
    │                ├─ fit_state()            limits.py   (token budget → truncated)
    │                ├─ validate_response()    jev_validation.py (fail-closed)
@@ -77,7 +80,8 @@ jev_engine.py  ── execute_system_one ── TypeSafeClient.system_one(state,
    ▼
 jevs_settings.json  (enable_model_routing, models, scan_paths)
 .env → TYPESAFE_API_KEY, JEV_MCP_MODEL, JEV_MCP_TIMEOUT_MS, JEV_MCP_MOCK,
-       JEV_MCP_AUTO_ACCEPT, JEV_MCP_REVIEW_AT
+       JEV_MCP_AUTO_ACCEPT, JEV_MCP_REVIEW_AT, JEV_MCP_ALLOWED_ROOTS,
+       JEV_MCP_BREAKER_*
 ```
 
 ### Decision flow
@@ -135,11 +139,20 @@ Copy-Item .env.example .env
 ```dotenv
 TYPESAFE_API_KEY=apikey_********************************
 # JEV_MCP_MODEL=jev-latest          # model for system_one (default: jev-latest)
-# JEV_MCP_TIMEOUT_MS=30000          # per-request timeout ms (default: 30000)
+# JEV_MCP_TIMEOUT_MS=30000          # TOTAL per-tool-call budget ms, retries included
 # JEV_MCP_MOCK=0                    # 1 = offline deterministic judge (tests/demos)
 # JEV_MCP_AUTO_ACCEPT=0.8           # confidence to auto-accept (0..1)
 # JEV_MCP_REVIEW_AT=0.5             # confidence below which we escalate (0..1)
+# JEV_MCP_ALLOWED_ROOTS=            # extra root_dir allowlist entries (';'-separated)
+# JEV_MCP_BREAKER_THRESHOLD=3       # consecutive provider failures before the breaker opens
+# JEV_MCP_BREAKER_COOLDOWN_S=30     # seconds before one probe call is let through
+# JEV_MCP_AUTH_COOLDOWN_S=300       # longer window after a 401/403
 ```
+
+`JEV_MCP_TIMEOUT_MS` is a **total** budget for one tool call, not a per-attempt
+timeout: it is passed as the SDK retry policy's total limit, and each attempt is
+clamped to whatever remains of it, so a call cannot take 3× the configured
+value. The same deadline is applied in mock mode, which is CPU-bound.
 
 Both `jev_engine.py` and `jev_mcp.py` load `.env` via `python-dotenv` with `override=False` (relative to the file's parent directory). Because the MCP config already injects `TYPESAFE_API_KEY`, injected variables take precedence and the `.env` file acts as a reliable fallback.
 
@@ -177,7 +190,7 @@ Pre-execution audit for shell commands.
 
 Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,000 chars per resource.
 
-- **Params:** `task` (required), `root_dir` (default `.`)
+- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots)
 - **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jevs_settings.scan_paths`
 - **Jev primitive:** `primary` (`Choice`, one question). `criteria` carry each document's own summary — a `SKILL.md` contributes its front-matter `description` — not its filename, so the options are actually distinguishable. `ranked` comes from `primary.probabilities`, which is the full ranking; there are no `secondary`/`tertiary` duplicates.
 - **Key capabilities:** sibling expansion (probability ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`) but only when `primary_probability >= 0.5` and for at most 2 siblings
@@ -204,7 +217,7 @@ Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,
 
 Filters the repo tree down to task-relevant files.
 
-- **Params:** `task` (required), `root_dir` (default `.`)
+- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots)
 - **Exclusions:** `.git`, `.godot`, `.import`, `.venv`, `node_modules`, `dist`, `build` + media/binary extensions (`.png`, `.jpg`, `.wav`, `.mp3`, `.zip`, ...)
 - **Jev primitives:** `target_file` (`Choice`, `criteria={path: <path + head of file>}`) **and** `is_relevant` (`Noul`). Two independent questions over the same state, one request. The Noul is what stops a forced winner among poor options from reading as a match.
 - **Cost bounds:** at most `MAX_PREVIEW_READS` (120) file reads and `MAX_TOTAL_PREVIEW_CHARS` (40 000) preview characters per call; candidates past the bound keep their path alone and are counted in `coverage.candidate_fields.previews_skipped`.
@@ -257,12 +270,22 @@ keeping `recommended_tier` unchanged.
 
 ## Configuration — `jevs_settings.json` (per project)
 
-File: `<project-root>/jevs_settings.json`. Lookup order (first file that contains a Jev key wins):
+File: `<project-root>/jevs_settings.json`. Discovery order:
 
 1. `<project>/jevs_settings.json`
 2. `<project>/.opencode/jevs_settings.json`
 3. `~/.config/opencode/jevs_settings.json`
 4. Legacy: `jev_settings` block in `opencode.json` (project > user)
+
+Discovery order is unchanged, but precedence is applied by **merging**, not by
+first-file-wins: the user-level files are applied first, then the project files
+override them **per key**. A project file that only sets
+`enable_model_routing` no longer discards the user file's `models` map — which
+matters because a default-valued project `jevs_settings.json` is safe to commit
+and would otherwise shadow the user config permanently.
+
+`opencode.json` is only read through an explicit `jev_settings` block; its
+unrelated top-level keys are never treated as Jev settings.
 
 ```jsonc
 {
@@ -281,14 +304,50 @@ File: `<project-root>/jevs_settings.json`. Lookup order (first file that contain
 | Key | Type | Meaning |
 |---|---|---|
 | `enable_model_routing` | bool | Master switch. **Off** (default) = no Jev model call, opencode uses its `"model"` config / window-selected model. **On** = the plugin asks Jev the tier and **forces** the switch per task. |
-| `models` | `{fast, balanced, frontier}` | Tier → `"provider/model-id"` mapping applied by the plugin. Empty entries are ignored. |
-| `scan_paths` | `[relative path]` | **Additive** extras to the default skill dirs. Deduplicated on load. |
+| `models` | `{fast, balanced, frontier}` | Tier → `"provider/model-id"` mapping applied by the plugin. Values **union** across files; an explicit `""` removes an inherited tier. |
+| `scan_paths` | `[relative path]` | **Additive** extras to the default skill dirs, unioned across files and deduplicated on load. |
 
 Everything is optional; a missing/invalid file falls back to defaults (routing off,
 empty models, built-in scan dirs `.agents/skills`, `.agents/workflows`,
 `.agents/memory`, `.opencode/skills`, `skills`, `.agents`). Malformed JSON never
-breaks the server — it logs to stderr and falls back. The resolved `source` file is
-exposed in `load_jev_settings()["source"]`.
+breaks the server — it logs to stderr and the remaining files are still applied.
+`load_jev_settings()["source"]` is the last contributor (the project file) and
+`["sources"]` lists every file that contributed; the returned dict is a
+defensive copy, so a tool result can never alias the settings cache.
+
+---
+
+## Bounds — deadlines, `root_dir` and the circuit breaker
+
+Three limits keep a misbehaving or hostile caller from turning a decision tool
+into an unbounded read or an unbounded wait.
+
+**`JEV_MCP_TIMEOUT_MS` is a total budget.** The SDK's per-attempt timeout is
+only a slice of the real cost: with `max_retries=2` the worst case is 3 × the
+timeout plus backoff. The budget is passed as `RetryPolicy.timeout` (the whole
+call), each attempt is clamped to the *remaining* deadline, and timeouts are not
+retried — a retry cannot beat an expired deadline, it only burns budget. Mock
+mode enforces the same deadline, so the CPU-bound offline judge cannot quietly
+exceed a small budget either.
+
+**`root_dir` is confined to an allowlist.** `search_agent_skills` and
+`search_target_files` both take a `root_dir`, and an LLM supplies it. Allowed:
+the process working directory and anything under it, any **ancestor** of it
+(hosts launch the server with `cwd` set to the project root or to a temp dir),
+and anything under `JEV_MCP_ALLOWED_ROOTS`. Everything else is rejected with
+`INVALID_INPUT`. Containment uses `Path.relative_to`, never `startswith`, so
+`<root>-evil` and a symlink pointing outside the root are both refused. The OS's
+own directories (`C:\Windows`, `C:\Program Files`, a filesystem root) are
+rejected by name as a second gate.
+
+**A circuit breaker short-circuits a failing provider.** After
+`JEV_MCP_BREAKER_THRESHOLD` consecutive failures (default 3) the breaker opens
+and further calls fail immediately with a `TIMEOUT` / `retryable: true` envelope
+that states when to come back — instead of paying three attempts plus backoff on
+every call, and again on every plugin message. Auth failures (401/403) use the
+longer `JEV_MCP_AUTH_COOLDOWN_S` window, because a bad key does not fix itself in
+30 seconds. After the cooldown, exactly one probe call is let through; if it
+succeeds the breaker closes, and if it fails the circuit re-opens.
 
 ---
 
@@ -324,6 +383,14 @@ An auxiliary OpenCode hook (`chat.message`) that does two things per user messag
 
 All errors are caught and logged ("Execution bypassed safely") — the hook never
 crashes OpenCode.
+
+The hook talks to the TypeSafe API directly and does **not** pass a `root_dir`,
+so the `root_dir` allowlist does not affect the default flow. It becomes relevant
+if the plugin ever forwards a configured scan root: that root must then be inside
+the working directory, one of its ancestors, or listed in
+`JEV_MCP_ALLOWED_ROOTS`. Note also that the hook is called on **every** message,
+which is exactly why a failing provider now opens a circuit breaker instead of
+paying the retry budget each time.
 
 ---
 
@@ -420,7 +487,21 @@ decision engine: its routing accuracy is far below live Jev (see
 - `test_limits.py` — token estimation, truncation, budget errors.
 - `test_mock_tools.py` — offline tool runs (no key): backward-compat keys,
   new envelope keys, malformed→`INVALID_RESPONSE`, `none` escape hatch.
+- `test_deadline.py` — `JEV_MCP_TIMEOUT_MS` really bounds one call; the retry
+  policy carries the total budget and does not retry timeouts.
+- `test_breaker.py` — the breaker opens after N failures, admits one probe after
+  the cooldown, and short-circuits auth failures for longer.
+- `test_root_dir_allowlist.py` — allowed/denied `root_dir` cases, sibling-prefix
+  and symlink escapes.
+- `test_settings_merge.py` — user/project merge per key, `""` clears a tier,
+  post-read re-stat, and the defensive snapshot.
+- `test_client_cache.py` — the cached client is closed on invalidation and keyed
+  on everything the SDK reads from the environment.
 - `test_live_smoke.py` — skipped unless `TYPESAFE_API_KEY` or `JEV_MCP_LIVE=1`.
+
+`tests/conftest.py` grants `tempfile.gettempdir()` through
+`JEV_MCP_ALLOWED_ROOTS` for every test, so pytest's `tmp_path` remains a
+legitimate `root_dir` without weakening the allowlist.
 
 ---
 

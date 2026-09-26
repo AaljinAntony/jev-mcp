@@ -52,7 +52,11 @@ values are read from `TYPESAFE_API_KEY` interpolation plus:
 | Variable | Default | Meaning |
 |---|---|---|
 | `JEV_MCP_MODEL` | `jev-latest` | Model used for `system_one` calls. |
-| `JEV_MCP_TIMEOUT_MS` | `30000` | Per-request timeout in ms. |
+| `JEV_MCP_TIMEOUT_MS` | `30000` | **Total** per-tool-call budget in ms, retries and backoff included — not a per-attempt timeout. Enforced in mock mode too. |
+| `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` may resolve inside. Empty = the process CWD and its ancestors only. |
+| `JEV_MCP_BREAKER_THRESHOLD` | `3` | Consecutive provider failures after which the circuit breaker opens and later calls fail fast without a network round-trip. |
+| `JEV_MCP_BREAKER_COOLDOWN_S` | `30` | Seconds an open breaker stays open before one probe call is allowed through. |
+| `JEV_MCP_AUTH_COOLDOWN_S` | `300` | Cooldown after an auth failure (401/403). A bad key does not fix itself in 30 seconds. |
 | `JEV_MCP_MOCK` | `0` | `1` = offline deterministic judge (tests/demos only). |
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
@@ -60,6 +64,32 @@ values are read from `TYPESAFE_API_KEY` interpolation plus:
 
 Thresholds must satisfy `0 <= review_at <= auto_accept <= 1` (invalid values
 fail fast with a `CONFIG_ERROR` envelope instead of silently mis-routing).
+
+### `root_dir` and the allowed-roots allowlist
+
+`root_dir` is **confined to an allowlist**, not screened against a denylist — a
+denylist cannot enumerate every sensitive path, and an LLM-supplied `root_dir`
+should carry no more privilege than the session's own working directory.
+
+Allowed:
+
+- the process working directory, and anything under it;
+- any **ancestor** of the working directory (hosts launch the server with `cwd`
+  set to the project root or to a temp dir);
+- anything under a path listed in `JEV_MCP_ALLOWED_ROOTS`.
+
+Everything else is rejected with `INVALID_INPUT`. Containment is computed with
+`Path.relative_to`, never `startswith`, so `<root>-evil` and a symlink pointing
+outside the root are both refused. The OS's own directories (`C:\Windows`,
+`C:\Program Files`, a filesystem root) are still rejected by name as a second
+gate, even if you list them.
+
+To let the server read a project you are working on from a different directory,
+allowlist it explicitly:
+
+```powershell
+$env:JEV_MCP_ALLOWED_ROOTS="D:\work\other-project;D:\work\shared"
+```
 
 4. **(Optional) per-project Jev settings:** copy
    `config\jevs_settings.example.json` to your project root as `jevs_settings.json`
@@ -131,14 +161,25 @@ To set a project-specific default, add it back:
 - Lookup order: `<project>/jevs_settings.json` →
   `<project>/.opencode/jevs_settings.json` →
   `~/.config/opencode/jevs_settings.json` → legacy `jev_settings` block in
-  `opencode.json` (project > user). The first file that contains any Jev key wins.
+  `opencode.json` (project > user). Discovery order is unchanged; **precedence
+  is applied by merging**: the user-level files are applied first, then the
+  project files override them **per key**. Neither discards the other, so a
+  project file that only sets `enable_model_routing` no longer wipes out the
+  user file's `models` map.
+- `opencode.json` is only read through an explicit `jev_settings` block; its
+  unrelated top-level keys are never treated as Jev settings.
 - All keys optional; missing keys fall back to defaults: routing **off**, empty
   `models`, built-in `scan_paths` (`.agents/skills`, `.agents/workflows`,
   `.agents/memory`, `.opencode/skills`, `skills`, `.agents`).
 - `scan_paths` entries are relative to the workspace root and **appended** to the
-  built-in defaults, deduplicated.
-- Empty `models` values are ignored, so `""` placeholders are equivalent to omitting
-  the tier until you're ready to enable routing.
+  built-in defaults, deduplicated. They union across files.
+- `models` entries **union** non-empty values across files, so a project can add
+  a tier without deleting the user's others. An explicit `""` **removes** an
+  inherited tier — that is how a tier is disabled, and it is no longer
+  equivalent to omitting the key once a user-level file has set it.
+- `load_jev_settings()["source"]` is the last contributor (the project file);
+  `["sources"]` lists every file that contributed. The returned dict is a
+  defensive copy — mutating it cannot corrupt the cache.
 
 ### What "routing on" actually does
 

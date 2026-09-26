@@ -169,6 +169,12 @@ def run_benchmarks(runs=5):
 
     # File-based benchmark cases with synthetic workspace
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # The synthetic workspace lives under the system temp dir, which is not
+        # on the `root_dir` allowlist by default. Allowlisting the temp root is
+        # exactly what JEV_MCP_ALLOWED_ROOTS is for.
+        os.environ["JEV_MCP_ALLOWED_ROOTS"] = tempfile.gettempdir()
+        config._reset_config_cache()
+
         # Seed 250 .md skills with realistic group prefix and content
         skills_dir = Path(tmp_dir) / ".agents" / "skills"
         for i in range(250):

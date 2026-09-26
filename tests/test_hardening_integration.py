@@ -259,5 +259,10 @@ def test_settings_mtime_caching(tmp_path, monkeypatch):
     assert s1["enable_model_routing"] is True
 
     s2 = load_jev_settings()
-    assert s1 is s2
+    # The cache is still doing its job (equal content, no re-read), but the
+    # loader hands out a copy so a caller cannot mutate module state. Identity
+    # was testing the implementation; equality plus non-identity tests the
+    # behaviour that actually matters.
+    assert s1 == s2
+    assert s1 is not s2
     _reset_settings_cache()

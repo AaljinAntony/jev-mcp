@@ -10,8 +10,10 @@ from typing import Dict, List, Any, Optional
 from typesafe_sdk import TypeSafeClient, Choice, Noul, Score, RetryPolicy
 from typesafe_sdk import (
     TypeSafeAPIConnectionError,
+    TypeSafeAPIError,
     TypeSafeAPIResponseValidationError,
     TypeSafeAPITimeoutError,
+    TypeSafeAuthenticationError,
 )
 
 from config import get_config
@@ -25,10 +27,12 @@ from candidates import (
 )
 from jev_errors import (
     JevConfigError,
+    JevError,
     JevResponseError,
     JevTimeoutError,
     JevValidationError,
     error_details,
+    retryable_status,
 )
 from jev_logging import log_round, log_event
 from jev_validation import validate_response
@@ -76,27 +80,59 @@ def _check_input_length(name: str, value: str) -> None:
         )
 
 
-def _validate_root_dir(root_dir: str) -> Path:
-    """Resolve and sanity-check root_dir. Rejects system-level paths."""
-    _check_input_length("root_dir", root_dir)
-    root = Path(root_dir).resolve()
+def _is_within(candidate: Path, base: Path) -> bool:
+    """True when `candidate` is `base` or lives under it.
 
-    blocked_posix = {
-        Path("/").resolve(),
-        Path("/etc").resolve(),
-        Path("/usr").resolve(),
-        Path("/bin").resolve(),
-        Path("/sbin").resolve(),
-    }
-    if root in blocked_posix:
-        raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+    Uses `relative_to`, never `startswith`, so a sibling that shares a textual
+    prefix (`<cwd>-evil`) is *not* inside `<cwd>`.
+    """
+    try:
+        candidate.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _allowed_roots() -> List[Path]:
+    """Directories an LLM-supplied `root_dir` may resolve inside.
+
+    The process CWD and **its ancestors**, plus anything under
+    `JEV_MCP_ALLOWED_ROOTS`. Ancestors are included deliberately: hosts launch
+    the server with `cwd` set to the project root or to a temp dir, and a
+    session legitimately asks about a subdirectory of, or a parent of, that.
+    It is still an enormous reduction from "any path on the machine" and it
+    never grants reach outside the user's own project tree.
+    """
+    roots: List[Path] = []
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        roots.append(cwd)
+        roots.extend(cwd.parents)
+    for entry in get_config().allowed_roots:
+        try:
+            candidate = Path(entry)
+        except (TypeError, ValueError):
+            continue
+        if candidate.is_dir():
+            roots.append(candidate)
+    return roots
+
+
+def _reject_system_dir(root: Path, root_dir: str) -> None:
+    """Second gate: refuse the OS's own directories even if allowlisted.
+
+    Kept separate from the allowlist so `C:\\Windows` still fails with the
+    specific "system directory" wording the tests assert on.
+    """
+    root_lower = str(root).lower().rstrip("\\/")
+    parts = root.parts
+    if root.parent == root or len(parts) <= (1 if os.name == "nt" else 0):
+        raise JevValidationError(f"root_dir '{root_dir}' points to a filesystem root (system directory).")
 
     if os.name == "nt":
-        if root.parent == root or len(root.parts) <= 1:
-            raise JevValidationError(
-                f"root_dir '{root_dir}' points to a filesystem drive root (system directory)."
-            )
-        root_lower = str(root).lower().rstrip("\\")
         for env_var in [
             "SystemRoot",
             "windir",
@@ -104,24 +140,50 @@ def _validate_root_dir(root_dir: str) -> Path:
             "ProgramFiles(x86)",
         ]:
             val = os.environ.get(env_var)
-            if val:
-                val_resolved = str(Path(val).resolve()).lower().rstrip("\\")
-                if root_lower == val_resolved or root_lower.startswith(val_resolved + "\\"):
-                    raise JevValidationError(
-                        f"root_dir '{root_dir}' points inside a system directory ({env_var})."
-                    )
+            if not val:
+                continue
+            try:
+                val_resolved = str(Path(val).resolve()).lower().rstrip("\\/")
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if root_lower == val_resolved or root_lower.startswith(val_resolved + "\\"):
+                raise JevValidationError(
+                    f"root_dir '{root_dir}' points inside a system directory ({env_var})."
+                )
         # The system drive is a volume root, not a system directory: only the
         # bare drive itself is rejected, never arbitrary data on that volume.
         drive = os.environ.get("SystemDrive")
-        if drive and root_lower == drive.lower().rstrip("\\"):
+        if drive and root_lower == drive.lower().rstrip("\\/"):
             raise JevValidationError(
                 f"root_dir '{root_dir}' points to a filesystem drive root (system directory)."
             )
 
-    if root.parent == root:
-        raise JevValidationError(f"root_dir '{root_dir}' points to a system directory.")
+
+def _validate_root_dir(root_dir: str) -> Path:
+    """Resolve `root_dir` and confine it to an allowlist.
+
+    A denylist cannot enumerate every sensitive path — the previous five-entry
+    POSIX set left `/home`, `/var`, `/proc`, `C:\\Users` and `C:\\ProgramData`
+    reachable from an LLM-supplied argument. The invariant is instead that a
+    supplied `root_dir` carries no more privilege than the session's own working
+    directory: it must be the CWD, one of its descendants, one of its ancestors,
+    or inside `JEV_MCP_ALLOWED_ROOTS`. Everything else is rejected.
+    """
+    _check_input_length("root_dir", root_dir)
+    root = Path(root_dir).resolve()
+
+    # Belt and braces: keep the specific "system directory" rejection as a
+    # second gate so it fires before the generic allowlist message.
+    _reject_system_dir(root, root_dir)
+
     if not root.is_dir():
         raise JevValidationError(f"root_dir '{root_dir}' does not exist or is not a directory.")
+
+    if not any(root == base or _is_within(root, base) for base in _allowed_roots()):
+        raise JevValidationError(
+            f"root_dir '{root_dir}' is outside the allowed roots. "
+            "Pass a path inside the workspace, or set JEV_MCP_ALLOWED_ROOTS."
+        )
     return root
 
 
@@ -166,21 +228,57 @@ def _find_config_files() -> List[Path]:
     return candidates
 
 
-def _apply_jev_settings(settings: dict, jev: dict) -> bool:
-    """Merge a raw jev_settings dict onto `settings`. Returns True if it matched."""
+def _merge_jev_settings(settings: dict, jev: dict) -> bool:
+    """Deep-merge one `jev_settings` dict onto `settings`. Returns True if it matched.
+
+    Merging rather than first-file-wins matters because this repo ships a
+    `jevs_settings.json` whose keys are all at their defaults. Under
+    first-wins that file permanently shadowed `~/.config/opencode/jevs_settings.json`,
+    so turning routing on in the user-level file silently did nothing.
+
+    Semantics per key:
+      * `enable_model_routing` — last writer wins (project overrides user).
+      * `models` — union of non-empty values; an explicit `""` **removes** an
+        inherited tier, which is the documented way to disable one.
+      * `scan_paths` — additive union against the built-in defaults, deduped.
+    """
     jev = jev or {}
-    if "enable_model_routing" not in jev and not jev.get("models") and not jev.get("scan_paths"):
+    if not isinstance(jev, dict):
         return False
+    matched = False
     if isinstance(jev.get("enable_model_routing"), bool):
         settings["enable_model_routing"] = jev["enable_model_routing"]
-    models = jev.get("models") or {}
-    if isinstance(models, dict):
-        settings["models"] = {k: v for k, v in models.items() if v}
+        matched = True
+    models = jev.get("models")
+    if isinstance(models, dict) and models:
+        merged = dict(settings.get("models") or {})
+        for k, v in models.items():
+            if v:
+                merged[k] = v
+            else:
+                merged.pop(k, None)   # explicit "" clears an inherited tier
+        settings["models"] = merged
+        matched = True
     scan_paths = jev.get("scan_paths")
     if isinstance(scan_paths, list):
         extras = [str(p) for p in scan_paths if isinstance(p, str)]
-        settings["scan_paths"] = list(dict.fromkeys(list(DEFAULT_SCAN_PATHS) + extras))
-    return True
+        settings["scan_paths"] = list(dict.fromkeys(list(settings["scan_paths"]) + extras))
+        matched = True
+    return matched
+
+
+def _snapshot(settings: dict) -> dict:
+    """A defensive copy, so a caller cannot mutate the module-level cache.
+
+    `result["model_map"]` used to be a live reference into `_cached_settings`;
+    any consumer that mutated it corrupted the cache for the rest of the
+    process.
+    """
+    out = dict(settings)
+    out["models"] = dict(settings.get("models") or {})
+    out["scan_paths"] = list(settings.get("scan_paths") or [])
+    out["sources"] = list(settings.get("sources") or [])
+    return out
 
 
 _cached_settings: Optional[dict] = None
@@ -205,14 +303,18 @@ def _get_files_mtime_signature(files: List[Path]) -> dict:
 
 
 def load_jev_settings() -> dict:
-    """Read Jev settings from jevs_settings.json (project wins over user).
+    """Read Jev settings by merging every candidate file, user config first.
 
     Lookup order: <cwd>/jevs_settings.json -> <cwd>/.opencode/jevs_settings.json ->
     ~/.config/opencode/jevs_settings.json -> legacy `jev_settings` block in
-    opencode.json (project > user). Falls back to defaults when nothing matches:
-    routing off, empty model map, built-in scan paths.
+    opencode.json (project > user). Discovery is unchanged; precedence is now
+    applied by *merging* the files in reverse discovery order, so a project file
+    overrides the user file per key instead of replacing it wholesale.
+    `source` is the last contributor (the project file, for display) and
+    `sources` lists everything that contributed.
 
     Results are cached and only re-read when a candidate file's mtime changes.
+    The returned dict is a fresh copy: callers cannot reach into the cache.
     """
     global _cached_settings, _cached_settings_mtimes
 
@@ -221,44 +323,43 @@ def load_jev_settings() -> dict:
     current_mtimes = _get_files_mtime_signature(settings_files + config_files)
 
     if _cached_settings is not None and _cached_settings_mtimes == current_mtimes:
-        return _cached_settings
+        return _snapshot(_cached_settings)
 
     settings = {
         "enable_model_routing": False,
         "models": {},
         "scan_paths": list(DEFAULT_SCAN_PATHS),
         "source": None,
+        "sources": [],
     }
 
-    for cfg in settings_files:
+    # User-level config first, then project config, so the project overrides
+    # the user and neither silently discards the other.
+    ordered = [(f, True) for f in reversed(settings_files)]
+    ordered += [(f, False) for f in reversed(config_files)]
+    for cfg, whole_file in ordered:
         try:
             raw = json.loads(cfg.read_text(encoding="utf-8"))
         except Exception as e:
             log_event("settings_parse_error", file=str(cfg), error=str(e))
             sys.stderr.write(f"jev_engine: failed reading {cfg}: {e}\n")
             continue
-        if _apply_jev_settings(settings, raw.get("jev_settings") or raw):
-            settings["source"] = str(cfg)
-            _cached_settings = settings
-            _cached_settings_mtimes = current_mtimes
-            return settings
-
-    for cfg in config_files:
-        try:
-            raw = json.loads(cfg.read_text(encoding="utf-8"))
-        except Exception as e:
-            log_event("settings_parse_error", file=str(cfg), error=str(e))
-            sys.stderr.write(f"jev_engine: failed reading {cfg}: {e}\n")
+        if not isinstance(raw, dict):
             continue
-        if _apply_jev_settings(settings, raw.get("jev_settings") or {}):
+        # A `jevs_settings.json` *is* the settings object. `opencode.json` is a
+        # full config, so only an explicit `jev_settings` block is read from it —
+        # never its unrelated top-level keys.
+        jev = raw if whole_file else (raw.get("jev_settings") if isinstance(raw.get("jev_settings"), dict) else {})
+        if _merge_jev_settings(settings, jev):
             settings["source"] = str(cfg)
-            _cached_settings = settings
-            _cached_settings_mtimes = current_mtimes
-            return settings
+            settings["sources"].append(str(cfg))
 
     _cached_settings = settings
-    _cached_settings_mtimes = current_mtimes
-    return settings
+    # Re-stat after reading: a file edited between the signature and the read
+    # must not leave a stale mtime paired with fresh content in the cache, which
+    # would make the change invisible until the next edit.
+    _cached_settings_mtimes = _get_files_mtime_signature(settings_files + config_files)
+    return _snapshot(settings)
 
 
 def get_scan_paths(root: Path) -> List[Path]:
@@ -280,76 +381,244 @@ _cached_client_key: Optional[tuple] = None
 _client_lock = threading.Lock()
 
 
-def _reset_client_cache() -> None:
-    """Clear the cached client. Exposed for tests."""
+def _close_cached_client() -> None:
+    """Drop the cached client *and* close it so its connection pool is released.
+
+    `TypeSafeClient` owns an `httpx2.Client` with a connection pool. Simply
+    nulling the reference leaks the pool and its sockets — once per test here,
+    once per `JEV_MCP_MOCK` toggle in the server. The `close()` runs outside the
+    lock so a slow close cannot block other callers.
+    """
     global _cached_client, _cached_client_key
     with _client_lock:
-        _cached_client = None
-        _cached_client_key = None
+        client, _cached_client, _cached_client_key = _cached_client, None, None
+    if client is not None:
+        try:
+            client.close()
+        except Exception as e:
+            log_event("client_close_failed", error=type(e).__name__)
+
+
+def _reset_client_cache() -> None:
+    """Clear the cached client. Exposed for tests."""
+    _close_cached_client()
 
 
 def get_client() -> Optional[TypeSafeClient]:
     """Return a configured TypeSafe client, or None in mock mode.
 
     Caches the client and reuses it across calls as long as the
-    configuration (api_key, model, mock, timeout) hasn't changed.
-    Raises `JevConfigError` when `TYPESAFE_API_KEY` is missing (unless
-    `JEV_MCP_MOCK=1`, which never needs a key).
+    client-relevant configuration hasn't changed. Raises `JevConfigError` when
+    `TYPESAFE_API_KEY` is missing (unless `JEV_MCP_MOCK=1`, which never needs a
+    key).
     """
     global _cached_client, _cached_client_key
 
     cfg = get_config()
     if cfg.mock:
-        with _client_lock:
-            _cached_client = None
-            _cached_client_key = None
+        _close_cached_client()
         return None
     if not cfg.api_key:
         raise JevConfigError("TYPESAFE_API_KEY environment variable is not configured.")
 
-    # Cache key: invalidate when any client-relevant config changes
-    cache_key = (cfg.api_key, cfg.timeout_ms, cfg.model)
+    # Cache key: invalidate when any client-relevant config changes. The SDK
+    # also reads TYPESAFE_BASE_URL and TYPESAFE_DEFAULT_MODEL from the
+    # environment, so a mid-process change to either must not leave a stale
+    # client pointed at the old host or model.
+    cache_key = (
+        cfg.api_key,
+        cfg.timeout_ms,
+        cfg.model,
+        (os.getenv("TYPESAFE_BASE_URL") or "").strip().rstrip("/"),
+        (os.getenv("TYPESAFE_DEFAULT_MODEL") or "").strip(),
+    )
     with _client_lock:
         if _cached_client is not None and _cached_client_key == cache_key:
             return _cached_client
+        stale, _cached_client, _cached_client_key = _cached_client, None, None
+        if stale is not None:
+            try:
+                stale.close()
+            except Exception as e:
+                log_event("client_close_failed", error=type(e).__name__)
 
+        budget = cfg.timeout_ms / 1000.0
         _cached_client = TypeSafeClient(
             api_key=cfg.api_key,
-            timeout=cfg.timeout_ms / 1000.0,
+            timeout=budget,
             retry=RetryPolicy(
                 max_retries=2,
                 backoff_initial=0.5,
                 backoff_max=5.0,
                 backoff_jitter=0.25,
+                # `timeout` is the TOTAL budget for the call, not a per-attempt
+                # limit: without it the SDK default of 30s applied on top of a
+                # 30s per-attempt timeout, so 3 attempts + backoff took ~91.5s.
+                timeout=budget,
+                # A retry cannot beat an expired deadline; it only burns budget.
+                api_timeout_error=False,
             ),
         )
         _cached_client_key = cache_key
         return _cached_client
 
 
-def execute_system_one(client, state: Any, questions: dict) -> Any:
+def _remaining_seconds(started: float, cfg) -> float:
+    """Seconds left in the `JEV_MCP_TIMEOUT_MS` budget for this tool call."""
+    return max(0.001, (cfg.timeout_ms / 1000.0) - (time.perf_counter() - started))
+
+
+# ----------------------------------------------------------------------
+# Circuit breaker
+# ----------------------------------------------------------------------
+class _Breaker:
+    """A minimal circuit breaker. Deliberately dependency-free.
+
+    Without it, a revoked key or a 5xx outage means every tool call pays the
+    full retry budget — and the plugin pays it again on every single message.
+    The breaker turns "repeat the same expensive failure" into "fail
+    immediately until it is worth probing again".
+
+    After a cooldown exactly one half-open probe is admitted; anything that
+    arrives while the probe is in flight is rejected, so a burst of callers
+    cannot fan back out at once.
+    """
+
+    def __init__(self, threshold: int, cooldown_s: float, auth_cooldown_s: float) -> None:
+        self.threshold = max(1, threshold)
+        self.cooldown_s = cooldown_s
+        self.auth_cooldown_s = auth_cooldown_s
+        self.failures = 0
+        self.opened_at = 0.0
+        self.opened_cooldown = cooldown_s
+        self.probing = False
+
+    def cooldown_for(self, retryable: bool) -> float:
+        """A bad API key does not fix itself in 30 seconds; a 5xx might."""
+        return self.cooldown_s if retryable else self.auth_cooldown_s
+
+    def allow(self) -> bool:
+        if self.failures < self.threshold:
+            return True
+        if self.probing:
+            return False
+        if time.monotonic() - self.opened_at >= self.opened_cooldown:
+            self.probing = True   # half-open: exactly one probe gets through
+            return True
+        return False
+
+    def record_success(self) -> None:
+        """A success closes the circuit and clears the consecutive-failure count."""
+        self.failures = 0
+        self.opened_at = 0.0
+        self.opened_cooldown = self.cooldown_s
+        self.probing = False
+
+    def record_failure(self, retryable: bool) -> None:
+        self.failures += 1
+        self.probing = False
+        if self.failures >= self.threshold:
+            self.opened_at = time.monotonic()
+            # A 401 must not park the breaker in a 30s window, but it must still
+            # short-circuit: a bad key does not fix itself in 30 seconds.
+            self.opened_cooldown = self.cooldown_for(retryable)
+
+    def remaining(self) -> float:
+        """Seconds until the next probe is allowed."""
+        return max(0.0, self.opened_cooldown - (time.monotonic() - self.opened_at))
+
+
+_cached_breaker: Optional[_Breaker] = None
+_cached_breaker_key: Optional[tuple] = None
+
+
+def _breaker() -> _Breaker:
+    """The process-wide breaker, rebuilt when the configured knobs change."""
+    global _cached_breaker, _cached_breaker_key
+    cfg = get_config()
+    key = (cfg.breaker_threshold, cfg.breaker_cooldown_s, cfg.auth_cooldown_s)
+    if _cached_breaker is None or _cached_breaker_key != key:
+        _cached_breaker = _Breaker(cfg.breaker_threshold, cfg.breaker_cooldown_s, cfg.auth_cooldown_s)
+        _cached_breaker_key = key
+    return _cached_breaker
+
+
+def _reset_breaker() -> None:
+    """Clear the circuit breaker state. Exposed for tests."""
+    global _cached_breaker, _cached_breaker_key
+    _cached_breaker = None
+    _cached_breaker_key = None
+
+
+def _breaker_guard(breaker: _Breaker) -> None:
+    """Raise a retryable error when the circuit is open, stating when to retry."""
+    if breaker.allow():
+        return
+    wait = breaker.remaining()
+    log_event("circuit_open", retry_in=round(wait, 3))
+    raise JevTimeoutError(
+        "TypeSafe is failing repeatedly; the circuit is open. "
+        f"Retry in {int(wait) + 1}s."
+    )
+
+
+def execute_system_one(client, state: Any, questions: dict, timeout_s: Optional[float] = None) -> Any:
     """Run `system_one`, re-raising SDK failures as typed Jev errors.
 
+    `timeout_s` is the *remaining* budget for this tool call, so an attempt that
+    starts late in the call cannot run past the deadline (ported from
+    `reference/burnigtm-jev-mcp/src/typesafe.ts:13-16`).
+
     In mock mode (or with a None client) a deterministic offline judge answers,
-    so the server and tests run without a network round-trip.
+    so the server and tests run without a network round-trip; that path is
+    CPU-bound, so the caller checks it against the budget instead.
     """
     cfg = get_config()
     model = cfg.model or None
     if cfg.mock or client is None:
         return mock_system_one(state, questions, model=model or "jev-latest")
+
+    breaker = _breaker()
+    _breaker_guard(breaker)
+    kwargs: Dict[str, Any] = {}
+    if timeout_s is not None:
+        kwargs["timeout"] = timeout_s
     try:
-        if hasattr(client, "system_one"):
-            return client.system_one(state=state, questions=questions, model=model)
-        elif hasattr(client, "decide"):
-            return client.decide(state=state, decisions=questions, model=model)
-        raise JevConfigError("Configured client does not support system_one or decide")
-    except TypeSafeAPITimeoutError as e:
-        raise JevTimeoutError() from e
-    except TypeSafeAPIConnectionError as e:
-        raise JevTimeoutError("Could not connect to TypeSafe.") from e
-    except TypeSafeAPIResponseValidationError as e:
-        raise JevResponseError() from e
-    # HTTP status errors map in error_details()
+        try:
+            if hasattr(client, "system_one"):
+                res = client.system_one(state=state, questions=questions, model=model, **kwargs)
+            elif hasattr(client, "decide"):
+                res = client.decide(state=state, decisions=questions, model=model, **kwargs)
+            else:
+                raise JevConfigError("Configured client does not support system_one or decide")
+        except TypeSafeAPITimeoutError as e:
+            breaker.record_failure(retryable=True)
+            raise JevTimeoutError() from e
+        except TypeSafeAPIConnectionError as e:
+            breaker.record_failure(retryable=True)
+            raise JevTimeoutError("Could not connect to TypeSafe.") from e
+        except TypeSafeAPIResponseValidationError as e:
+            # A malformed body is the provider's fault and is not an auth
+            # problem, so it must not extend the auth cooldown.
+            breaker.record_failure(retryable=True)
+            raise JevResponseError() from e
+        except TypeSafeAuthenticationError:
+            # 401/403: not retryable, but it must still short-circuit for the
+            # longer auth window.
+            breaker.record_failure(retryable=False)
+            raise
+        except TypeSafeAPIError as e:
+            breaker.record_failure(retryable=retryable_status(getattr(e, "status", 500)))
+            raise
+    except JevError:
+        raise
+    except Exception:
+        # A local programming error is not provider failure; do not open the
+        # circuit on it.
+        breaker.probing = False
+        raise
+    breaker.record_success()
+    return res
 
 
 def get_answer(response: Any, key: str) -> Any:
@@ -494,12 +763,27 @@ def _risk_action(prob: float, cfg) -> str:
 
 
 def _request(state_text: str, questions: dict):
-    """Fit + execute + validate one Jev round. Returns (res, fitted)."""
+    """Fit + execute + validate one Jev round. Returns (res, fitted, cfg).
+
+    The whole call is bounded by `JEV_MCP_TIMEOUT_MS`, not just the HTTP leg:
+    `fit_state` and the offline judge are inside the same budget, so a call that
+    spends its time locally cannot then spend it again on the network.
+    """
     cfg = get_config()
     started = time.perf_counter()
     try:
         fitted = fit_state(state_text, questions)
-        res = execute_system_one(get_client(), state=fitted["state"], questions=questions)
+        res = execute_system_one(
+            get_client(),
+            state=fitted["state"],
+            questions=questions,
+            timeout_s=_remaining_seconds(started, cfg),
+        )
+        # The mock judge is CPU-bound Python: a 100k-char state with 250 options
+        # can exceed a small budget, and reporting a decision as if it had been
+        # produced in time is worse than reporting the overrun.
+        if time.perf_counter() - started > cfg.timeout_ms / 1000.0:
+            raise JevTimeoutError()
         validate_response(res, questions)
         log_round(
             (time.perf_counter() - started) * 1000,
@@ -1049,7 +1333,7 @@ def select_model_tier(task: str) -> dict:
         "task": task,
         "recommended_tier": None,
         "recommended_model": None,
-        "model_map": settings["models"],
+        "model_map": dict(settings["models"]),
         "action": "review",
         "confidence": None,
         "truncated": False,

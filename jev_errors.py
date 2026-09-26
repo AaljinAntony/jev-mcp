@@ -33,11 +33,15 @@ except ImportError:
 RETRYABLE_STATUSES = frozenset({408, 429})
 
 
-class JevConfigError(Exception):
+class JevError(Exception):
+    """Base for every error this engine raises on purpose."""
+
+
+class JevConfigError(JevError):
     """Bad environment / settings configuration (key missing, thresholds invalid)."""
 
 
-class JevValidationError(Exception):
+class JevValidationError(JevError):
     """Invalid caller input (bad thresholds, negative budget, ...)."""
 
 
@@ -45,7 +49,7 @@ class JevBudgetError(JevValidationError):
     """The request exceeds the estimated context budget."""
 
 
-class JevResponseError(Exception):
+class JevResponseError(JevError):
     """The provider returned an invalid response; no decision was accepted."""
 
     def __init__(self, reason: str = "TypeSafe returned an invalid response. No decision was accepted.") -> None:
@@ -53,11 +57,16 @@ class JevResponseError(Exception):
         self.reason = reason
 
 
-class JevTimeoutError(Exception):
-    """The request exceeded its configured timeout."""
+class JevTimeoutError(JevError):
+    """The request exceeded its configured timeout.
+
+    An explicit message is preserved by `error_details` (the circuit breaker's
+    "retry in Ns" is actionable in a way the generic advice is not); the bare
+    constructor keeps the generic wording.
+    """
 
 
-class JevCancelledError(Exception):
+class JevCancelledError(JevError):
     """The tool request was cancelled."""
 
 
@@ -73,7 +82,8 @@ class JevToolError(ToolError):
         self.envelope = envelope
 
 
-def _retryable_status(status: int) -> bool:
+def retryable_status(status: int) -> bool:
+    """True for provider status codes worth another attempt: 408, 429, any 5xx."""
     return status in RETRYABLE_STATUSES or status >= 500
 
 
@@ -104,7 +114,7 @@ def error_details(err: Exception) -> dict:
     if isinstance(err, JevTimeoutError):
         return {
             "code": "TIMEOUT",
-            "message": "The tool request timed out. Reduce the request size or increase JEV_MCP_TIMEOUT_MS.",
+            "message": str(err) or "The tool request timed out. Reduce the request size or increase JEV_MCP_TIMEOUT_MS.",
             "retryable": True,
         }
     if isinstance(err, JevCancelledError):
@@ -147,7 +157,7 @@ def error_details(err: Exception) -> dict:
         return {
             "code": "API_ERROR",
             "message": f"TypeSafe API request failed (HTTP {status}).",
-            "retryable": _retryable_status(status),
+            "retryable": retryable_status(status),
         }
     if isinstance(err, TypeSafeAPIConnectionError):
         return {"code": "API_ERROR", "message": "Could not connect to TypeSafe.", "retryable": True}
