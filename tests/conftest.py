@@ -3,11 +3,67 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from typesafe_sdk import ChoiceAnswer, SystemOneResponse, Usage
 
 # Make the repo root importable from tests/ (repo modules are not a package).
 ROOT = str(Path(__file__).resolve().parent.parent)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+
+@pytest.fixture
+def stub_choice(monkeypatch):
+    """Answer a Choice question with a hand-built distribution, no SDK call.
+
+    Patches `jev_engine._request` — the single seam every tool funnels through —
+    so the test controls the judgment the policy layer will see while the
+    discovery, validation and decision code around it still runs for real.
+
+    Lives here rather than in each test module because several modules need the
+    same stub, and because a stub that drifts from the SDK's answer shape breaks
+    validation rather than the test. A test that needs to *inspect* the questions
+    (criteria keys, state) still writes its own `_request`, since the fixture
+    discards them.
+
+    Usage::
+
+        stub_choice(".agents/skills/a/SKILL.md",
+                    {".agents/skills/a/SKILL.md": 0.8, "none": 0.2})
+
+    With a second answer — `search_target_files` asks a Choice and a Noul::
+
+        stub_choice("none", {"a.py": 0.1, "none": 0.9},
+                    key="target_file", confidence=0.7,
+                    extra={"is_relevant": NoulAnswer(noul=0.1)})
+    """
+    import jev_engine
+
+    def _install(choice, probabilities, *, key="primary", confidence=0.9, extra=None):
+        answers = {
+            key: ChoiceAnswer(
+                choice=choice,
+                probabilities=dict(probabilities),
+                confidence=confidence,
+            )
+        }
+        if extra:
+            answers.update(extra)
+
+        def _fake_request(state, questions):
+            return (
+                SystemOneResponse(
+                    model="jev-test",
+                    answers=answers,
+                    usage=Usage(input_tokens=12, output_tokens=6),
+                ),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _fake_request)
+        return _fake_request
+
+    return _install
 
 
 @pytest.fixture(autouse=True)

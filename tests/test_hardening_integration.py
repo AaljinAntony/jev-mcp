@@ -17,31 +17,27 @@ from jev_engine import (
     _validate_root_dir,
     select_target_files,
     find_agent_resources,
+    MAX_WALK_DEPTH,
 )
 from jev_errors import error_details, JevValidationError
-from limits import fit_state
+from limits import fit_state, MAX_CHOICE_OPTIONS
 from policy import (
     DEFAULT_RISK_THRESHOLD,
     DEFAULT_ESCALATE_THRESHOLD,
     FAMILY_CLUSTER_MAX_SIBLINGS,
+    FAMILY_CLUSTER_MIN_PROB,
     guardrail_safe,
 )
-from typesafe_sdk import (
-    ChoiceAnswer,
-    SystemOneResponse,
-    TypeSafeAPIConnectionError,
-    TypeSafeAPITimeoutError,
-    Usage,
-)
+from typesafe_sdk import TypeSafeAPIConnectionError
 
 
 # 1. Connection error mapping
 def test_connection_error_never_skipped():
-    class TestConnError(TypeSafeAPIConnectionError):
-        def __init__(self):
-            super(Exception, self).__init__("Connection dropped")
-
-    res = error_details(TestConnError())
+    # Constructed through the SDK's own __init__ (message, request_id, body), so
+    # this exercises the real class rather than a hand-rolled Exception that
+    # happens to inherit the same name.
+    err = TypeSafeAPIConnectionError("Connection dropped")
+    res = error_details(err)
     assert res["code"] == "API_ERROR"
     assert res["retryable"] is True
     assert "Could not connect to TypeSafe" in res["message"]
@@ -57,28 +53,6 @@ def test_risk_constants_and_guardrail_boundaries():
 
 
 # 3. Sibling family-prefix matching
-def _stub_primary(monkeypatch, probs, choice):
-    """Answer `find_agent_resources` with one hand-built Choice distribution."""
-    def _fake_request(state, questions):
-        return (
-            SystemOneResponse(
-                model="jev-test",
-                answers={
-                    "primary": ChoiceAnswer(
-                        choice=choice,
-                        probabilities=probs,
-                        confidence=0.9,
-                    )
-                },
-                usage=Usage(input_tokens=10, output_tokens=5),
-            ),
-            {"truncated": False, "coverage": {}},
-            get_config(),
-        )
-
-    monkeypatch.setattr(jev_engine, "_request", _fake_request)
-
-
 def _family_tree(tmp_path):
     skills_dir = tmp_path / ".agents" / "skills"
     for name in ["tool-runner", "tool-builder", "tool-linter", "my-tool-extra"]:
@@ -90,65 +64,70 @@ def _family_tree(tmp_path):
     }
 
 
-def test_family_prefix_sibling_matching(tmp_path, monkeypatch):
+def test_family_cluster_adds_siblings_for_confident_primary(tmp_path, monkeypatch, stub_choice):
+    """A high-probability primary pulls in same-family siblings, newest first."""
     monkeypatch.setenv("JEV_MCP_MOCK", "1")
-    _reset_config_cache()
-    _reset_client_cache()
-    _reset_settings_cache()
     rel = _family_tree(tmp_path)
 
-    # A confident primary pulls in same-family siblings, highest probability first.
-    _stub_primary(
-        monkeypatch,
+    # tool-builder and tool-linter share the primary's "tool-" family; every
+    # sibling sits below the independent 0.12 floor, so only clustering can add
+    # them. my-tool-extra does not start with "tool-" and must never be added.
+    stub_choice(
+        rel["tool-runner"],
         {
-            rel["tool-runner"]: 0.7,
-            rel["tool-linter"]: 0.2,
-            rel["tool-builder"]: 0.05,
-            rel["my-tool-extra"]: 0.04,
+            rel["tool-runner"]: 0.70,
+            rel["tool-linter"]: 0.11,
+            rel["tool-builder"]: 0.10,
+            rel["my-tool-extra"]: 0.08,
             "none": 0.01,
         },
-        rel["tool-runner"],
     )
     res = find_agent_resources("run tools", root_dir=str(tmp_path))
     files = [r["file"] for r in res["resources"]]
+
     assert files[0] == rel["tool-runner"]
-    assert rel["tool-linter"] in files          # same "tool-" family
-    assert rel["my-tool-extra"] not in files    # different family prefix
+    assert set(files[1:]) == {rel["tool-linter"], rel["tool-builder"]}
+    assert rel["my-tool-extra"] not in files
 
-    # At most FAMILY_CLUSTER_MAX_SIBLINGS siblings are added, never the whole family.
-    _stub_primary(
-        monkeypatch,
-        {
-            rel["tool-runner"]: 0.7,
-            rel["tool-linter"]: 0.2,
-            rel["tool-builder"]: 0.05,
-            rel["my-tool-extra"]: 0.04,
-            "none": 0.01,
-        },
+
+def test_family_cluster_never_claims_every_slot(tmp_path, monkeypatch, stub_choice):
+    """Clustering is capped at FAMILY_CLUSTER_MAX_SIBLINGS, family size be damned."""
+    monkeypatch.setenv("JEV_MCP_MOCK", "1")
+    rel = _family_tree(tmp_path)
+    assert FAMILY_CLUSTER_MAX_SIBLINGS < 3, "fixture no longer exercises the cap"
+
+    stub_choice(
         rel["tool-runner"],
-    )
-    res = find_agent_resources("run tools", root_dir=str(tmp_path))
-    assert len(res["resources"]) <= 1 + FAMILY_CLUSTER_MAX_SIBLINGS
-
-    # A weak primary must not claim any slot for its family: every sibling is
-    # below the independent 0.12 sibling floor, so only clustering could add one.
-    _stub_primary(
-        monkeypatch,
         {
-            rel["tool-runner"]: 0.15,
+            rel["tool-runner"]: 0.70,
             rel["tool-linter"]: 0.11,
             rel["tool-builder"]: 0.10,
-            rel["my-tool-extra"]: 0.09,
-            "none": 0.55,
+            rel["my-tool-extra"]: 0.08,
+            "none": 0.01,
         },
-        rel["tool-runner"],
     )
     res = find_agent_resources("run tools", root_dir=str(tmp_path))
-    assert [r["file"] for r in res["resources"]] == [rel["tool-runner"]]
+    assert len(res["resources"]) == 1 + FAMILY_CLUSTER_MAX_SIBLINGS
 
-    _reset_config_cache()
-    _reset_client_cache()
-    _reset_settings_cache()
+
+def test_family_cluster_suppressed_for_weak_primary(tmp_path, monkeypatch, stub_choice):
+    """A low-probability primary must not claim the sibling slots."""
+    monkeypatch.setenv("JEV_MCP_MOCK", "1")
+    rel = _family_tree(tmp_path)
+
+    # Below FAMILY_CLUSTER_MIN_PROB: this is a guess, not a decision, so it is
+    # not allowed to fill the result with its own directory family.
+    probs = {
+        rel["tool-runner"]: 0.15,
+        rel["tool-linter"]: 0.11,
+        rel["tool-builder"]: 0.10,
+        rel["my-tool-extra"]: 0.09,
+        "none": 0.55,
+    }
+    assert probs[rel["tool-runner"]] < FAMILY_CLUSTER_MIN_PROB
+    stub_choice(rel["tool-runner"], probs)
+    res = find_agent_resources("run tools", root_dir=str(tmp_path))
+    assert [r["file"] for r in res["resources"]] == [rel["tool-runner"]]
 
 
 # 4. Thread-safe client caching under concurrent access
@@ -180,8 +159,14 @@ def test_concurrent_get_client_thread_safety(monkeypatch):
     for c in clients:
         assert c is first
 
-    _reset_client_cache()
-    _reset_config_cache()
+    # Close the pool this test opened. `_reset_client_cache` only drops the
+    # reference; without an explicit close, every run of this test leaked one
+    # connection pool.
+    try:
+        first.close()
+    finally:
+        _reset_client_cache()
+        _reset_config_cache()
 
 
 # 5. Settings parse error handling
@@ -204,20 +189,72 @@ def test_validate_root_dir_security():
 
 
 # 7. Depth-bounded directory walk
-def test_target_files_bounded_depth(tmp_path, monkeypatch):
+def test_target_files_respects_walk_depth(tmp_path, monkeypatch):
+    """Files past MAX_WALK_DEPTH are never offered to the model."""
     monkeypatch.setenv("JEV_MCP_MOCK", "1")
     _reset_config_cache()
     _reset_client_cache()
-    p = tmp_path
-    for i in range(7):
-        p = p / f"dir_{i}"
-        p.mkdir()
-        (p / "test.py").write_text("a = 1")
 
-    res = select_target_files("find file", root_dir=str(tmp_path))
-    assert res is not None
+    # One file at each depth 0..MAX_WALK_DEPTH+1. `_prune_dirnames` clears a
+    # directory's children once the directory itself is MAX_WALK_DEPTH levels
+    # down, so depth MAX_WALK_DEPTH-1 is the last one that yields a file.
+    deepest = tmp_path
+    for i in range(MAX_WALK_DEPTH + 2):
+        level = deepest / f"d{i}"
+        level.mkdir()
+        (level / f"f{i}.py").write_text("x = 1")
+        deepest = level
+    (tmp_path / "top.py").write_text("x = 1")
+
+    seen = {}
+    real_request = jev_engine._request
+
+    def _spy(state, questions):
+        seen["criteria"] = set(questions["target_file"].criteria)
+        return real_request(state, questions)
+
+    monkeypatch.setattr(jev_engine, "_request", _spy)
+    res = select_target_files("find the top file", root_dir=str(tmp_path))
+    criteria = seen["criteria"]
+
+    assert "top.py" in criteria
+    # `_prune_dirnames` clears a directory's children once the directory itself
+    # sits MAX_WALK_DEPTH levels down, so the deepest offered file is the one
+    # in the directory one level above that.
+    depths = [len(Path(c).parts) - 1 for c in criteria if c != "none"]
+    assert max(depths) == MAX_WALK_DEPTH - 1
+    assert f"d{MAX_WALK_DEPTH}/" not in "".join(criteria), "depth bound not enforced"
+    assert not any(f"d{MAX_WALK_DEPTH + 1}/" in c for c in criteria)
+    assert res["candidates_truncated"] is False
+
+
+def test_target_files_reports_candidate_overflow(tmp_path, monkeypatch):
+    """Past the discovery cap the tool reports truncation and never auto-accepts."""
+    monkeypatch.setenv("JEV_MCP_MOCK", "1")
     _reset_config_cache()
     _reset_client_cache()
+
+    for i in range(MAX_CHOICE_OPTIONS + 1):
+        (tmp_path / f"f{i:04d}.py").write_text("x = 1")
+
+    seen = {}
+    real_request = jev_engine._request
+
+    def _spy(state, questions):
+        seen["state"] = state
+        return real_request(state, questions)
+
+    monkeypatch.setattr(jev_engine, "_request", _spy)
+    res = select_target_files("find a file", root_dir=str(tmp_path))
+
+    # One file past the cap was never offered, so the winner cannot be defended
+    # from the evidence the model actually saw.
+    assert res["candidates_truncated"] is True
+    assert res["action"] != "auto"
+    assert seen["state"]["candidates_evaluated"] == MAX_CHOICE_OPTIONS
+    fields = res["coverage"]["candidate_fields"]
+    assert fields["complete"] is False
+    assert fields["candidates_considered"] == MAX_CHOICE_OPTIONS
 
 
 # 8. fit_state token reuse & defensive copy
@@ -249,20 +286,42 @@ def test_config_caching(monkeypatch):
 
 
 # 10. Settings mtime caching
-def test_settings_mtime_caching(tmp_path, monkeypatch):
+def test_settings_cache_invalidates_on_mtime_change(tmp_path, monkeypatch):
+    cfg_file = tmp_path / "jevs_settings.json"
+    cfg_file.write_text(json.dumps({"enable_model_routing": False}))
+    monkeypatch.chdir(tmp_path)
+    _reset_settings_cache()
+
+    assert load_jev_settings()["enable_model_routing"] is False
+
+    cfg_file.write_text(json.dumps({"enable_model_routing": True}))
+    # Filesystem mtime granularity is coarse (and tmp_path is often a FAT-like
+    # volume on CI); a same-second rewrite can leave st_mtime unchanged, which
+    # would make the test flaky rather than wrong. Force the observable change.
+    bump = time.time() + 2
+    os.utime(cfg_file, (bump, bump))
+
+    assert load_jev_settings()["enable_model_routing"] is True
+    _reset_settings_cache()
+
+
+def test_settings_cache_serves_a_copy_not_the_cache_object(tmp_path, monkeypatch):
+    """Identity would test the implementation; equality plus non-identity tests
+    the behaviour that actually matters — a caller cannot mutate module state."""
     cfg_file = tmp_path / "jevs_settings.json"
     cfg_file.write_text(json.dumps({"enable_model_routing": True}))
     monkeypatch.chdir(tmp_path)
     _reset_settings_cache()
 
     s1 = load_jev_settings()
-    assert s1["enable_model_routing"] is True
-
     s2 = load_jev_settings()
-    # The cache is still doing its job (equal content, no re-read), but the
-    # loader hands out a copy so a caller cannot mutate module state. Identity
-    # was testing the implementation; equality plus non-identity tests the
-    # behaviour that actually matters.
     assert s1 == s2
     assert s1 is not s2
+
+    s1["scan_paths"].append("injected")
+    s1["enable_model_routing"] = False
+    s3 = load_jev_settings()
+    assert "injected" not in s3["scan_paths"]
+    assert s3["enable_model_routing"] is True
     _reset_settings_cache()
+

@@ -12,6 +12,37 @@ files live in your user profile or project root and must **never** be committed.
 | `config/jevs_settings.example.json` | `<project-root>\jevs_settings.json` (per project) |
 | `config/jev-plugin.example.js` | `C:\Users\<you>\.config\opencode\plugins\jev-plugin.js` |
 
+## The plugin's lifecycle
+
+The plugin is a **copy**, not a symlink or an import, and it is the only file
+opencode loads. That makes drift the failure mode to design against:
+
+```
+config/jev-plugin.example.js        <- edited here, committed
+        │  node tests\test_plugin.mjs      (behaviour + drift check)
+        │  Copy-Item ... -Force
+        ▼
+~\.config\opencode\plugins\jev-plugin.js   <- what opencode actually runs
+        ▲
+        │  scripts\doctor.py               (same SHA256 comparison, no Node)
+        │
+```
+
+Rules that follow from that:
+
+- **Edit the example, never the installed copy.** An edit made only in the
+  installed file is lost on the next reinstall and is invisible to review.
+- **The example is the single server implementation.** The plugin holds no
+  Python and no TypeSafe SDK access; it drives the same `jev_mcp.py` over stdio
+  JSON-RPC as an MCP client. There is no second code path to keep in step, and
+  the plugin tests run against a real child process for exactly that reason.
+- **Copy, then test, then restart.** opencode loads the plugin once at startup;
+  a copied file has no effect until it restarts.
+- **The drift check is not optional.** `node tests\test_plugin.mjs` ends with a
+  byte comparison against the installed file and fails on any difference. A
+  427-line installed plugin that was missing every guard the example has is a
+  real event from this project's history.
+
 ## Install steps
 
 1. **Copy the config example into place:**
@@ -62,6 +93,7 @@ values are read from `TYPESAFE_API_KEY` interpolation plus:
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_LOG_FILE` | `<repo>/logs/jev_engine.log` | Absolute path to the server log; each tool call and provider round is recorded (always written cwd-independently). |
 | `JEV_MCP_LOG_PREVIEW` | `0` | `1` = also log a 1,000-character `result_preview` per tool call. Off by default: the result is serialized twice (here and by the MCP runtime) and a skill result carries kilobytes of file content. The preview is redacted like every other logged value. |
+| `JEV_PLUGIN_SCAN_ROOTS` | *(empty)* | Read by the **plugin**, not the server. Extra skill directories outside the project; forwarded to the child as `JEV_MCP_ALLOWED_ROOTS` so both sides agree on what may be read. |
 
 Thresholds must satisfy `0 <= review_at <= auto_accept <= 1` (invalid values
 fail fast with a `CONFIG_ERROR` envelope instead of silently mis-routing).
@@ -103,8 +135,7 @@ $env:JEV_MCP_ALLOWED_ROOTS="D:\work\other-project;D:\work\shared"
    containing prompt text — only its length and a short digest).
    It reuses the same `jev_mcp.py` you configured above, spawned once per
    session and driven as a stdio MCP client, so no second server implementation
-   exists to drift. Run `node tests\test_plugin.mjs` after every copy: its last
-   check fails if the installed file no longer matches the committed example.
+   exists to drift.
 
    To keep skills outside the project, opt in explicitly (forwarded to the
    server as `JEV_MCP_ALLOWED_ROOTS`):
@@ -113,10 +144,40 @@ $env:JEV_MCP_ALLOWED_ROOTS="D:\work\other-project;D:\work\shared"
    $env:JEV_PLUGIN_SCAN_ROOTS="$env:USERPROFILE\.config\opencode\skills"
    ```
 
-6. **Restart OpenCode** so the MCP server and settings are re-read, then run the
-   verification commands from the main `README.md`.
+6. **(Required after any plugin edit) run the plugin tests:**
+
+   ```powershell
+   node tests\test_plugin.mjs
+   ```
+
+   The last check in that file compares
+   `~\.config\opencode\plugins\jev-plugin.js` against
+   `config\jev-plugin.example.js` byte for byte and **fails** on any difference.
+   A 427-line installed plugin missing every guard the example has is exactly
+   the failure this catches, so treat the copy and the test as one step: edit the
+   example, copy it, run the test. `scripts\doctor.py` runs the same SHA256
+   comparison, so a user without Node can check it too.
+
+7. **Restart OpenCode** so the MCP server, the settings and the plugin are
+   re-read.
+
+8. **Check the installation:**
+
+   ```powershell
+   & .\.venv\Scripts\python.exe scripts\doctor.py
+   ```
+
+   Read-only; no child process, no API call. It verifies the interpreter, both
+   SDKs, key *presence* (length and a 4-character suffix only), settings
+   resolution and their `sources`, the `root_dir` allowlist against the current
+   directory, log-directory writability, `review_at <= auto_accept`, and the
+   plugin copy from step 6. Exits 0 when healthy, 1 otherwise, with a one-line
+   fix per finding. Run it **before** reading any trace below.
 
 ## Troubleshooting
+
+Start with `scripts\doctor.py` (step 8). If it is clean, the remaining failures
+are behavioural, and these are the two that have actually happened:
 
 "Unexpected error occurred" while sending a prompt in a project that has a
 `.agents/` folder? The fix below is already applied to the installed plugin
@@ -179,14 +240,16 @@ To set a project-specific default, add it back:
 
 - Lookup order: `<project>/jevs_settings.json` →
   `<project>/.opencode/jevs_settings.json` →
-  `~/.config/opencode/jevs_settings.json` → legacy `jev_settings` block in
-  `opencode.json` (project > user). Discovery order is unchanged; **precedence
-  is applied by merging**: the user-level files are applied first, then the
-  project files override them **per key**. Neither discards the other, so a
-  project file that only sets `enable_model_routing` no longer wipes out the
-  user file's `models` map.
-- `opencode.json` is only read through an explicit `jev_settings` block; its
-  unrelated top-level keys are never treated as Jev settings.
+  `<repo>/jevs_settings.json` (the server's own directory, so the CWD does not
+  matter) → `~/.config/opencode/jevs_settings.json`. Discovery order is
+  unchanged; **precedence is applied by merging**: the user-level files are
+  applied first, then the project files override them **per key**. Neither
+  discards the other, so a project file that only sets `enable_model_routing` no
+  longer wipes out the user file's `models` map.
+- `opencode.json` is **not** a settings source, for the reason in step 2: its
+  schema rejects unknown top-level keys, so a `jev_settings` block would stop the
+  MCP server from loading at all. The lookup that used to read one has been
+  deleted from the server.
 - All keys optional; missing keys fall back to defaults: routing **off**, empty
   `models`, built-in `scan_paths` (`.agents/skills`, `.agents/workflows`,
   `.agents/memory`, `.opencode/skills`, `skills`, `.agents`).
@@ -205,13 +268,14 @@ To set a project-specific default, add it back:
 
 ### What "routing on" actually does
 
-When `enable_model_routing` is **on** and all three tiers have model IDs, the
+When `enable_model_routing` is **on** and at least one tier has a model ID, the
 `jev-plugin.js` `chat.message` hook asks Jev the tier, looks up the model ID, and
 **forces** the switch by mutating `output.message.model` (opencode uses that value
-for the reply — a hard switch, not a recommendation). `select_model_tier` remains
-available as an MCP tool for explicit/on-demand queries. When routing is **off**
-(the default), nothing is changed and opencode uses its `"model"` config /
-window-selected model.
+for the reply — a hard switch, not a recommendation). A partial `models` map is
+fine: if the tier Jev picks has no ID, nothing is switched and the hook logs why.
+`select_model_tier` remains available as an MCP tool for explicit/on-demand
+queries. When routing is **off** (the default), nothing is changed and opencode
+uses its `"model"` config / window-selected model.
 
 Both the switch and the skill injection require the server to return
 `action: "auto"` with `confidence >= 0.6`, a well-formed `provider/model` id, and

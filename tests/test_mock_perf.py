@@ -8,7 +8,6 @@ option; if it ever changes a probability, the golden below fails.
 
 import math
 
-import pytest
 from typesafe_sdk import Choice, Noul, Score
 
 import mock

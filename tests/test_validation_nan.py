@@ -1,7 +1,6 @@
 """Tests for NaN/Inf rejection in fail-closed response validation and serialization boundary."""
 
 import json
-import math
 import pytest
 
 from typesafe_sdk import Choice, Noul, Score, SystemOneResponse, Usage

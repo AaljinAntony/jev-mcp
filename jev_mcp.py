@@ -19,7 +19,6 @@ from jev_engine import (
     find_agent_resources,
     select_target_files,
     select_model_tier as _engine_select_model_tier,
-    load_jev_settings,
 )
 from jev_errors import JevToolError, error_details
 from jev_logging import log_tool_call, log_event, log_exception, log_path

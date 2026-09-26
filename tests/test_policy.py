@@ -6,7 +6,6 @@ from policy import (
     DEFAULT_ESCALATE_THRESHOLD,
     DEFAULT_REVIEW_AT,
     DEFAULT_RISK_THRESHOLD,
-    ESCAPE_HATCHES,
     action_from_confidence,
     confidence_from_probabilities,
     guardrail_safe,
@@ -124,6 +123,16 @@ class TestGuardrailSafe:
         assert guardrail_safe("auto", 0.20, 0.0) is False
 
 
-class TestEscapeHatches:
-    def test_standard_hatches_present(self):
-        assert set(ESCAPE_HATCHES) >= {"ask_user", "investigate", "none"}
+def test_no_escape_hatch_dict_remains():
+    """`ESCAPE_HATCHES` was defined and never read.
+
+    A policy constant nobody enforces is worse than no constant: the next
+    reader assumes `ask_user` and `investigate` are offered and that a `none`
+    selection is being routed somewhere. The only escape hatch in use is the
+    literal `"none"` criterion, which each tool adds to its own Choice — and
+    that lives in the tools, not in policy.
+    """
+    import policy
+
+    assert not hasattr(policy, "ESCAPE_HATCHES")
+    assert "ask_user" not in dir(policy)

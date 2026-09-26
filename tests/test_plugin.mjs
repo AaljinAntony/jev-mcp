@@ -724,8 +724,49 @@ await test("a server that exits at startup fails fast, and the hook survives it"
   assert.ok(/exited|handshake|failed/.test(added), `the failure was logged:\n${added}`);
 });
 
-console.log("--- 13. Source-level guarantees ---");
-await test("no inline Python, no .env parsing, no blocking spawn", () => {
+console.log("--- 13. Privacy and gating invariants ---");
+await test("a prompt is logged as a length plus a digest, never as text", () => {
+  const secret = "my private prompt about the acquisition";
+  const described = P.describeText(secret);
+  assert.ok(!described.includes("private"), `the prompt leaked into the log: ${described}`);
+  assert.ok(/^len=\d+ sha256=[0-9a-f]{12}$/.test(described), `unexpected shape: ${described}`);
+  // A digest, not a truncation: two prompts of the same length differ.
+  const other = "my private prompt about the acquisitionX";
+  assert.notStrictEqual(P.describeText(other), described);
+  // A 200kB prompt still yields a short, bounded description.
+  const huge = "x".repeat(200_000);
+  assert.ok(P.describeText(huge).length < 64, "the description is not bounded");
+});
+await test("isConfident is the action AND the confidence floor, not either alone", () => {
+  assert.strictEqual(P.isConfident({ action: "auto", confidence: 0.9 }), true);
+  assert.strictEqual(P.isConfident({ action: "review", confidence: 0.99 }), false);
+  assert.strictEqual(P.isConfident({ action: "escalate", confidence: 0.99 }), false);
+  assert.strictEqual(P.isConfident({ action: "auto", confidence: 0.59 }), false);
+  assert.strictEqual(P.isConfident({ action: "auto", confidence: 0.6 }), true);
+  assert.strictEqual(P.isConfident({ action: "auto" }), false, "a missing confidence is not confidence");
+  assert.strictEqual(P.isConfident({ action: "auto", confidence: "0.9" }), false, "a string is not a number");
+  assert.strictEqual(P.isConfident(null), false);
+  assert.strictEqual(P.isConfident(undefined), false);
+});
+await test("the log records the digest, and never an interpolated prompt", () => {
+  // Behavioural, not a substring check: put a marker in a prompt the plugin
+  // logs, then prove the marker is absent from the log file afterwards.
+  const marker = "ZZPROMPTZZ-unique-marker";
+  const logFile = path.join(LOG_DIR, "jev-plugin.log");
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.writeFileSync(logFile, "");
+  P.pluginLog(`prompt ${P.describeText(marker)}`);
+  const contents = fs.readFileSync(logFile, "utf-8");
+  assert.ok(!contents.includes(marker), "the raw prompt reached the log");
+  assert.ok(contents.includes("sha256="), "no digest was logged instead");
+});
+await test("the plugin carries no inline Python and no direct SDK use", () => {
+  // The one invariant that is architectural rather than behavioural: nothing in
+  // this file may reach the TypeSafe SDK except through the MCP child, because
+  // an inline Python path would silently bypass every bound the server
+  // enforces. No behavioural test can fail if such dead code is re-added, so it
+  // is asserted against the source — the file the drift check below proves is
+  // byte-identical to the installed plugin.
   for (const forbidden of [
     "typesafe_sdk",
     "TypeSafeClient",
@@ -736,21 +777,9 @@ await test("no inline Python, no .env parsing, no blocking spawn", () => {
   ]) {
     assert.ok(!pluginSource.includes(forbidden), `source must not contain ${forbidden}`);
   }
-});
-await test("the bounded scan, log rotation and prompt cap are all present", () => {
-  for (const required of [
-    "maxDepth = 6",
-    "2 * 1024 * 1024",
-    "MAX_PROMPT_CHARS",
-    "PLUGIN_MIN_CONFIDENCE",
-    "path.relative",
-  ]) {
-    assert.ok(pluginSource.includes(required), `source must contain ${required}`);
-  }
-});
-await test("the user prompt is never written to the log verbatim", () => {
-  assert.ok(!/prompt="\$\{/.test(pluginSource), "no interpolated prompt in a log line");
-  assert.ok(pluginSource.includes("describeText(promptText)"), "the prompt is logged as a digest");
+  // One spawn site, and it is the MCP child.
+  const spawns = pluginSource.match(/\bspawn\(/g) || [];
+  assert.strictEqual(spawns.length, 1, `expected exactly one spawn() call, found ${spawns.length}`);
 });
 
 console.log("--- 14. Installed plugin drift ---");

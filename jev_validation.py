@@ -4,11 +4,16 @@ Borrowed from `reference/burnigtm-jev-mcp/src/responses.ts` (MIT). Validates a
 `system_one` response against the questions that produced it before any policy
 function reads a number. Invalid responses raise `JevResponseError`; they are
 never read as `safe:true`.
+
+Answers are read through `_attr`, which accepts both an SDK answer object and
+the raw dict a JSON response decodes to, so nothing here imports a concrete SDK
+answer class. The `Score` branch is kept and tested even though no tool asks a
+graded question yet: it is the most intricate validator in the file (int-key
+coercion plus a mean-consistency check) and the SDK supports it, so deleting it
+would remove a capability the design documents rather than dead weight.
 """
 
 import math
-
-from typesafe_sdk import Answer, Choice, Noul, Score
 
 from jev_errors import JevResponseError
 from policy import PROBABILITY_SUM_TOLERANCE, score_mean_tolerance

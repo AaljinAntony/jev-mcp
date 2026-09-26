@@ -1,7 +1,5 @@
 """Unit tests for the candidate evidence extractor (no filesystem required)."""
 
-import pytest
-
 from candidates import (
     UNREADABLE,
     bound_candidates,

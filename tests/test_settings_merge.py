@@ -32,7 +32,6 @@ def project(tmp_path, monkeypatch):
     project_dir.mkdir()
     monkeypatch.chdir(project_dir)
     monkeypatch.setattr(jev_engine, "_find_settings_files", lambda: [project_dir / "jevs_settings.json"])
-    monkeypatch.setattr(jev_engine, "_find_config_files", lambda: [])
     _reset_settings_cache()
     return project_dir
 
@@ -122,35 +121,35 @@ def test_sources_lists_everything_and_source_is_the_last_contributor(project, mo
     assert settings["source"] == str(project_file)
 
 
-def test_opencode_json_is_only_read_through_its_jev_settings_block(project, monkeypatch):
-    """Never take unrelated top-level keys from a full opencode.json."""
-    project_file = project / "opencode.json"
-    _write(
-        project_file,
-        {
-            "$schema": "https://opencode.ai/config.json",
-            "model": "some-provider/some-model",
-            "models": {"fast": "should-be-ignored"},
-            "mcp": {"jev": {"command": "python"}},
-        },
-    )
-    monkeypatch.setattr(jev_engine, "_find_config_files", lambda: [project_file])
-    _reset_settings_cache()
+def test_opencode_json_is_not_a_settings_source(project, monkeypatch):
+    """Settings come from `jevs_settings.json` only.
 
+    There used to be a lookup for a `jev_settings` block inside
+    `opencode.json`. It can never match: OpenCode's `opencommand` schema is
+    strict (`additionalProperties: false`), so an unknown top-level key
+    invalidates the entire config and the server would not start at all. A file
+    that cannot be loaded is not a settings source, so the branch and the
+    discovery walk that fed it are both gone.
+    """
+    import jev_engine as engine
+
+    assert not hasattr(engine, "_find_config_files")
+
+    # And nothing reads an unrelated opencode.json that happens to sit in the CWD.
+    (project / "opencode.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "enable_model_routing": True,
+                "models": {"fast": "should-be-ignored"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _reset_settings_cache()
     settings = load_jev_settings()
     assert settings["models"] == {}
     assert settings["enable_model_routing"] is False
-
-
-def test_opencode_jev_settings_block_is_merged(project, monkeypatch):
-    project_file = project / "opencode.json"
-    _write(project_file, {"jev_settings": {"models": {"fast": "a/f"}, "enable_model_routing": True}})
-    monkeypatch.setattr(jev_engine, "_find_config_files", lambda: [project_file])
-    _reset_settings_cache()
-
-    settings = load_jev_settings()
-    assert settings["models"] == {"fast": "a/f"}
-    assert settings["enable_model_routing"] is True
 
 
 def test_an_edit_after_a_load_is_picked_up(project):

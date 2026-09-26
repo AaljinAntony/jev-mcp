@@ -1,10 +1,9 @@
 """Table-driven tests verifying identical envelope keys across all branches of every tool."""
 
 import json
-from pathlib import Path
 import pytest
 
-from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
+from typesafe_sdk import NoulAnswer
 import jev_engine
 
 
@@ -15,7 +14,7 @@ def _mock_env(monkeypatch):
 
 
 class TestFindAgentResourcesEnvelopeKeys:
-    def test_keys_identical_across_branches(self, tmp_path, monkeypatch):
+    def test_keys_identical_across_branches(self, tmp_path, stub_choice):
         # 1. No candidates branch (empty directory)
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
@@ -32,26 +31,8 @@ class TestFindAgentResourcesEnvelopeKeys:
         # 2. Match branch
         res_match = jev_engine.find_agent_resources("Skill 1", str(skills_dir))
 
-        # 3. No match branch (force mock response to pick "none" or nonexistent)
-        fitted_mock = {
-            "truncated": False,
-            "coverage": {
-                "complete": True,
-                "original_chars": 50,
-                "evaluated_chars": 50,
-                "estimated_tokens": {"state": 10, "questions": 5, "longest_question": 5},
-                "estimator": "chars/4",
-            },
-        }
-        cfg_mock = jev_engine.get_config()
-        no_match_response = SystemOneResponse(
-            model="jev-mock",
-            answers={
-                "primary": ChoiceAnswer(choice="none", probabilities={rel1: 0.05, "none": 0.95}, confidence=0.9),
-            },
-            usage=Usage(input_tokens=10, output_tokens=5),
-        )
-        monkeypatch.setattr(jev_engine, "_request", lambda s, q: (no_match_response, fitted_mock, cfg_mock))
+        # 3. No match branch (force the answer to `none`)
+        stub_choice("none", {rel1: 0.05, "none": 0.95})
         res_no_match = jev_engine.find_agent_resources("unknown", str(skills_dir))
 
         keys_no_candidates = set(res_no_candidates.keys())
@@ -106,7 +87,7 @@ class TestSkillEnvelopeHasNoDuplicates:
 
 
 class TestSelectTargetFilesEnvelopeKeys:
-    def test_keys_identical_across_branches(self, tmp_path, monkeypatch):
+    def test_keys_identical_across_branches(self, tmp_path, monkeypatch, stub_choice):
         # 1. No candidates branch (empty directory, git disabled)
         empty_dir = tmp_path / "empty_dir"
         empty_dir.mkdir()
@@ -123,27 +104,14 @@ class TestSelectTargetFilesEnvelopeKeys:
         # 2. Match branch
         res_match = jev_engine.select_target_files("find main", str(ws))
 
-        # 3. Escape-hatch branch (model selects "none")
-        fitted_mock = {
-            "truncated": False,
-            "coverage": {
-                "complete": True,
-                "original_chars": 50,
-                "evaluated_chars": 50,
-                "estimated_tokens": {"state": 10, "questions": 5, "longest_question": 5},
-                "estimator": "chars/4",
-            },
-        }
-        cfg_mock = jev_engine.get_config()
-        escape_response = SystemOneResponse(
-            model="jev-mock",
-            answers={
-                "target_file": ChoiceAnswer(choice="none", probabilities={"main.py": 0.1, "util.py": 0.1, "none": 0.8}, confidence=0.7),
-                "is_relevant": NoulAnswer(noul=0.1),
-            },
-            usage=Usage(input_tokens=10, output_tokens=5),
+        # 3. The `none` branch: the Choice declines and the presence Noul agrees.
+        stub_choice(
+            "none",
+            {"main.py": 0.1, "util.py": 0.1, "none": 0.8},
+            key="target_file",
+            confidence=0.7,
+            extra={"is_relevant": NoulAnswer(noul=0.1)},
         )
-        monkeypatch.setattr(jev_engine, "_request", lambda s, q: (escape_response, fitted_mock, cfg_mock))
         res_escape = jev_engine.select_target_files("find other", str(ws))
 
         keys_no_candidates = set(res_no_candidates.keys())
@@ -158,7 +126,7 @@ class TestSelectTargetFilesEnvelopeKeys:
 
 
 class TestSelectModelTierEnvelopeKeys:
-    def test_keys_identical_across_branches(self, monkeypatch):
+    def test_keys_identical_across_branches(self, monkeypatch, stub_choice):
         # 1. Routing off branch
         monkeypatch.setattr(
             jev_engine,
@@ -184,29 +152,12 @@ class TestSelectModelTierEnvelopeKeys:
         res_on = jev_engine.select_model_tier("fix typo")
 
         # 3. Routing on, low confidence (escalates)
-        fitted_mock = {
-            "truncated": False,
-            "coverage": {
-                "complete": True,
-                "original_chars": 50,
-                "evaluated_chars": 50,
-                "estimated_tokens": {"state": 10, "questions": 5, "longest_question": 5},
-                "estimator": "chars/4",
-            },
-        }
-        cfg_mock = jev_engine.get_config()
-        low_conf_response = SystemOneResponse(
-            model="jev-mock",
-            answers={
-                "tier": ChoiceAnswer(
-                    choice="balanced",
-                    probabilities={"fast": 0.33, "balanced": 0.34, "frontier": 0.33},
-                    confidence=0.1,
-                ),
-            },
-            usage=Usage(input_tokens=10, output_tokens=5),
+        stub_choice(
+            "balanced",
+            {"fast": 0.33, "balanced": 0.34, "frontier": 0.33},
+            key="tier",
+            confidence=0.1,
         )
-        monkeypatch.setattr(jev_engine, "_request", lambda s, q: (low_conf_response, fitted_mock, cfg_mock))
         res_low_conf = jev_engine.select_model_tier("ambiguous task")
 
         keys_disabled = set(res_disabled.keys())

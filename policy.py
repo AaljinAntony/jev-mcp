@@ -53,13 +53,15 @@ def score_mean_tolerance(levels: int) -> float:
 #: Backwards-compatibility alias for 3-level rubrics.
 SCORE_MEAN_TOLERANCE = score_mean_tolerance(3)
 
-#: Escape-hatch options appended to Choice criteria so the model can decline
-#: to pick a supplied candidate (jkudish `DECIDE_ESCAPE_HATCHES`).
-ESCAPE_HATCHES = {
-    "ask_user": "A consequential user preference or requirement is missing; ask instead of inventing it",
-    "investigate": "Gather missing technical or factual evidence before selecting a candidate",
-    "none": "None of the supplied candidates fits the known requirements",
-}
+# NOTE: the escape-hatch vocabulary ("ask_user" / "investigate" / "none") from
+# jkudish's `DECIDE_ESCAPE_HATCHES` used to live here as `ESCAPE_HATCHES`. It was
+# never read: only "none" was ever offered, and it is a `criteria` entry each tool
+# adds to its own Choice (see `search_target_files` and `AGENT_RESOURCE_
+# INSTRUCTIONS`). An unused dict invites the belief that asking the user or
+# investigating is enforced somewhere, and nothing in this file enforced it.
+# `ask_user` and `investigate` remain unimplemented on purpose: each new Choice
+# option changes the model's behaviour and needs the labelled routing set in
+# `scripts/eval_routing.py` re-run before it ships.
 
 
 def validate_policy_thresholds(auto_accept: float, review_at: float) -> None:

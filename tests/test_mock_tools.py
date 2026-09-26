@@ -713,14 +713,6 @@ class TestSettingsLookup:
             assert expected_script in candidates
             assert candidates.index(local_settings) < candidates.index(expected_script)
 
-    def test_find_config_files_includes_script_dir(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        candidates = jev_engine._find_config_files()
-        script_dir = Path(jev_engine.__file__).resolve().parent
-        expected = script_dir / "opencode.json"
-        if expected.exists():
-            assert expected in candidates
-
     def test_load_jev_settings_finds_script_dir_settings_from_different_cwd(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         settings = jev_engine.load_jev_settings()

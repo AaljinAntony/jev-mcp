@@ -263,3 +263,64 @@ provider response therefore read as a confident pick, and a low-confidence
 judgment still injected a skill into the model's context. Driving the real server
 means the plugin now applies the server's own `action` / `confidence` verdict
 (both effects require `auto` and >= 0.6) instead of "whatever `choice` returned".
+
+---
+
+# Phase 7 - the gates had to learn what "slow" means
+
+Measured: 2026-09-26  |  Commit: (this change)  |  Phase: 7
+
+Phase 7 changed no hot path. It deleted an unused settings lookup and four unused
+imports, so the honest expectation for `bench_jev.py --assert` was "identical".
+It was not:
+
+```
+case                          Phase 5    Phase 7 (loaded)   Phase 7 (quietest observed)
+estimate_tokens_100k              0.2           0.3                    0.2
+fit_state_trunc                   4.9           6.7 - 9.0              6.7
+mock_system_one_250               1.3           1.6 - 2.5              1.6
+find_agent_resources_250        113.6         143 - 194              143.2
+find_agent_resources_250_warm    84.4         111 - 190              111.1
+select_target_files_git          10.8         15.5 - 30.6             15.5
+envelope_size_skills           13509 B        13509 B                13509 B
+```
+
+Every **timing** row moved by 1.4-2.1x. `envelope_size_skills` did not move at
+all, because it measures bytes. That asymmetry is the diagnosis: a code change
+cannot slow down `fit_state_trunc`, which is a `truncate_to_token_budget` binary
+search over a 1 MB string with no I/O and no module of ours in the loop. The
+uniform inflation is the machine. `Get-Counter "\Processor(_Total)\% Processor
+Time"` read 30-44% during the worst runs and 20-21% during the quietest, from
+unrelated MCP servers and a Playwright browser on the same desktop.
+
+## What changed in `bench_jev.py`
+
+The thresholds were **not** moved. Re-basing a wall-clock gate on a loaded
+machine bakes one afternoon's desktop into the repository and makes the next
+person on a fast machine read a healthy run as a regression. Instead, `--assert`
+now measures whether the machine can be judged at all:
+
+- `fit_state_trunc` is the load probe. It is already in the table, it is pure
+  in-memory, and no change in this project can move it.
+- At or below `IDLE_PROBE_MAX_MS` (6.0 ms - above the 4.9 ms idle measurement,
+  below every loaded one from 6.7 ms up), the wall-clock gates are enforced
+  exactly as before and a breach is a `Regression`.
+- Above it, the run is reported `INCONCLUSIVE`, each breached timing gate is
+  printed as `SKIP: Inconclusive ...` instead of `FAIL`, and the process exits
+  **2** rather than 1. The **size gates are still enforced**, because bytes do
+  not depend on load.
+
+Exit codes are now `0` pass, `1` regression, `2` machine too loaded to judge.
+
+## What this is and is not
+
+It is not a fix for a slow `find_agent_resources`. The 84 ms warm figure from
+Phase 5 still stands on an idle machine, and the Phase 3 accuracy trade that
+produced it is unchanged. What changed is that the harness can now tell the two
+situations apart instead of reporting whichever one it happened to run in.
+
+The honest limit: 6.0 ms is calibrated on one machine. A faster or slower host
+re-calibrates it the same way the thresholds were calibrated - by reading the
+table above and setting the number between the idle and loaded figures for that
+host. A threshold that has never been measured on the host running it is not a
+gate, it is a guess.

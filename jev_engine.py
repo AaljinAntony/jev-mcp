@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 # Direct imports from the active virtual environment SDK
-from typesafe_sdk import TypeSafeClient, Choice, Noul, Score, RetryPolicy
+from typesafe_sdk import TypeSafeClient, Choice, Noul, RetryPolicy
 from typesafe_sdk import (
     TypeSafeAPIConnectionError,
     TypeSafeAPIError,
@@ -71,6 +71,13 @@ DEFAULT_SCAN_PATHS = [
 ]
 
 #: Maximum allowed length for any single tool parameter string.
+#: NOTE: this is a cap, not a fit. A 100k-character task is ~25k estimated
+#: tokens, which on its own can exceed MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS once
+#: the Choice criteria are large — and `fit_state` then truncates the state from
+#: the *right*, cutting the `candidates` tail rather than the task head. Truncating
+#: the task head-first would be better; it is left alone because no test has shown
+#: the head being lost, and a half-implemented truncation is worse than a
+#: documented one.
 MAX_INPUT_CHARS = 100_000
 
 
@@ -211,25 +218,6 @@ def _find_settings_files() -> List[Path]:
     return candidates
 
 
-def _find_config_files() -> List[Path]:
-    """Locate opencode.json candidates: project-level first, user-level last."""
-    candidates = []
-    for name in ("opencode.json", ".opencode/opencode.json"):
-        local = Path.cwd() / name
-        if local.exists():
-            candidates.append(local)
-    script_dir = Path(__file__).resolve().parent
-    if script_dir != Path.cwd().resolve():
-        for name in ("opencode.json", ".opencode/opencode.json"):
-            script_local = script_dir / name
-            if script_local.exists() and script_local not in candidates:
-                candidates.append(script_local)
-    user = Path.home() / ".config" / "opencode" / "opencode.json"
-    if user.exists():
-        candidates.append(user)
-    return candidates
-
-
 def _merge_jev_settings(settings: dict, jev: dict) -> bool:
     """Deep-merge one `jev_settings` dict onto `settings`. Returns True if it matched.
 
@@ -308,12 +296,16 @@ def load_jev_settings() -> dict:
     """Read Jev settings by merging every candidate file, user config first.
 
     Lookup order: <cwd>/jevs_settings.json -> <cwd>/.opencode/jevs_settings.json ->
-    ~/.config/opencode/jevs_settings.json -> legacy `jev_settings` block in
-    opencode.json (project > user). Discovery is unchanged; precedence is now
-    applied by *merging* the files in reverse discovery order, so a project file
-    overrides the user file per key instead of replacing it wholesale.
-    `source` is the last contributor (the project file, for display) and
-    `sources` lists everything that contributed.
+    <repo>/jevs_settings.json -> ~/.config/opencode/jevs_settings.json. Discovery
+    order is unchanged; precedence is applied by *merging* the files in reverse
+    discovery order, so a project file overrides the user file per key instead of
+    replacing it wholesale. `source` is the last contributor (the project file,
+    for display) and `sources` lists everything that contributed.
+
+    There is deliberately no `jev_settings` block in `opencode.json`: OpenCode's
+    `opencommand` schema is strict (`additionalProperties: false`), so an unknown
+    top-level key invalidates the whole config. A file that cannot be loaded is
+    not a settings source.
 
     Results are cached and only re-read when a candidate file's mtime changes.
     The returned dict is a fresh copy: callers cannot reach into the cache.
@@ -321,8 +313,7 @@ def load_jev_settings() -> dict:
     global _cached_settings, _cached_settings_mtimes
 
     settings_files = _find_settings_files()
-    config_files = _find_config_files()
-    current_mtimes = _get_files_mtime_signature(settings_files + config_files)
+    current_mtimes = _get_files_mtime_signature(settings_files)
 
     if _cached_settings is not None and _cached_settings_mtimes == current_mtimes:
         return _snapshot(_cached_settings)
@@ -337,9 +328,7 @@ def load_jev_settings() -> dict:
 
     # User-level config first, then project config, so the project overrides
     # the user and neither silently discards the other.
-    ordered = [(f, True) for f in reversed(settings_files)]
-    ordered += [(f, False) for f in reversed(config_files)]
-    for cfg, whole_file in ordered:
+    for cfg in reversed(settings_files):
         try:
             raw = json.loads(cfg.read_text(encoding="utf-8"))
         except Exception as e:
@@ -348,11 +337,8 @@ def load_jev_settings() -> dict:
             continue
         if not isinstance(raw, dict):
             continue
-        # A `jevs_settings.json` *is* the settings object. `opencode.json` is a
-        # full config, so only an explicit `jev_settings` block is read from it —
-        # never its unrelated top-level keys.
-        jev = raw if whole_file else (raw.get("jev_settings") if isinstance(raw.get("jev_settings"), dict) else {})
-        if _merge_jev_settings(settings, jev):
+        # A `jevs_settings.json` *is* the settings object.
+        if _merge_jev_settings(settings, raw):
             settings["source"] = str(cfg)
             settings["sources"].append(str(cfg))
 
@@ -360,7 +346,7 @@ def load_jev_settings() -> dict:
     # Re-stat after reading: a file edited between the signature and the read
     # must not leave a stale mtime paired with fresh content in the cache, which
     # would make the change invisible until the next edit.
-    _cached_settings_mtimes = _get_files_mtime_signature(settings_files + config_files)
+    _cached_settings_mtimes = _get_files_mtime_signature(settings_files)
     return _snapshot(settings)
 
 

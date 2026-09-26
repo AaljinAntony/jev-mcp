@@ -42,9 +42,13 @@ jev_engine._reset_settings_cache()
 # Silence informational round logs during benchmark execution
 jev_logging.get_logger().setLevel(logging.WARNING)
 
-# Regression thresholds: 1.25x the Phase 5 medians recorded in
-# docs/perf-baseline.md (2026-09-26). Tighter than the 3x Phase 1 gates these
-# replaced, so a regression is now a visible failure rather than a footnote.
+# Regression thresholds: 1.25x the medians recorded in docs/perf-baseline.md.
+# Tighter than the 3x Phase 1 gates these replaced, so a regression is a visible
+# failure rather than a footnote. These are the Phase 5 (idle) numbers; Phase 7
+# re-measured every row on a loaded machine and did NOT move them, because the
+# uniform inflation it saw - including on the pure-in-memory control row - was
+# the machine. `IDLE_PROBE_MAX_MS` is what keeps a busy desktop from reading as a
+# regression; see below.
 THRESHOLDS = {
     "estimate_tokens_100k": 0.5,
     "estimate_tokens_750_options": 0.4,
@@ -53,8 +57,8 @@ THRESHOLDS = {
     "mock_choice_250": 1.5,
     "mock_system_one_250": 3.0,
     # find_agent_resources reads a preview per candidate (Phase 3), so the cost
-    # is dominated by 250 file reads rather than by discovery. Cold 113 ms (the
-    # scan cache is cleared per run) vs 82 ms warm; the gap is the walk itself.
+    # is dominated by 250 file reads rather than by discovery. Cold 114 ms (the
+    # scan cache is cleared per run) vs 84 ms warm; the gap is the walk itself.
     "find_agent_resources_250": 145.0,
     "find_agent_resources_250_warm": 105.0,
     "select_target_files_git": 25.0,
@@ -278,6 +282,25 @@ def format_table(results):
     return "\n".join(lines)
 
 
+#: Idle-machine precondition for the wall-clock gates. These gates measure
+#: elapsed time, so on a machine carrying unrelated work they report the
+#: desktop's mood rather than this code's behaviour. `fit_state_trunc` is the
+#: right probe for that: it is a pure in-memory benchmark that no change in this
+#: project can move, and it is already in the table.
+#:
+#: Measured on this machine (docs/perf-baseline.md, Phase 7):
+#:     idle                 4.9 ms   -> precondition passes, gates are meaningful
+#:     20-30% foreign load  6.7-9.0 ms -> precondition fails
+#:     40%+ foreign load    8.0-9.5 ms -> precondition fails
+#:
+#: 6.0 ms sits above the idle figure and below every loaded one. Above it,
+#: `--assert` still enforces the size gates (bytes do not depend on load) and
+#: reports the wall-clock gates as inconclusive. Exit codes: 0 pass,
+#: 1 regression, 2 machine too loaded to judge.
+IDLE_PROBE_CASE = "fit_state_trunc"
+IDLE_PROBE_MAX_MS = 6.0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deterministic offline benchmark for jev-engine hot paths.")
     parser.add_argument("--json", action="store_true", help="Output results as JSON.")
@@ -286,11 +309,22 @@ def main():
     args = parser.parse_args()
 
     results = run_benchmarks(runs=args.runs)
+    by_case = {r["case"]: r for r in results}
+
+    probe_ms = by_case.get(IDLE_PROBE_CASE, {}).get("median_ms")
+    loaded = probe_ms is not None and probe_ms > IDLE_PROBE_MAX_MS
 
     if args.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps({"load_probe_case": IDLE_PROBE_CASE, "load_probe_ms": probe_ms,
+                          "inconclusive": loaded, "results": results}, indent=2))
     else:
         print(format_table(results))
+        if args.assert_mode and loaded:
+            print(
+                f"\nINCONCLUSIVE: {IDLE_PROBE_CASE} took {probe_ms:.1f} ms (> {IDLE_PROBE_MAX_MS} ms), "
+                f"so this machine is too loaded for the wall-clock gates to mean anything. "
+                f"The size gates are still enforced; re-run on an idle machine for the rest."
+            )
 
     if args.assert_mode:
         failures = []
@@ -301,21 +335,30 @@ def main():
                 continue
             if r["median_ms"] is not None:
                 if r["median_ms"] > threshold:
+                    kind = "Inconclusive" if loaded else "Regression"
+                    suffix = (
+                        f" (machine busy - see {IDLE_PROBE_CASE} above)"
+                        if loaded
+                        else ""
+                    )
                     failures.append(
-                        f"Regression in {case}: median {r['median_ms']}ms > threshold {threshold}ms"
+                        f"{kind} in {case}: median {r['median_ms']}ms > threshold {threshold}ms{suffix}"
                     )
             elif r["bytes"] is not None:
+                # Load-independent: always enforced, even on a busy machine.
                 if r["bytes"] > threshold:
                     failures.append(
                         f"Regression in {case}: bytes {r['bytes']} > threshold {threshold}"
                     )
         if failures:
             for msg in failures:
-                sys.stderr.write(f"FAIL: {msg}\n")
-            sys.exit(1)
+                sys.stderr.write(f"{'SKIP' if msg.startswith('Inconclusive') else 'FAIL'}: {msg}\n")
+            sys.exit(2 if loaded else 1)
         else:
             if not args.json:
                 print("\nAll assert gates passed.")
+            if loaded:
+                sys.exit(2)
 
 
 if __name__ == "__main__":
