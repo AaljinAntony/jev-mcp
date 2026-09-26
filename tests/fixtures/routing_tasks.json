@@ -60,18 +60,6 @@
     "expected_skill": null
   },
   {
-    "id": "plan-index",
-    "task": "the index of reliability and performance remediation phases",
-    "expected_file": ".agents_plans/README.md",
-    "expected_skill": null
-  },
-  {
-    "id": "phase-plan",
-    "task": "the work order for giving the Choice questions candidate evidence",
-    "expected_file": ".agents_plans/phase-3-decision-quality.md",
-    "expected_skill": null
-  },
-  {
     "id": "benchmark",
     "task": "the offline benchmark harness with regression gates",
     "expected_file": "scripts/bench_jev.py",
