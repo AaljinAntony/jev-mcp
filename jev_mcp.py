@@ -74,15 +74,24 @@ def guardrail_command(command: str) -> dict:
 
 
 @mcp.tool()
-def search_agent_skills(task: str, root_dir: str = ".") -> dict:
-    """Find and retrieve relevant agent skills, workflows, and memory markdown files for a given task."""
-    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
+def search_agent_skills(task: str, root_dir: str = ".", task_file: str = "") -> dict:
+    """Find and retrieve relevant agent skills, workflows, and memory markdown files for a given task.
+
+    `task_file` is an optional path to a file holding the real prompt (a saved
+    prompt or a plan); its head is read and judged alongside `task`. It is
+    confined to the same allowlist as `root_dir`.
+    """
+    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir, task_file=task_file or None), task=task, root_dir=root_dir, task_file=task_file or None)
 
 
 @mcp.tool()
-def search_target_files(task: str, root_dir: str = ".") -> dict:
-    """Identify which workspace files are relevant to a task using Jev AI evaluation."""
-    return _run("search_target_files", lambda: select_target_files(task=task, root_dir=root_dir), task=task, root_dir=root_dir)
+def search_target_files(task: str, root_dir: str = ".", task_file: str = "") -> dict:
+    """Identify which workspace files are relevant to a task using Jev AI evaluation.
+
+    `task_file` is an optional path to a file holding the real prompt; it is
+    confined to the same allowlist as `root_dir`.
+    """
+    return _run("search_target_files", lambda: select_target_files(task=task, root_dir=root_dir, task_file=task_file or None), task=task, root_dir=root_dir, task_file=task_file or None)
 
 
 @mcp.tool()

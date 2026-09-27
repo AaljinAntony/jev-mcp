@@ -80,6 +80,12 @@ DEFAULT_SCAN_PATHS = [
 #: documented one.
 MAX_INPUT_CHARS = 100_000
 
+#: Head-only read cap for `task_file`. A saved prompt or plan supplies the
+#: *question*, not the evidence: the judge reads the candidate files itself, so
+#: the summary and the headings at the top of the document are what matter. Read
+#: head-only so a 5 MB log named `plan.md` cannot turn into a 5 MB request.
+MAX_TASK_FILE_CHARS = 8_000
+
 
 def _check_input_length(name: str, value: str) -> None:
     """Reject oversized string inputs before expensive processing."""
@@ -87,6 +93,57 @@ def _check_input_length(name: str, value: str) -> None:
         raise JevValidationError(
             f"Parameter '{name}' is too long ({len(value):,} chars, limit {MAX_INPUT_CHARS:,})."
         )
+
+
+def _resolve_task_file(task_file: str, root: Path) -> Path:
+    """Resolve `task_file` under the same allowlist that governs `root_dir`.
+
+    An LLM-supplied path is an LLM-supplied `root_dir` with extra steps, so it
+    gets the identical treatment: relative paths resolve against `root`, and the
+    result must be a real file inside the session's own tree (CWD and its
+    ancestors) or inside `JEV_MCP_ALLOWED_ROOTS`. Nothing here is reachable that
+    `root_dir` would not already have allowed.
+    """
+    _check_input_length("task_file", task_file)
+    candidate = Path(task_file)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise JevValidationError(f"task_file '{task_file}' could not be resolved: {exc}")
+    if not resolved.is_file():
+        raise JevValidationError(f"task_file '{task_file}' does not exist or is not a file.")
+    if not any(resolved == base or _is_within(resolved, base) for base in _allowed_roots()):
+        raise JevValidationError(
+            f"task_file '{task_file}' is outside the allowed roots. "
+            "Pass a path inside the workspace, or set JEV_MCP_ALLOWED_ROOTS."
+        )
+    return resolved
+
+
+def _task_text(task: str, root: Path, task_file: Optional[str] = None) -> str:
+    """The question the judge answers: `task`, plus the head of `task_file`.
+
+    Both, never either: "do phase 2 of D:/plans/phase_2.md" is a real question
+    whose subject only exists in the file, and dropping the caller's words would
+    throw away the part they typed. The file is run through `markdown_preview`,
+    the same normaliser used for candidate evidence, so YAML front matter and
+    syntax noise do not spend question budget.
+    """
+    _check_input_length("task", task)
+    if not task_file:
+        return task
+    path = _resolve_task_file(task_file, root)
+    head = read_head(path, MAX_TASK_FILE_CHARS)
+    if looks_binary(head):
+        raise JevValidationError(f"task_file '{task_file}' looks like a binary file, not a prompt.")
+    body = markdown_preview(head, MAX_TASK_FILE_CHARS)
+    if not body:
+        raise JevValidationError(f"task_file '{task_file}' is empty or has no readable text.")
+    if not task.strip():
+        return f"Prompt from {path}:\n{body}"
+    return f"{task}\n\nPrompt from {path}:\n{body}"
 
 
 def _is_within(candidate: Path, base: Path) -> bool:
@@ -1012,9 +1069,14 @@ AGENT_RESOURCE_INSTRUCTIONS = (
 )
 
 
-def find_agent_resources(task: str, root_dir: str = ".", max_matches: int = 5) -> dict:
-    _check_input_length("task", task)
+def find_agent_resources(
+    task: str,
+    root_dir: str = ".",
+    max_matches: int = 5,
+    task_file: Optional[str] = None,
+) -> dict:
     root = _validate_root_dir(root_dir)
+    task = _task_text(task, root, task_file)
     search_dirs = get_scan_paths(root)
 
     candidate_files, discovery_truncated = _discover_markdown(root, search_dirs)
@@ -1428,9 +1490,14 @@ def _preview_criteria(root: Path, candidates: List[str]):
     return criteria, previews_built, previews_skipped, original_chars
 
 
-def select_target_files(task: str, root_dir: str = ".", max_results: int = 5) -> dict:
-    _check_input_length("task", task)
+def select_target_files(
+    task: str,
+    root_dir: str = ".",
+    max_results: int = 5,
+    task_file: Optional[str] = None,
+) -> dict:
     root = _validate_root_dir(root_dir)
+    task = _task_text(task, root, task_file)
     ignore_dirs = {".git", ".godot", ".import", ".venv", "node_modules", "dist", "build"}
     ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".wav", ".ogg", ".mp3", ".ttf", ".import", ".zip"}
 
@@ -1603,7 +1670,7 @@ def select_model_tier(task: str) -> dict:
 # ----------------------------------------------------------------------
 def _cli_dispatch(argv) -> int:
     if len(argv) < 2:
-        print(json.dumps({"error": {"code": "USAGE", "message": "Usage: python jev_engine.py [verify|resource|files] [args...]", "retryable": False}}))
+        print(json.dumps({"error": {"code": "USAGE", "message": "Usage: python jev_engine.py [verify|resource|files] [args...] (resource/files: <task> [root_dir] [task_file])", "retryable": False}}))
         return 1
     action = argv[0].lower()
     try:
@@ -1611,10 +1678,12 @@ def _cli_dispatch(argv) -> int:
             print(json.dumps(verify_command(argv[1])))
         elif action in ["resource", "find_resource"]:
             root_path = argv[2] if len(argv) > 2 else "."
-            print(json.dumps(find_agent_resources(argv[1], root_path)))
+            task_file = argv[3] if len(argv) > 3 else None
+            print(json.dumps(find_agent_resources(argv[1], root_path, task_file=task_file)))
         elif action in ["files", "target_files"]:
             root_path = argv[2] if len(argv) > 2 else "."
-            print(json.dumps(select_target_files(argv[1], root_path)))
+            task_file = argv[3] if len(argv) > 3 else None
+            print(json.dumps(select_target_files(argv[1], root_path, task_file=task_file)))
         elif action in ["tier", "model_tier"]:
             print(json.dumps(select_model_tier(argv[1])))
         else:
