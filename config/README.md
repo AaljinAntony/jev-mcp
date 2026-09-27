@@ -230,7 +230,12 @@ are behavioural, and these are the two that have actually happened:
   - `~\.config\opencode\logs\jev-plugin.log` — hook fired? `client started`?
     per-tool `action`/`confidence`? injected or skipped, and why? A second
     message must **not** log a second `client started`: that is the
-    connection-reuse proof.
+    connection-reuse proof. A parallel window that logs
+    `skip: 3 jev queries already in flight` is at the concurrency cap, and
+    `result dropped: superseded by a newer message` is the per-session
+    staleness guard doing its job — neither is an error.
+    `no skill to inject: action=auto confidence=0.99 primary=none` means the
+    judge answered "nothing here applies", not that the plugin failed.
   - `<repo>\logs\jev_engine.log` — was the tool even invoked? current tool call, duration, envelope.
 - Reproduce a tool failure over the real transport (same as opencode) with:
 
@@ -270,7 +275,9 @@ To set a project-specific default, add it back:
     "balanced": "",
     "frontier": ""
   },
-  "scan_paths": []                  // extra skill dirs, appended to the defaults
+  "scan_paths": [],                 // extra skill dirs, appended to the defaults
+  "judge_read_prompts": true,       // PLUGIN: judge a prompt file the agent reads
+  "inject_agent_instructions": true // PLUGIN: state the decision points every turn
 }
 ```
 
@@ -294,6 +301,9 @@ To set a project-specific default, add it back:
   already inside another configured scan path (the built-in `.agents` covers
   `.agents/skills`, `.agents/workflows` and `.agents/memory`) is collapsed to the
   ancestor, so those files are walked once instead of four times.
+- `judge_read_prompts` and `inject_agent_instructions` are read by the **plugin
+  only**, are **on by default**, and are disabled only by an explicit `false` — a
+  typo must not be able to switch the judge off.
 - `models` entries **union** non-empty values across files, so a project can add
   a tier without deleting the user's others. An explicit `""` **removes** an
   inherited tier — that is how a tier is disabled, and it is no longer
@@ -313,11 +323,18 @@ fine: if the tier Jev picks has no ID, nothing is switched and the hook logs why
 queries. When routing is **off** (the default), nothing is changed and opencode
 uses its `"model"` config / window-selected model.
 
-Both the switch and the skill injection require the server to return
-`action: "auto"` with `confidence >= 0.6`, a well-formed `provider/model` id, and
-an existing `output.message.model`. A `review` or `escalate` decision changes
-nothing — the hook logs why, and opencode carries on with the window model and no
-injected skill.
+The two effects have **different** gates, which is the part worth remembering:
+
+| effect | gate | why |
+|---|---|---|
+| skill injection | `action` is `auto` **or** `review`, and `confidence >= 0.6` | a skill note is advisory text in the user's own message, not an action |
+| model switch | `action` is `auto` and `confidence >= 0.6`, plus a well-formed `provider/model` id and an existing `output.message.model` | moving the model changes how the reply is produced, so it takes the server's unreserved verdict |
+
+Requiring `auto` for the injection, as this plugin used to, made the documented 0.6
+floor unreachable: the server only says `auto` at `JEV_MCP_AUTO_ACCEPT` (0.8), so
+the real bar was 0.8 and every decision in between was dropped without a trace.
+`escalate` is refused by both — below `JEV_MCP_REVIEW_AT` (0.5) the model is
+guessing among options that do not fit.
 
 ## Security
 

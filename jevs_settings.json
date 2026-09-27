@@ -5,5 +5,7 @@
     "balanced": "",
     "frontier": ""
   },
-  "scan_paths": []
+  "scan_paths": [],
+  "judge_read_prompts": true,
+  "inject_agent_instructions": true
 }

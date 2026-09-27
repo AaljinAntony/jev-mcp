@@ -243,7 +243,7 @@ Pre-execution audit for shell commands.
 
 Scans workspace agent docs and returns only relevant Markdown, inlining up to 6,000 chars per resource.
 
-- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots)
+- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots), `task_file` (optional — a saved prompt; see [Saved prompts as a file](#saved-prompts-as-a-file))
 - **Scan dirs:** `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`, `skills`, `.agents` **plus** any extras from `jevs_settings.scan_paths`
 - **Jev primitive:** `primary` (`Choice`, one question). `criteria` carry each document's own summary — a `SKILL.md` contributes its front-matter `description` — not its filename, so the options are actually distinguishable. `ranked` comes from `primary.probabilities`, which is the full ranking; there are no `secondary`/`tertiary` duplicates.
 - **Key capabilities:** sibling expansion (probability ≥ 0.12), sibling-prefix clustering (e.g. `godot-ui-*`) but only when `primary_probability >= 0.5` and for at most 2 siblings
@@ -275,7 +275,7 @@ third and fourth time in the same JSON document. Read `result["primary"]["file"]
 
 Filters the repo tree down to task-relevant files.
 
-- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots)
+- **Params:** `task` (required), `root_dir` (default `.`, confined to the allowed roots), `task_file` (optional — a saved prompt; see [Saved prompts as a file](#saved-prompts-as-a-file))
 - **Exclusions:** `.git`, `.godot`, `.import`, `.venv`, `node_modules`, `dist`, `build` + media/binary extensions (`.png`, `.jpg`, `.wav`, `.mp3`, `.zip`, ...)
 - **Jev primitives:** `target_file` (`Choice`, `criteria={path: <path + head of file>}`) **and** `is_relevant` (`Noul`). Two independent questions over the same state, one request. The Noul is what stops a forced winner among poor options from reading as a match.
 - **Cost bounds:** at most `MAX_PREVIEW_READS` (120) file reads and `MAX_TOTAL_PREVIEW_CHARS` (40 000) preview characters per call; candidates past the bound keep their path alone and are counted in `coverage.candidate_fields.previews_skipped`.
@@ -329,6 +329,30 @@ Analyzes task complexity and assigns a tier. **Gated by `jevs_settings.enable_mo
 Low-confidence or truncated judgments report `action: "escalate"` while
 keeping `recommended_tier` unchanged.
 
+### Saved prompts as a file
+
+`search_agent_skills` and `search_target_files` take an optional `task_file`: the
+path to a prompt or plan kept on disk, which is the normal shape of a long
+task. Without it the judge is handed the *path* — "do phase 2 of
+`.agent_plans/phase_2.md`" — and has no statement of the task to reason from, so
+it ranks whatever it has at a low confidence and nothing is injected.
+
+```jsonc
+// "do phase 2" + the file's text become the question that is judged
+{ "task": "do phase 2", "root_dir": ".", "task_file": ".agent_plans/phase_2.md" }
+```
+
+- The file is read by the **engine**, never by the plugin: all IO policy stays in one place.
+- It is confined exactly like `root_dir` — resolved against `root_dir`, then required to be inside the CWD (and its ancestors) or `JEV_MCP_ALLOWED_ROOTS`, with symlinks resolved first. An LLM-supplied path is an LLM-supplied `root_dir` with extra steps.
+- Read head-only to `MAX_TASK_FILE_CHARS` (8 000) and passed through `markdown_preview`, so front matter and syntax noise do not spend question budget. Binary, empty, missing and directory paths are refused with `INVALID_INPUT`.
+- `task` and the file are **combined**, never swapped: "do phase 2 of X" is a real question whose subject only exists in the file.
+
+The plugin wires this up on its own: when the agent *reads* a `.md` / `.txt` /
+`.markdown` / `.prompt` / `.plan` file inside the workspace, the judge runs
+against that file and the ranking is appended to the tool result (see
+[How it works](#how-it-works)). Repeated reads of an unchanged file are
+memoised, so this costs one round trip per file, not one per read.
+
 ---
 
 ## Configuration — `jevs_settings.json` (per project)
@@ -366,7 +390,9 @@ that key is part of the schema.)
     "balanced": "",
     "frontier": ""
   },
-  "scan_paths": []        // <-- extra skill dirs, appended to the defaults
+  "scan_paths": [],       // <-- extra skill dirs, appended to the defaults
+  "judge_read_prompts": true,         // <-- plugin only: judge a prompt file the agent reads
+  "inject_agent_instructions": true   // <-- plugin only: state the decision points every turn
 }
 ```
 
@@ -377,6 +403,12 @@ that key is part of the schema.)
 | `enable_model_routing` | bool | Master switch. **Off** (default) = no Jev model call, opencode uses its `"model"` config / window-selected model. **On** = the plugin asks Jev the tier and **forces** the switch per task. |
 | `models` | `{fast, balanced, frontier}` | Tier → `"provider/model-id"` mapping applied by the plugin. Values **union** across files; an explicit `""` removes an inherited tier. |
 | `scan_paths` | `[relative path]` | **Additive** extras to the default skill dirs, unioned across files and deduplicated on load. |
+| `judge_read_prompts` | bool | **Plugin only.** **On** (default) = when the agent reads a prompt-shaped file in the workspace, judge it and append the ranking to the tool result. Only an explicit `false` turns it off. |
+| `inject_agent_instructions` | bool | **Plugin only.** **On** (default) = append the "where to ask Jev" rules block to the system prompt every turn. Only an explicit `false` turns it off. |
+
+The last two are read by the plugin, not the server, and both compare against
+`false` rather than testing truthiness: a typo (`"flase"`, `0`, `null`) must not
+be able to switch the judge off.
 
 Everything is optional; a missing/invalid file falls back to defaults (routing off,
 empty models, built-in scan dirs `.agents/skills`, `.agents/workflows`,
@@ -493,10 +525,47 @@ $env:JEV_PLUGIN_SCAN_ROOTS="$env:USERPROFILE\.config\opencode\skills"
 which the plugin forwards to the server as `JEV_MCP_ALLOWED_ROOTS`, so both sides
 agree on what may be read.
 
-**Resilience.** One in-flight query per session (a concurrent message is skipped
-and logged, not queued — a stale injection is worse than none), a 3-failure /
-60-second circuit breaker mirroring the server's own, per-request timeouts, an
-idle shutdown, and support for aborting a message the user cancelled.
+**Resilience.** Up to 3 messages are judged at once, so parallel opencode windows
+and parallel subagents no longer queue behind one lock (it used to be a single
+`busy` boolean, and the second window simply got nothing). What the lock was
+really protecting — never injecting a decision for a message the user has already
+moved past — is now tracked per session: the hook records the newest message per
+`sessionID` and drops a stale result as superseded. A message past the cap is
+skipped and logged, never queued. On top of that: a 3-failure / 60-second circuit
+breaker mirroring the server's own, per-request timeouts, an idle shutdown, and
+owner-scoped aborts, so cancelling one message cannot destroy another session's
+in-flight work.
+
+**Three hooks, not one.** The plugin registers `chat.message`,
+`tool.execute.after` and `experimental.chat.system.transform`, because the three
+jobs need three different moments:
+
+| hook | what it does | why there |
+|---|---|---|
+| `chat.message` | judges the prompt, injects the winning skill, applies a model switch | the only hook whose payload is the user message, so the only place a skill can be injected and the only place the model can be changed |
+| `tool.execute.after` | when the agent reads a `.md`/`.txt`/`.markdown`/`.prompt`/`.plan` file in the workspace, judges *that file* and appends the ranking to the tool result | the prompt-in-a-file case: at `chat.message` the file has not been read yet, so the judge had only its path |
+| `experimental.chat.system.transform` | appends a short "where to ask" rules block to the system prompt every turn | the plugin can judge and advise but cannot make the agent act; this is the only place the agent reads instructions in every workspace at once |
+
+Two constraints shape what those hooks may do, both verified against the host
+rather than assumed:
+
+- **A hook's return value is discarded.** `Plugin.trigger` returns the *same*
+  object it was handed, so every effect has to be an in-place mutation of the
+  payload. Nothing is ever returned and relied upon.
+- **A pushed message part crashes the session.** opencode validates every part
+  against PartV2 when it saves the message, and a bare `{type:"text", text}`
+  fails hard enough to stop the task. So nothing is pushed anywhere: the user
+  message's existing text part is mutated, and the tool result's last existing
+  text part is *replaced by a copy of itself* with a longer `text`, keeping every
+  id, `messageID`, `sessionID` and `synthetic` flag the host put there.
+
+The read judge is memoised per `(session, path, size, mtime)`, so re-reading a
+file for a grep hit or a failed edit costs nothing while an edited file is judged
+again, and it stays silent when the judge says `none` or is under the floor.
+
+Two settings, both **on by default** in `jevs_settings.json` and both disabled
+only by an explicit `false` (a typo must not silently switch the judge off):
+`judge_read_prompts` and `inject_agent_instructions`.
 
 All errors are caught and logged ("Execution bypassed safely") — the hook never
 crashes OpenCode. The plugin log rotates at 2 MB and records a prompt's **length
@@ -505,6 +574,19 @@ and digest only**, never its text.
 The hook always passes the working directory as `root_dir`, which the server
 confines to the process CWD and its ancestors. Skills kept outside the workspace
 only become reachable through `JEV_MCP_ALLOWED_ROOTS` above.
+
+Two consequences worth knowing before you run several windows at once:
+
+- **`cwd`, not the session's directory.** The `chat.message` payload carries
+  `{sessionID, agent, model, messageID, variant}` and no directory, so the
+  plugin has nothing better than `process.cwd()`. A session that is asked about a
+  *different* project than the one opencode was started in will search the
+  launch directory. `JEV_MCP_ALLOWED_ROOTS` widens what the server will accept;
+  it does not change what the plugin searches.
+- **The guardrail is advisory.** This build of opencode has no `permission.ask`
+  plugin hook, so a plugin cannot deny a tool call — it can only judge and tell
+  the agent. Making a destructive command *impossible* needs an opencode
+  permission rule or a wrapper, not this plugin.
 
 ---
 
