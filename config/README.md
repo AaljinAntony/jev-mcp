@@ -64,17 +64,24 @@ Rules that follow from that:
      "D:/mcp/jev-typesafe-mcp/jev_mcp.py"
    ]
    ```
-   - `"environment"` uses `"{env:TYPESAFE_API_KEY}"` interpolation, so
-     `TYPESAFE_API_KEY` must be set in your shell environment (see step 3).
+   - Do **not** put `TYPESAFE_API_KEY` in `"environment"`. opencode resolves
+     `"TYPESAFE_API_KEY": "{env:TYPESAFE_API_KEY}"` to an **empty string** when
+     that variable is missing from its own environment, and it passes the empty
+     string to the child — which then shadows the repo `.env` and every live
+     tool call fails with `TYPESAFE_API_KEY environment variable is not
+     configured`. The server finds `.env` relative to its own module, so no
+     `environment` entry is needed for the key in any workspace.
 
    > OpenCode's `opencommand` schema is strict (`additionalProperties: false`):
    > unknown top-level keys (e.g. a `jev_settings` block) invalidate the **whole**
    > config and the MCP server silently disappears from `list`. Never add Jev
    > settings inside `opencode.json`.
 
-3. **Configure the API key.** Two equivalent options:
-   - Set `TYPESAFE_API_KEY` in your environment (used by the `"{env:TYPESAFE_API_KEY}"` interpolation), **or**
-   - Create `.env` in the repo from `.env.example` (`Copy-Item .env.example .env`) — the server loads it as a fallback.
+3. **Configure the API key.** Create `.env` in the repo from `.env.example`
+   (`Copy-Item .env.example .env`). The server loads it at startup, relative to
+   its own module, so the key resolves in every workspace. A `TYPESAFE_API_KEY`
+   already present in the server's environment still wins — a blank one is
+   treated as absent.
 
 ### Antigravity IDE setup
 

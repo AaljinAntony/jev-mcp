@@ -182,7 +182,17 @@ timeout: it is passed as the SDK retry policy's total limit, and each attempt is
 clamped to whatever remains of it, so a call cannot take 3× the configured
 value. The same deadline is applied in mock mode, which is CPU-bound.
 
-Both `jev_engine.py` and `jev_mcp.py` load `.env` via `python-dotenv` with `override=False` (relative to the file's parent directory). Because the MCP config already injects `TYPESAFE_API_KEY`, injected variables take precedence and the `.env` file acts as a reliable fallback.
+`jev_engine.py` and `jev_mcp.py` load `.env` with `python-dotenv`, relative to the
+module's own directory — never the working directory, so the server behaves
+identically in every workspace. An injected value always wins over the file, so a
+stale `.env` cannot override the MCP `environment` block. The one exception is a
+*blank* injected value: opencode resolves `"TYPESAFE_API_KEY":
+"{env:TYPESAFE_API_KEY}"` to an empty string whenever that variable is missing
+from its own environment, and `python-dotenv` treats "already present" as
+authoritative even for `""` — which made every live call fail with
+`TYPESAFE_API_KEY environment variable is not configured`. Leave the key out of
+the `environment` block (as `config/opencode.example.json` now does) and let the
+`.env` provide it; a blank value is healed either way.
 
 ### Is this installation healthy?
 
@@ -463,9 +473,9 @@ the steady-state cost per message is one HTTPS round trip on a warm pooled
 connection — no interpreter start, no SDK import. See `docs/perf-baseline.md`.
 
 **The API key is never read by the plugin.** The server loads `TYPESAFE_API_KEY`
-from its own env or `.env`, and the MCP `environment` block injects it. That
-removes the plugin's `.env` regex, which used to capture a quoted key *with* its
-quotes — a guaranteed 401.
+from its own env or `.env` — the plugin forwards `process.env` untouched and adds
+no key of its own. That removes the plugin's `.env` regex, which used to capture
+a quoted key *with* its quotes — a guaranteed 401.
 
 **The plugin is not trusted with paths it was handed.** `scan_paths` comes from
 `jevs_settings.json`, which is documented as safe to commit and share. Resolved

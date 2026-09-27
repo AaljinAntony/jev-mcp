@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
@@ -59,43 +60,73 @@ class TestEnsureDotenv:
     """Tests for Task 8C: Idempotent dotenv loading."""
 
     def test_ensure_dotenv_does_not_override(self, monkeypatch):
-        called = {}
-
-        def mock_load_dotenv(**kwargs):
-            called.update(kwargs)
-            return True
-
-        import dotenv
-        monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
+        monkeypatch.delenv("JEV_MCP_MOCK", raising=False)
         monkeypatch.setattr(Path, "exists", lambda self: True)
+        import dotenv
+        monkeypatch.setattr(
+            dotenv, "dotenv_values", lambda **kwargs: {"JEV_MCP_MOCK": "1"}
+        )
+        # An authoritative injected value must survive: the MCP `environment`
+        # block wins over the file, so a stale .env cannot flip the live judge
+        # to the mock one.
+        monkeypatch.setenv("JEV_MCP_MOCK", "0")
         res = ensure_dotenv()
-        assert res is True
-        assert called.get("override") is False
+        assert res is False
+        assert os.environ["JEV_MCP_MOCK"] == "0"
 
     def test_ensure_dotenv_passes_env_path_when_exists(self, monkeypatch):
         called = {}
 
-        def mock_load_dotenv(**kwargs):
+        def mock_dotenv_values(**kwargs):
             called.update(kwargs)
-            return True
+            return {}
 
         import dotenv
-        monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
+        monkeypatch.setattr(dotenv, "dotenv_values", mock_dotenv_values)
         monkeypatch.setattr(Path, "exists", lambda self: True)
         ensure_dotenv()
-        assert called.get("override") is False
         assert "dotenv_path" in called
         assert called["dotenv_path"].name == ".env"
+
+    def test_ensure_dotenv_heals_blank_injected_value(self, monkeypatch):
+        """A blank injected value must not shadow the .env.
+
+        opencode resolves `"TYPESAFE_API_KEY": "{env:TYPESAFE_API_KEY}"` to an
+        empty string when the variable is missing from its own environment, and
+        `load_dotenv(override=False)` treats "already present" as authoritative
+        even for `""` — so the file could never take effect and every live call
+        failed with CONFIG_ERROR.
+        """
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        import dotenv
+        monkeypatch.setattr(
+            dotenv, "dotenv_values", lambda **kwargs: {"TYPESAFE_API_KEY": "key-from-file"}
+        )
+        monkeypatch.setenv("TYPESAFE_API_KEY", "")
+        assert ensure_dotenv() is True
+        assert os.environ["TYPESAFE_API_KEY"] == "key-from-file"
+
+    def test_ensure_dotenv_heals_whitespace_injected_value(self, monkeypatch):
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        import dotenv
+        monkeypatch.setattr(
+            dotenv, "dotenv_values", lambda **kwargs: {"TYPESAFE_API_KEY": "key-from-file"}
+        )
+        monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+        assert ensure_dotenv() is True
+        assert os.environ["TYPESAFE_API_KEY"] == "key-from-file"
 
     def test_ensure_dotenv_skips_when_missing(self, monkeypatch):
         called = {}
 
-        def mock_load_dotenv(**kwargs):
+        def mock_dotenv_values(**kwargs):
             called.update(kwargs)
-            return True
+            return {}
 
         import dotenv
-        monkeypatch.setattr(dotenv, "load_dotenv", mock_load_dotenv)
+        monkeypatch.setattr(dotenv, "dotenv_values", mock_dotenv_values)
         monkeypatch.setattr(Path, "exists", lambda self: False)
         res = ensure_dotenv()
         assert res is False

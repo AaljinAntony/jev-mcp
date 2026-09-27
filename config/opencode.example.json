@@ -9,7 +9,6 @@
         "<REPO_DIR>/jev_mcp.py"
       ],
       "environment": {
-        "TYPESAFE_API_KEY": "{env:TYPESAFE_API_KEY}",
         "JEV_MCP_MODEL": "jev-latest",
         "JEV_MCP_TIMEOUT_MS": "30000",
         "JEV_MCP_MOCK": "0",

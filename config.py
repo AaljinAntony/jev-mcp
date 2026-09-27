@@ -24,19 +24,43 @@ DEFAULT_AUTH_COOLDOWN_S = 300.0
 def ensure_dotenv() -> bool:
     """Load the repo `.env` as a *fallback* only. Returns True if a file was loaded.
 
-    `override=False` is essential: opencode injects TYPESAFE_API_KEY and the
-    JEV_MCP_* knobs through the MCP `environment` block, and those are the
-    authoritative source. A stale `.env` must never win — least of all
-    JEV_MCP_MOCK, which would silently replace live decisions with the mock judge.
+    An injected value always wins over `.env` — a stale `.env` must never
+    override the authoritative MCP `environment` block, least of all
+    JEV_MCP_MOCK, which would silently replace live decisions with the mock
+    judge.
+
+    A *blank* injected value is the one exception, and it is not a corner case:
+    opencode resolves `"TYPESAFE_API_KEY": "{env:TYPESAFE_API_KEY}"` to `""`
+    whenever that variable is missing from its own environment, and hands the
+    empty string to the child. `load_dotenv(override=False)` treats "already
+    present" as authoritative even for an empty value, so the `.env` key could
+    never take effect and every live tool call failed with
+    "TYPESAFE_API_KEY environment variable is not configured" — in every
+    workspace, since the file is found relative to this module, not the CWD.
+
+    So a variable is only "already set" when it holds something other than
+    whitespace.
     """
     try:
-        from dotenv import load_dotenv
+        from dotenv import dotenv_values
     except ImportError:
         return False
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return False   # never search upward from an unrelated CWD
-    return bool(load_dotenv(dotenv_path=env_path, override=False))
+    try:
+        values = dotenv_values(dotenv_path=env_path)
+    except OSError:
+        return False
+    applied = False
+    for key, value in values.items():
+        if value is None:
+            continue
+        if (os.environ.get(key) or "").strip():
+            continue    # a real injected value stays authoritative
+        os.environ[key] = value
+        applied = True
+    return applied
 
 
 @dataclass(frozen=True)
