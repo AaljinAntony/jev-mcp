@@ -12,6 +12,8 @@
  *   STUB_CHUNKS          {method: [piece, ...]} written raw, with a short delay
  *                        between pieces (the framing test)
  *   STUB_HANG=1          never answer tools/call
+ *   STUB_DELAY_MS=N      answer tools/call after N ms, so a test can hold several
+ *                        requests in flight at once
  *   STUB_EXIT_ON_CALL=1  exit(1) instead of answering tools/call
  *
  * Run: node scripts\stub_mcp.js  (normally spawned by the test, not by hand)
@@ -89,8 +91,16 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    const response = answer(msg);
-    if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+  const response = answer(msg);
+  if (!response) continue;
+  // An optional delay, so a test can keep more than one request open at a time
+  // and prove the client (and the plugin's concurrency cap) handle it.
+  const delay = Number(process.env.STUB_DELAY_MS || 0);
+  if (Number.isFinite(delay) && delay > 0) {
+    setTimeout(() => process.stdout.write(`${JSON.stringify(response)}\n`), delay);
+  } else {
+    process.stdout.write(`${JSON.stringify(response)}\n`);
+  }
   }
 });
 

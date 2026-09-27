@@ -409,7 +409,7 @@ await test("the circuit breaker opens after 3 consecutive failures", async () =>
     assert.ok(log.some((l) => l.startsWith("circuit breaker opened")), "logged the breaker");
     const callsSoFar = log.filter((l) => l.includes("failed: boom")).length;
     const res = await runQueries(client, { task: "x", cwd, wantTier: false });
-    assert.deepStrictEqual(res, {}, "an open breaker short-circuits");
+    assert.strictEqual(res, null, "an open breaker short-circuits, distinctly from a decision");
     assert.strictEqual(
       log.filter((l) => l.includes("failed: boom")).length,
       callsSoFar,
@@ -432,32 +432,114 @@ await test("a success closes the breaker again", () => {
     client.stop("test end");
   }
 });
-await test("runQueries returns decisions and never throws", async () => {
+await test("runQueries returns decisions and releases the in-flight slot", async () => {
   const skills = { action: "auto", confidence: 0.9, primary: { file: "a.md", content: "x" } };
   const { client } = newClient({ STUB_CHUNKS: null, STUB_BODY: JSON.stringify(skills) });
   try {
     const res = await withTimeout(runQueries(client, { task: "x", cwd, wantTier: false }), 5000, "runQueries");
     assert.strictEqual(res.skillsRes.primary.file, "a.md");
     assert.strictEqual(res.tierRes, null, "no tier call when routing is off");
-    assert.strictEqual(client.busy, false, "the in-flight guard is released");
+    assert.strictEqual(client.inFlight, 0, "the in-flight slot is released");
   } finally {
     client.stop("test end");
   }
 });
-await test("a second message while one is in flight is skipped, not queued", async () => {
-  const { client, log } = newClient({ STUB_HANG: "1" });
+await test("two sessions are judged at once, not serialised behind one lock", async () => {
+  // This is the parallel-opencode regression: a single `busy` boolean made the
+  // second window log "already in flight" and never get a decision.
+  const skills = { action: "auto", confidence: 0.9, primary: { file: "a.md", content: "x" } };
+  const { client, log } = newClient({ STUB_BODY: JSON.stringify(skills), STUB_DELAY_MS: "250" });
   try {
-    const first = runQueries(client, { task: "x", cwd, wantTier: false });
-    await sleep(150);
-    assert.strictEqual(client.busy, true, "the first call holds the guard");
-    const second = await runQueries(client, { task: "y", cwd, wantTier: false });
-    assert.deepStrictEqual(second, {}, "the concurrent call is skipped");
-    assert.ok(log.some((l) => l.includes("already in flight")), "logged the skip");
-    client.stop("test end");
-    await first;
+    const results = await withTimeout(
+      Promise.all([
+        runQueries(client, { task: "one", cwd, wantTier: false, turn: P.beginTurn("sess-a") }),
+        runQueries(client, { task: "two", cwd, wantTier: false, turn: P.beginTurn("sess-b") }),
+      ]),
+      5000,
+      "two concurrent queries"
+    );
+    for (const res of results) {
+      assert.ok(res, "neither query was skipped");
+      assert.strictEqual(res.skillsRes.primary.file, "a.md");
+    }
+    assert.strictEqual(client.inFlight, 0, "both slots released");
+    assert.ok(
+      !log.some((l) => l.includes("already in flight")),
+      "no contention was reported"
+    );
   } finally {
     client.stop("test end");
   }
+});
+await test("concurrency past the cap is skipped and logged, never queued", async () => {
+  const skills = { action: "auto", confidence: 0.9, primary: { file: "a.md", content: "x" } };
+  const { client, log } = newClient({ STUB_BODY: JSON.stringify(skills), STUB_DELAY_MS: "400" });
+  try {
+    const cap = P.MAX_CONCURRENT_QUERIES;
+    const started = [];
+    for (let i = 0; i < cap; i += 1) {
+      started.push(runQueries(client, { task: `t${i}`, cwd, wantTier: false, turn: P.beginTurn(`sess-${i}`) }));
+    }
+    await sleep(150);
+    assert.strictEqual(client.inFlight, cap, "the cap is exactly what is running");
+    const overflow = await withTimeout(
+      runQueries(client, { task: "overflow", cwd, wantTier: false, turn: P.beginTurn("sess-x") }),
+      5000,
+      "overflow query"
+    );
+    assert.strictEqual(overflow, null, "the message past the cap is skipped");
+    assert.ok(
+      log.some((l) => l.includes(`${cap} jev queries already in flight`)),
+      "the skip says how many are running"
+    );
+    await withTimeout(Promise.all(started), 5000, "the capped queries");
+  } finally {
+    client.stop("test end");
+  }
+});
+await test("an aborted message does not destroy another session's work", async () => {
+  // abort() used to reject every pending request and kill the child, which was
+  // only survivable while a single message could be in flight.
+  const skills = { action: "auto", confidence: 0.9, primary: { file: "a.md", content: "x" } };
+  const { client, log } = newClient({ STUB_BODY: JSON.stringify(skills), STUB_DELAY_MS: "300" });
+  try {
+    const mine = P.beginTurn("sess-mine");
+    const theirs = P.beginTurn("sess-theirs");
+    const myQuery = runQueries(client, { task: "mine", cwd, wantTier: false, turn: mine });
+    const theirQuery = runQueries(client, { task: "theirs", cwd, wantTier: false, turn: theirs });
+    // Wait for the request to be genuinely pending: the first call pays the child
+    // spawn and the initialize handshake, so a fixed sleep can land before the
+    // tools/call is ever registered.
+    const minePending = () => Array.from(client.pending.values()).some((e) => e.owner === mine);
+    const deadline = Date.now() + 5000;
+    while (!minePending() && Date.now() < deadline) await sleep(20);
+    assert.ok(minePending(), "the aborted message has a request in flight");
+    client.abort("aborted by user", mine);
+    const aborted = await withTimeout(myQuery, 5000, "aborted query");
+    assert.strictEqual(aborted.skillsRes, null, "the aborted message got no decision");
+    const res = await withTimeout(theirQuery, 5000, "the other session's query");
+    assert.ok(res, "the other session kept its request");
+    assert.strictEqual(res.skillsRes.primary.file, "a.md");
+    assert.ok(
+      log.some((l) => l.includes("aborting")),
+      "the abort was scoped, not global"
+    );
+  } finally {
+    client.stop("test end");
+  }
+});
+await test("a superseded message is dropped, and only within its own session", async () => {
+  const first = P.beginTurn("sess-x");
+  assert.strictEqual(P.isCurrentTurn(first), true);
+  const second = P.beginTurn("sess-x");
+  assert.strictEqual(P.isCurrentTurn(first), false, "the older message lost its session");
+  assert.strictEqual(P.isCurrentTurn(second), true);
+  // A different session, and a payload with no session id, are untouched.
+  const other = P.beginTurn("sess-y");
+  assert.strictEqual(P.isCurrentTurn(other), true);
+  assert.strictEqual(P.isCurrentTurn(second), true, "another session cannot supersede this one");
+  assert.strictEqual(P.isCurrentTurn(P.beginTurn(null)), true, "no session id cannot be superseded");
+  assert.strictEqual(P.isCurrentTurn(undefined), true, "a missing turn is treated as current");
 });
 
 console.log("--- 7. Settings, command resolution and path confinement ---");

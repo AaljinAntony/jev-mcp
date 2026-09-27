@@ -75,6 +75,29 @@ const MAX_BUFFER_BYTES = 8 * 1024 * 1024; // A server that never sends \n must n
 const CIRCUIT_FAILURES = 3; // Mirrors JEV_MCP_BREAKER_THRESHOLD
 const CIRCUIT_COOLDOWN_MS = 60_000; // Mirrors JEV_MCP_BREAKER_COOLDOWN_S
 
+/**
+ * How many messages may be judged at once, process-wide.
+ *
+ * This used to be a single `busy` boolean, which made the plugin serialise every
+ * session and every subagent in the opencode server behind one lock: with two
+ * windows open, the second message logged `skip: a jev query is already in
+ * flight` and never got a skill. The limit was never about the transport — the
+ * stdio client multiplexes concurrent requests by JSON-RPC id over one child — it
+ * was about not injecting a decision for a message that had already been
+ * superseded. That concern is now handled per session (see `beginTurn`), so the
+ * cap exists only to bound load on one Python child.
+ */
+const MAX_CONCURRENT_QUERIES = 3;
+
+/**
+ * How many session ids to remember for supersede detection.
+ *
+ * A `Map` keyed by session id would otherwise grow for the lifetime of the
+ * server. 64 is far more than any realistic number of live sessions, and the
+ * oldest entry is dropped once the cap is passed.
+ */
+const MAX_TRACKED_SESSIONS = 64;
+
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
 /** Log directory. Overridable so the test suite can assert rotation. */
@@ -451,8 +474,8 @@ class JevMcpClient {
     this.pending = new Map();
     this.ready = null;
     this.idleTimer = null;
-    /** One in-flight hook at a time; see `runQueries`. */
-    this.busy = false;
+    /** Messages currently being judged. Bounded by MAX_CONCURRENT_QUERIES. */
+    this.inFlight = 0;
     this.consecutiveFailures = 0;
     this.breakerOpenUntil = 0;
   }
@@ -530,7 +553,7 @@ class JevMcpClient {
     }
   }
 
-  send(message, timeoutMs) {
+  send(message, timeoutMs, owner = null) {
     return new Promise((resolve, reject) => {
       const timer =
         Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -539,7 +562,7 @@ class JevMcpClient {
               reject(new Error(`${message.method} timed out after ${timeoutMs}ms`));
             }, timeoutMs)
           : null;
-      this.pending.set(message.id, { resolve, reject, timer });
+      this.pending.set(message.id, { resolve, reject, timer, owner });
       try {
         this.proc.stdin.write(`${JSON.stringify(message)}\n`);
       } catch (err) {
@@ -550,9 +573,9 @@ class JevMcpClient {
     });
   }
 
-  async request(method, params, timeoutMs = TOOL_TIMEOUT_MS) {
+  async request(method, params, timeoutMs = TOOL_TIMEOUT_MS, owner = null) {
     await this.start();
-    return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, timeoutMs);
+    return this.send({ jsonrpc: "2.0", id: this.nextId++, method, params }, timeoutMs, owner);
   }
 
   /** Frame on newlines and dispatch by request id. */
@@ -600,8 +623,8 @@ class JevMcpClient {
   }
 
   /** Unwrap the MCP result shape and return the parsed tool body. */
-  async callTool(name, args, timeoutMs = TOOL_TIMEOUT_MS) {
-    const result = await this.request("tools/call", { name, arguments: args }, timeoutMs);
+  async callTool(name, args, timeoutMs = TOOL_TIMEOUT_MS, owner = null) {
+    const result = await this.request("tools/call", { name, arguments: args }, timeoutMs, owner);
     const text = (result?.content || []).find((c) => c && c.type === "text")?.text;
 
     if (result?.isError) {
@@ -647,7 +670,10 @@ class JevMcpClient {
     this.proc = null;
     this.ready = null;
     this.buffer = "";
-    this.busy = false;
+    // `inFlight` is deliberately NOT reset here. Every query releases in its
+    // own `finally`, so the counter drains on its own; zeroing it here would
+    // under-count the queries that are still unwinding and let the cap be
+    // exceeded for the rest of their lifetime.
     this.failAll(new Error(`jev-engine client ${reason}`));
     if (!proc) return;
     this.log(`client stopped (${reason})`);
@@ -706,18 +732,33 @@ class JevMcpClient {
     }
   }
 
-  /** The user aborted the message: fail the pending work now, not at the timeout. */
-  abort(reason = "aborted") {
-    if (!this.pending.size) return;
-    this.log(`aborting ${this.pending.size} in-flight request(s): ${reason}`);
-    this.failAll(new Error(`jev-engine request ${reason}`));
-    this.stop(reason);
+  /**
+   * The user aborted one message: fail only that message's requests.
+   *
+   * This used to reject every pending request and kill the child, which was safe
+   * only because a single message could be in flight. With several sessions
+   * sharing one client, an abort in one window would have destroyed the others'
+   * work, so the entries are filtered by owner and the child is stopped only
+   * when no other query is left running.
+   */
+  abort(reason = "aborted", owner = null) {
+    const mine = Array.from(this.pending.entries()).filter(([, entry]) => entry.owner === owner);
+    if (!mine.length) return;
+    this.log(`aborting ${mine.length} in-flight request(s): ${reason}`);
+    for (const [id, entry] of mine) {
+      this.pending.delete(id);
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.reject(new Error(`jev-engine request ${reason}`));
+    }
+    if (this.inFlight <= 1) this.stop(reason);
   }
 
   /** Called by the hook once it is done with the client for this message. */
   release() {
-    this.busy = false;
-    this.armIdle();
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    // Only the last caller may arm the idle shutdown, or a message that finished
+    // while others were still running would schedule a stop under their feet.
+    if (this.inFlight === 0) this.armIdle();
   }
 }
 
@@ -740,38 +781,80 @@ function getClient(settings) {
 }
 
 /**
+ * Per-session supersede tracking.
+ *
+ * The reason the old code refused to run two queries at once: a decision for a
+ * message the user has already moved past is worse than no decision, because it
+ * injects a skill that answers a question nobody is asking any more. That is a
+ * *per-session* property, so it is tracked per session — several windows can now
+ * be judged at once, and only the stale one is dropped.
+ */
+let turnSeq = 0;
+const latestTurnBySession = new Map();
+
+function beginTurn(sessionID) {
+  turnSeq += 1;
+  const turn = { sessionID: sessionID || null, token: turnSeq };
+  if (turn.sessionID) {
+    latestTurnBySession.set(turn.sessionID, turn.token);
+    while (latestTurnBySession.size > MAX_TRACKED_SESSIONS) {
+      const oldest = latestTurnBySession.keys().next().value;
+      latestTurnBySession.delete(oldest);
+    }
+  }
+  return turn;
+}
+
+/**
+ * True while `turn` is still the newest message for its session.
+ *
+ * A payload with no session id cannot be superseded, so it is always current:
+ * dropping its result would be a silent no-op with no way to explain it.
+ */
+function isCurrentTurn(turn) {
+  if (!turn?.sessionID) return true;
+  return latestTurnBySession.get(turn.sessionID) === turn.token;
+}
+
+/**
  * Run the two tool calls for one message.
  *
- * - One in-flight call per session: a stale skill injection for a superseded
- *   message is worse than none, so a concurrent message is skipped, not queued.
+ * - Up to MAX_CONCURRENT_QUERIES messages are judged at once, so parallel
+ *   sessions and subagents no longer queue behind one another. Past the cap the
+ *   message is skipped and logged, never queued: a decision that arrives after
+ *   the user moved on is not worth the latency.
  * - The two calls are independent, so they run concurrently and a failure in one
  *   does not discard the other.
  * - The circuit breaker mirrors the server's own, so an outage is not paid twice
  *   per message.
+ * - Requests carry the caller's `owner`, so an abort rejects only its own.
+ *
+ * Returns `null` when nothing was run, so the caller can tell a skip from a
+ * decision it chose to ignore.
  */
-async function runQueries(client, { task, cwd, wantTier, signal }) {
-  if (client.busy) {
-    client.log("skip: a jev query is already in flight for this session");
-    return {};
+async function runQueries(client, { task, cwd, wantTier, signal, turn, taskFile }) {
+  if (client.inFlight >= MAX_CONCURRENT_QUERIES) {
+    client.log(`skip: ${MAX_CONCURRENT_QUERIES} jev queries already in flight`);
+    return null;
   }
   if (client.breakerOpen()) {
     client.log("skip: circuit breaker is open");
-    return {};
+    return null;
   }
   if (signal?.aborted) {
     client.log("skip: message was already aborted");
-    return {};
+    return null;
   }
 
-  client.busy = true;
-  const onAbort = () => client.abort("aborted by user");
+  client.inFlight += 1;
+  const onAbort = () => client.abort("aborted by user", turn);
   if (typeof signal?.addEventListener === "function") {
     signal.addEventListener("abort", onAbort, { once: true });
   }
 
   const safeCall = async (name, args) => {
     try {
-      const res = await client.callTool(name, args, TOOL_TIMEOUT_MS);
+      const res = await client.callTool(name, args, TOOL_TIMEOUT_MS, turn);
       client.recordSuccess();
       return res;
     } catch (err) {
@@ -781,10 +864,13 @@ async function runQueries(client, { task, cwd, wantTier, signal }) {
     }
   };
 
+  const skillArgs = { task, root_dir: cwd };
+  if (taskFile) skillArgs.task_file = taskFile;
+
   try {
     const [tierRes, skillsRes] = await Promise.all([
       wantTier ? safeCall("select_model_tier", { task }) : null,
-      safeCall("search_agent_skills", { task, root_dir: cwd }),
+      safeCall("search_agent_skills", skillArgs),
     ]);
     if (tierRes) client.log(`select_model_tier action=${tierRes.action} confidence=${tierRes.confidence}`);
     if (skillsRes) {
@@ -902,18 +988,34 @@ export const JevPlugin = async () => ({
 
       pluginLog(
         `chat.message: prompt ${describeText(promptText)} wantTier=${wantTier} ` +
-          `skillDirs=${searchDirs.length} cwd=${cwd}`
+          `skillDirs=${searchDirs.length} cwd=${cwd} session=${input?.sessionID ?? "none"}`
       );
+
+      const turn = beginTurn(input?.sessionID);
 
       const client = getClient(settings);
       const started = Date.now();
-      const { tierRes, skillsRes } = await runQueries(client, {
+      const results = await runQueries(client, {
         task: promptText,
         cwd,
         wantTier,
+        turn,
         signal: input?.signal ?? output?.signal,
       });
       const elapsed = Date.now() - started;
+      if (!results) {
+        pluginLog(`chat.message skipped after ${elapsed}ms`);
+        return;
+      }
+      if (!isCurrentTurn(turn)) {
+        // A newer message arrived in this same session while we were waiting. Its
+        // own hook is judging the question the user is actually asking, so this
+        // decision is dropped rather than injected into a message they moved on
+        // from. Other sessions are unaffected.
+        pluginLog(`chat.message result dropped: superseded by a newer message (${elapsed}ms)`);
+        return;
+      }
+      const { tierRes, skillsRes } = results;
 
       if (tierRes && applyTier(tierRes, settings, output)) {
         console.log(
@@ -947,6 +1049,9 @@ JevPlugin.injectSkill = injectSkill;
 JevPlugin.injectIntoUserMessage = injectIntoUserMessage;
 JevPlugin.parseEnvelope = parseEnvelope;
 JevPlugin.runQueries = runQueries;
+JevPlugin.beginTurn = beginTurn;
+JevPlugin.isCurrentTurn = isCurrentTurn;
+JevPlugin.MAX_CONCURRENT_QUERIES = MAX_CONCURRENT_QUERIES;
 JevPlugin.getClient = getClient;
 JevPlugin.JevMcpClient = JevMcpClient;
 JevPlugin.MAX_INJECT_CHARS = MAX_INJECT_CHARS;
