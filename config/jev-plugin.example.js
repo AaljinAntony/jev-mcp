@@ -263,6 +263,12 @@ function loadSettings(cwd) {
         ? jev.models
         : {},
     scanPaths,
+    // Both default ON: they are the two ways the engine reaches the agent when
+    // the user has not said anything in the prompt itself. An explicit `false` in
+    // jevs_settings.json turns either off; anything else (absent, null, a string)
+    // leaves it on, because a typo must not silently disable the judge.
+    judge_read_prompts: jev.judge_read_prompts !== false,
+    inject_agent_instructions: jev.inject_agent_instructions !== false,
   };
 }
 
@@ -963,7 +969,191 @@ function injectSkill(skillsRes, cwd, output) {
   return injected;
 }
 
+/**
+ * Files whose content is treated as a saved prompt when the agent reads them.
+ *
+ * Deliberately a short list rather than "any text file": every entry costs one
+ * judged round trip, and re-judging a source file the agent is reading for its
+ * own sake is noise.
+ */
+const PROMPT_FILE_EXTENSIONS = new Set([".md", ".markdown", ".txt", ".prompt", ".plan"]);
+
+/** Cap on the judge note appended to a tool result. */
+const MAX_TOOL_NOTICE_CHARS = 600;
+
+/**
+ * Append `notice` to a tool result, in place.
+ *
+ * opencode validates every message part against PartV2 when it saves the
+ * message, and a *pushed* bare `{type:"text", text}` crashes the session
+ * ("invalid user part before save" -> the task auto-stops) — the same trap
+ * `injectIntoUserMessage` documents. So nothing is ever pushed here either: the
+ * last existing text part is *replaced* by a copy of itself with a longer
+ * `text`, which keeps every id, messageID, sessionID and synthetic flag the
+ * host put there. A result with no text part, or a plain string, is refused.
+ */
+function appendToToolResult(result, notice) {
+  const suffix = `\n\n${truncateText(notice, MAX_TOOL_NOTICE_CHARS)}`;
+  if (Array.isArray(result)) {
+    for (let i = result.length - 1; i >= 0; i -= 1) {
+      const part = result[i];
+      if (part && part.type === "text" && typeof part.text === "string") {
+        result[i] = { ...part, text: part.text + suffix };
+        return true;
+      }
+    }
+    return false;
+  }
+  if (result && typeof result === "object" && typeof result.output === "string") {
+    result.output += suffix;
+    return true;
+  }
+  return false;
+}
+
+function truncateText(value, maxChars) {
+  const text = String(value ?? "");
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`;
+}
+
+/** The one-line-per-skill ranking appended after a prompt file is read. */
+function renderDecision(res, file) {
+  const ranked = Array.isArray(res?.ranked) ? res.ranked.slice(0, 3) : [];
+  // Paths come from the engine, so they are workspace-relative and normally
+  // short, but nothing guarantees a short one. Each line is capped here so the
+  // note is bounded at the source; `appendToToolResult` trims the whole thing
+  // again as a final guard.
+  const clip = (value) => truncateText(value, 120);
+  const lines = ranked.map((r, i) => `${i + 1}. ${clip(r.file)} (${Number(r.probability ?? 0).toFixed(2)})`);
+  const body = lines.length ? lines.join("\n") : "no skill stood out";
+  return (
+    `[Jev] judged ${clip(file)}: action=${res.action} confidence=${res.confidence}\n` +
+    `${body}\n` +
+    `Read the top skill with your read tool if it applies.`
+  );
+}
+
+/**
+ * Per-(session, file, revision) memo of what has already been judged.
+ *
+ * An agent re-reads a file for many reasons — a grep hit, a failed edit, a
+ * second opinion — and each one would otherwise cost a round trip to the API.
+ * Keyed by size and mtime so an edited file is judged again, and bounded so a
+ * long session cannot grow it without limit.
+ */
+const judgedFiles = new Map();
+const MAX_JUDGED_FILES = 64;
+
+function fileStamp(file, stat) {
+  return `${file}|${stat.size}:${Math.round(stat.mtimeMs)}`;
+}
+
+function alreadyJudged(key) {
+  const seen = judgedFiles.get(key);
+  const fresh = seen !== undefined && Date.now() - seen < 10 * 60_000;
+  if (fresh) return true;
+  judgedFiles.set(key, Date.now());
+  while (judgedFiles.size > MAX_JUDGED_FILES) {
+    judgedFiles.delete(judgedFiles.keys().next().value);
+  }
+  return false;
+}
+
+/**
+ * The rules block appended to the system prompt every turn.
+ *
+ * The plugin can only *judge and advise*; it cannot make the agent act. So the
+ * decision points are stated where the agent actually reads them — its system
+ * prompt — instead of in a project file that may not exist. Kept short on
+ * purpose: it is prepended to every request in every workspace, so every line
+ * is paid for on every turn.
+ */
+const AGENT_DECISION_RULES = [
+  "# Jev decision points",
+  "",
+  "The `jev-engine` MCP server turns prose into typed judgments. Use it at the",
+  "points below rather than guessing:",
+  "",
+  "- Before running a shell command that deletes, moves, force-writes, resets or",
+  "  pushes: `guardrail_command` with the exact command string. Treat",
+  "  `safe: false` as a stop, not a warning.",
+  "- Before editing: `search_target_files` to find which files the task really",
+  "  touches, so you inspect the right ones.",
+  "- At the start of a task, and after reading a saved prompt or plan:",
+  "  `search_agent_skills` to pick the skill or workflow that applies. When the",
+  "  prompt lives in a file, pass that path as `task_file` instead of pasting it,",
+  "  e.g. `task_file: \"docs/plan.md\"`.",
+  "- Every call returns `action` (`auto` / `review` / `escalate`) and a",
+  "  `confidence`. Below 0.5 the model is guessing: say so instead of acting on",
+  "  it. An error envelope means no judgment was made, not that nothing matched.",
+].join("\n");
+
 export const JevPlugin = async () => ({
+  "experimental.chat.system.transform": async (input, output) => {
+    try {
+      if (!Array.isArray(output?.system)) return;
+      const settings = loadSettings(process.cwd());
+      if (!settings.inject_agent_instructions) return;
+      // Pushed, never spliced in: the host keeps the first element as the
+      // provider's own instruction block, so the block belongs at the end.
+      output.system.push(AGENT_DECISION_RULES);
+    } catch (err) {
+      pluginLog(`system.transform bypassed safely: ${err.message}`);
+    }
+  },
+  "tool.execute.after": async (input, result) => {
+    if (input?.tool !== "read") return;
+    const file = input?.args?.filePath;
+    if (typeof file !== "string" || !file) return;
+    const cwd = process.cwd();
+    if (!PROMPT_FILE_EXTENSIONS.has(path.extname(file).toLowerCase())) return;
+    if (!isInside(cwd, file)) return;
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return;
+    }
+    if (alreadyJudged(fileStamp(file, stat))) return;
+
+    try {
+      const settings = loadSettings(cwd);
+      if (!settings.judge_read_prompts) return;
+      const client = getClient(settings);
+      if (client.inFlight >= MAX_CONCURRENT_QUERIES || client.breakerOpen()) {
+        pluginLog(`read judge skipped for ${file}: client is busy or the breaker is open`);
+        return;
+      }
+      client.inFlight += 1;
+      let res;
+      try {
+        res = await client.callTool(
+          "search_agent_skills",
+          { task: `Which skill or workflow applies to the document I just read (${path.basename(file)})?`, root_dir: cwd, task_file: file },
+          TOOL_TIMEOUT_MS,
+          { sessionID: input?.sessionID ?? null, token: 0 }
+        );
+        client.recordSuccess();
+      } catch (err) {
+        client.recordFailure(err);
+        pluginLog(`read judge failed for ${file}: ${err.message}`);
+        return;
+      } finally {
+        client.release();
+      }
+
+      if (!isInjectable(res) || !res?.primary?.file) {
+        pluginLog(`read judge: nothing to add for ${file} (action=${res?.action} confidence=${res?.confidence})`);
+        return;
+      }
+      const appended = appendToToolResult(result, renderDecision(res, path.basename(file)));      pluginLog(`read judge: ${appended ? "appended" : "no text part to append to"} for ${file}`);
+      if (appended) {
+        console.log(`[jev-plugin] ⚡ Judged ${path.basename(file)} → ${res.primary.file}`);
+      }
+    } catch (err) {
+      pluginLog(`read judge bypassed safely: ${err.message}`);
+    }
+  },
   "chat.message": async (input, output) => {
     try {
       const promptText = extractUserPrompt(input, output);
@@ -1051,6 +1241,12 @@ JevPlugin.parseEnvelope = parseEnvelope;
 JevPlugin.runQueries = runQueries;
 JevPlugin.beginTurn = beginTurn;
 JevPlugin.isCurrentTurn = isCurrentTurn;
+JevPlugin.appendToToolResult = appendToToolResult;
+JevPlugin.renderDecision = renderDecision;
+JevPlugin.fileStamp = fileStamp;
+JevPlugin.alreadyJudged = alreadyJudged;
+JevPlugin.AGENT_DECISION_RULES = AGENT_DECISION_RULES;
+JevPlugin.PROMPT_FILE_EXTENSIONS = PROMPT_FILE_EXTENSIONS;
 JevPlugin.MAX_CONCURRENT_QUERIES = MAX_CONCURRENT_QUERIES;
 JevPlugin.getClient = getClient;
 JevPlugin.JevMcpClient = JevMcpClient;

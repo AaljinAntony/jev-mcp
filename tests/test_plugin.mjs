@@ -884,7 +884,187 @@ await test("the plugin carries no inline Python and no direct SDK use", () => {
   assert.strictEqual(spawns.length, 1, `expected exactly one spawn() call, found ${spawns.length}`);
 });
 
-console.log("--- 14. Installed plugin drift ---");
+console.log("--- 14. Judging a prompt file the agent just read ---");
+await test("appends to an existing text part and pushes nothing", () => {
+  // The PartV2 trap: a *pushed* bare part crashes the session, so the host's own
+  // part is copied with a longer text and every id it carries is preserved.
+  const original = { id: "prt_1", messageID: "m1", sessionID: "s1", type: "text", text: "# Phase 2\nbody" };
+  const result = [original, { id: "prt_2", messageID: "m1", sessionID: "s1", type: "text", text: "later" }];
+  assert.strictEqual(P.appendToToolResult(result, "[Jev] note"), true);
+  assert.strictEqual(result.length, 2, "no part was pushed");
+  assert.strictEqual(original.text, "# Phase 2\nbody", "the host's own object is untouched");
+  const replaced = result[1];
+  assert.strictEqual(replaced.text, "later\n\n[Jev] note", "the LAST text part carries the note");
+  assert.strictEqual(replaced.id, "prt_2");
+  assert.strictEqual(replaced.messageID, "m1");
+  assert.strictEqual(replaced.sessionID, "s1");
+});
+await test("refuses result shapes it cannot extend safely", () => {
+  assert.strictEqual(P.appendToToolResult("a plain string", "n"), false, "a string is immutable");
+  assert.strictEqual(P.appendToToolResult([{ type: "image" }], "n"), false, "no text part to extend");
+  assert.strictEqual(P.appendToToolResult(undefined, "n"), false);
+  assert.strictEqual(P.appendToToolResult({ title: "x" }, "n"), false, "no output field");
+  const withOutput = { title: "t", output: "body" };
+  assert.strictEqual(P.appendToToolResult(withOutput, "[Jev] note"), true);
+  assert.strictEqual(withOutput.output, "body\n\n[Jev] note");
+});
+await test("the decision note is bounded and names the top candidates", () => {
+  const note = P.renderDecision(
+    {
+      action: "review",
+      confidence: 0.71,
+      ranked: [
+        { file: ".agents/skills/a/SKILL.md", probability: 0.4 },
+        { file: ".agents/skills/b/SKILL.md", probability: 0.2 },
+        { file: ".agents/skills/c/SKILL.md", probability: 0.1 },
+        { file: ".agents/skills/d/SKILL.md", probability: 0.05 },
+      ],
+    },
+    "plan.md"
+  );
+  assert.ok(note.includes("action=review") && note.includes("confidence=0.71"), note);
+  assert.ok(note.includes("plan.md"), "the file is named");
+  assert.ok(note.includes(".agents/skills/a/SKILL.md"));
+  assert.ok(!note.includes(".agents/skills/d/SKILL.md"), "only the top 3 are listed");
+  const huge = P.renderDecision(
+    { action: "auto", confidence: 1, ranked: [{ file: "x".repeat(5000), probability: 1 }] },
+    "plan.md"
+  );
+  assert.ok(huge.length <= 700, `the note is bounded, got ${huge.length} chars`);
+});
+await test("a re-read of an unchanged file is judged once", () => {
+  const stat = { size: 120, mtimeMs: 1_700_000_000_000 };
+  const key = P.fileStamp("a/plan.md", stat);
+  assert.strictEqual(P.alreadyJudged(key), false, "first look is judged");
+  assert.strictEqual(P.alreadyJudged(key), true, "the same revision is not");
+  assert.strictEqual(P.alreadyJudged(P.fileStamp("a/plan.md", { size: 121, mtimeMs: stat.mtimeMs })), false, "an edit is judged again");
+  assert.strictEqual(P.alreadyJudged(P.fileStamp("b/plan.md", stat)), false, "a different file is judged");
+});
+await test("reading a prompt file appends the ranking to the tool result", async () => {
+  const dir = tmpDir("read-judge");
+  fs.writeFileSync(path.join(dir, "plan.md"), "# Phase 2\n\noverhaul the audio bus\n");
+  fs.writeFileSync(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({ mcp: { "jev-engine": { command: [process.execPath, STUB] } } })
+  );
+  const decision = {
+    action: "review",
+    confidence: 0.83,
+    primary: { file: ".agents/skills/audio/SKILL.md", content: "x" },
+    resources: [],
+    ranked: [{ file: ".agents/skills/audio/SKILL.md", probability: 0.6 }],
+  };
+  const prevCwd = process.cwd();
+  const prevBody = process.env.STUB_BODY;
+  // STUB_BODY must be set BEFORE the client is built: `childEnv()` snapshots
+  // process.env at construction, and the child is spawned lazily.
+  process.env.STUB_BODY = JSON.stringify(decision);
+  // Pre-create the client with the exact key the hook will resolve, so the hook
+  // reuses this instance and the test can shut it down deterministically. Its
+  // child inherits the temp dir as its cwd, and Windows refuses to delete a
+  // directory that is still some process's working directory.
+  const client = P.getClient({ pythonPath: process.execPath, serverPath: STUB });
+  process.chdir(dir);
+  try {
+    const plugin = await P();
+    const part = { id: "prt_1", messageID: "m1", sessionID: "s1", type: "text", text: "# Phase 2" };
+    const result = [part];
+    await plugin["tool.execute.after"](
+      { tool: "read", sessionID: "s1", args: { filePath: path.join(dir, "plan.md") } },
+      result
+    );
+    assert.strictEqual(result.length, 1, "no part was pushed");
+    assert.ok(result[0].text.includes("[Jev]"), `expected a judge note, got: ${result[0].text}`);
+    assert.ok(result[0].text.includes(".agents/skills/audio/SKILL.md"));
+    assert.ok(result[0].text.startsWith("# Phase 2"), "the file content is still there");
+    assert.strictEqual(part.text, "# Phase 2", "the host's object is untouched");
+
+    // A second read of the same revision is debounced: no second API call.
+    const before = process.env.STUB_BODY;
+    const again = [{ id: "prt_9", messageID: "m1", sessionID: "s1", type: "text", text: "x" }];
+    await plugin["tool.execute.after"](
+      { tool: "read", sessionID: "s1", args: { filePath: path.join(dir, "plan.md") } },
+      again
+    );
+    assert.ok(!again[0].text.includes("[Jev]"), "the re-read was debounced");
+    assert.strictEqual(process.env.STUB_BODY, before);
+  } finally {
+    process.chdir(prevCwd);
+    if (prevBody === undefined) delete process.env.STUB_BODY;
+    else process.env.STUB_BODY = prevBody;
+    client.stop("test end");
+    // Let the child's exit land before the tree is removed (see above).
+    await sleep(500);
+    P.getClient({ pythonPath: "teardown", serverPath: "teardown" }).stop("test end");
+  }
+});
+await test("the read judge ignores what is not a saved prompt", async () => {
+  const dir = tmpDir("read-judge-skip");
+  fs.writeFileSync(path.join(dir, "opencode.json"), JSON.stringify({ mcp: { "jev-engine": { command: [process.execPath, STUB] } } }));
+  fs.writeFileSync(path.join(dir, "main.py"), "print(1)\n");
+  fs.writeFileSync(path.join(dir, "notes.md"), "# notes\n");
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const plugin = await P();
+    for (const [name, file] of [
+      ["a source file", "main.py"],
+      ["a different tool", null],
+    ]) {
+      const result = [{ id: "prt_1", messageID: "m1", sessionID: "s2", type: "text", text: "content" }];
+      const args = file ? { filePath: path.join(dir, file) } : { command: "ls" };
+      await plugin["tool.execute.after"](
+        { tool: file ? "read" : "bash", sessionID: "s2", args },
+        result
+      );
+      assert.strictEqual(result[0].text, "content", `${name} was left alone`);
+    }
+    // Outside the workspace: refused even with a prompt extension.
+    const outside = [{ id: "prt_2", messageID: "m1", sessionID: "s2", type: "text", text: "content" }];
+    await plugin["tool.execute.after"](
+      { tool: "read", sessionID: "s2", args: { filePath: path.join(REPO_ROOT, "..", "outside.md") } },
+      outside
+    );
+    assert.strictEqual(outside[0].text, "content", "a file outside the workspace was refused");
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+console.log("--- 15. Per-turn agent decision rules ---");
+await test("the rules block is appended to the system prompt, at the end", async () => {
+  const plugin = await P();
+  const system = ["provider instructions", "project rules"];
+  await plugin["experimental.chat.system.transform"]({ sessionID: "s1", model: {} }, { system });
+  assert.strictEqual(system.length, 3, "appended, not spliced in");
+  assert.strictEqual(system[0], "provider instructions", "the host's first element is untouched");
+  assert.ok(system[2].includes("guardrail_command"), system[2]);
+  assert.ok(system[2].includes("search_target_files"));
+  assert.ok(system[2].includes("search_agent_skills"));
+  assert.ok(system[2].includes("task_file"), "the saved-prompt workflow is stated");
+});
+await test("the rules block survives a payload the host did not send", async () => {
+  const plugin = await P();
+  for (const output of [undefined, {}, { system: "not an array" }]) {
+    await plugin["experimental.chat.system.transform"]({ sessionID: "s1" }, output);
+  }
+});
+await test("inject_agent_instructions: false turns the block off", async () => {
+  const dir = tmpDir("no-instructions");
+  fs.writeFileSync(path.join(dir, "jevs_settings.json"), JSON.stringify({ inject_agent_instructions: false }));
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const plugin = await P();
+    const system = ["only this"];
+    await plugin["experimental.chat.system.transform"]({ sessionID: "s1" }, { system });
+    assert.deepStrictEqual(system, ["only this"], "no block was added");
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+console.log("--- 16. Installed plugin drift ---");
 const homePlugin = path.join(os.homedir(), ".config", "opencode", "plugins", "jev-plugin.js");
 if (!fs.existsSync(homePlugin)) {
   console.warn(
