@@ -59,10 +59,11 @@ const MAX_PROMPT_CHARS = 100_000; // Longer prompts are skipped, not sent
 /**
  * Confidence floor for *both* effects (model switch and skill injection).
  *
- * Why 0.6 and not JEV_MCP_AUTO_ACCEPT (0.8)? The server already downgraded the
- * decision to `review` below 0.8, so by the time we see `action === "auto"` the
- * stricter bar is met. This 0.6 is a second, independent floor so a future
- * server-side threshold change cannot silently start injecting on weak judgments.
+ * Why 0.6 and not JEV_MCP_AUTO_ACCEPT (0.8)? A second, independent floor, so a
+ * future server-side threshold change cannot silently start acting on weak
+ * judgments. It can only ever *raise* the bar above what the server already
+ * allows, which is why `isConfident` (auto only) and `isInjectable` (auto or
+ * review) share it.
  */
 const PLUGIN_MIN_CONFIDENCE = 0.6;
 
@@ -376,6 +377,25 @@ function injectIntoUserMessage(output, notice) {
 /** True only for a decision the server is willing to act on without review. */
 function isConfident(res) {
   if (!res || res.action !== "auto") return false;
+  const confidence = typeof res.confidence === "number" ? res.confidence : 0;
+  return confidence >= PLUGIN_MIN_CONFIDENCE;
+}
+
+/**
+ * True when a decision is worth injecting as a skill hint.
+ *
+ * Deliberately wider than `isConfident`: a `review` decision (0.5 <= confidence
+ * < JEV_MCP_AUTO_ACCEPT) is a real, ranked pick that the server merely wants a
+ * human to glance at, and a skill note is advisory text in the user's own
+ * message — not a model switch and not a command. Requiring `auto` here made the
+ * 0.6 floor unreachable, so the effective bar was 0.8 and an `review`-grade
+ * match was dropped without a trace even though the plugin had already decided
+ * it was worth 0.6. `escalate` (below JEV_MCP_REVIEW_AT, a forced pick among
+ * options that do not fit) is still refused, and the model switch keeps the
+ * strict `isConfident` gate.
+ */
+function isInjectable(res) {
+  if (!res || (res.action !== "auto" && res.action !== "review")) return false;
   const confidence = typeof res.confidence === "number" ? res.confidence : 0;
   return confidence >= PLUGIN_MIN_CONFIDENCE;
 }
@@ -817,9 +837,18 @@ function applyTier(tierRes, settings, output) {
  */
 function injectSkill(skillsRes, cwd, output) {
   const primary = skillsRes?.primary;
-  if (!primary?.file || typeof primary.content !== "string") return false;
+  if (!primary?.file || typeof primary.content !== "string") {
+    // A confident `auto` with no primary is a real outcome: the model picked
+    // `none`, so there is nothing to inject. Say so, or it reads as a silent
+    // no-op in the log.
+    pluginLog(
+      `no skill to inject: action=${skillsRes?.action ?? "none"} ` +
+        `confidence=${skillsRes?.confidence ?? "n/a"} primary=${primary?.file ?? "none"}`
+    );
+    return false;
+  }
 
-  if (!isConfident(skillsRes)) {
+  if (!isInjectable(skillsRes)) {
     pluginLog(
       `skill ${primary.file} not injected: action=${skillsRes.action} confidence=${skillsRes.confidence}`
     );
@@ -905,6 +934,7 @@ export const JevPlugin = async () => ({
 JevPlugin.splitModelId = splitModelId;
 JevPlugin.isInside = isInside;
 JevPlugin.isConfident = isConfident;
+JevPlugin.isInjectable = isInjectable;
 JevPlugin.scanResourceFiles = scanResourceFiles;
 JevPlugin.pluginLog = pluginLog;
 JevPlugin.describeText = describeText;

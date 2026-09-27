@@ -78,6 +78,7 @@ for (const name of [
   "splitModelId",
   "isInside",
   "isConfident",
+  "isInjectable",
   "scanResourceFiles",
   "pluginLog",
   "describeText",
@@ -581,12 +582,19 @@ await test("auto + confident => injected", () => {
   assert.ok(output.parts[0].text.includes("[Active Capability / Skill: .agents/skills/demo/SKILL.md]"));
   assert.ok(output.parts[0].text.includes("SKILL BODY"));
 });
-await test("review / escalate / weak confidence => not injected", () => {
+await test("review at or above the floor => injected (advisory skill hint)", () => {
+  const output = textOutput();
+  const res = { ...confidentSkills("REVIEW BODY"), action: "review", confidence: 0.64 };
+  assert.strictEqual(P.injectSkill(res, injectCwd, output), true);
+  assert.ok(output.parts[0].text.includes("[Active Capability / Skill: .agents/skills/demo/SKILL.md]"));
+  assert.ok(output.parts[0].text.includes("REVIEW BODY"));
+});
+await test("escalate / weak confidence => not injected", () => {
   for (const res of [
-    { ...confidentSkills("X"), action: "review" },
     { ...confidentSkills("X"), action: "escalate" },
     { ...confidentSkills("X"), confidence: 0.4 },
     { ...confidentSkills("X"), confidence: null },
+    { ...confidentSkills("X"), action: "review", confidence: 0.59 },
   ]) {
     const output = textOutput();
     assert.strictEqual(P.injectSkill(res, injectCwd, output), false, `${res.action}/${res.confidence}`);
@@ -747,6 +755,18 @@ await test("isConfident is the action AND the confidence floor, not either alone
   assert.strictEqual(P.isConfident({ action: "auto", confidence: "0.9" }), false, "a string is not a number");
   assert.strictEqual(P.isConfident(null), false);
   assert.strictEqual(P.isConfident(undefined), false);
+});
+await test("isInjectable admits review, isConfident does not (skill hint vs model switch)", () => {
+  assert.strictEqual(P.isInjectable({ action: "auto", confidence: 0.9 }), true);
+  assert.strictEqual(P.isInjectable({ action: "review", confidence: 0.99 }), true);
+  assert.strictEqual(P.isInjectable({ action: "review", confidence: 0.6 }), true);
+  assert.strictEqual(P.isInjectable({ action: "review", confidence: 0.59 }), false);
+  assert.strictEqual(P.isInjectable({ action: "escalate", confidence: 0.99 }), false, "a forced pick is never a hint");
+  assert.strictEqual(P.isInjectable({ action: "auto", confidence: "0.9" }), false, "a string is not a number");
+  assert.strictEqual(P.isInjectable(null), false);
+  assert.strictEqual(P.isInjectable(undefined), false);
+  // The model switch keeps the strict gate: only `auto` moves a model.
+  assert.strictEqual(P.isConfident({ action: "review", confidence: 0.99 }), false);
 });
 await test("the log records the digest, and never an interpolated prompt", () => {
   // Behavioural, not a substring check: put a marker in a prompt the plugin
