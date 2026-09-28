@@ -203,6 +203,27 @@ def test_select_mcp_tools_advertises_its_roster_shape(tools):
     assert array_branch["items"]["type"] == "object"
     assert schema["properties"]["mcps_json"]["type"] == "string"
     assert schema["required"] == ["task"]
+    # Both ceilings the engine validates are reachable from the wire, or a
+    # caller has no way to set them and the validation is decoration.
+    assert schema["properties"]["max_tools"]["default"] == 20
+    assert schema["properties"]["max_servers"]["default"] == 5
+
+
+def test_the_two_ceilings_are_reachable_over_the_wire(server):
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {
+            "task": "do the thing",
+            "mcps": ROSTER,
+            "root_dir": str(REPO),
+            "max_tools": 1,
+            "max_servers": 1,
+        },
+    )
+    body = _body(result)
+    assert len(body["servers"]) <= 1
+    assert len(body["tools"]) <= 1
 
 
 # 2. A round trip per tool

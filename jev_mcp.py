@@ -137,6 +137,7 @@ def select_mcp_tools(
     root_dir: str = ".",
     task_file: str = "",
     max_tools: int = 20,
+    max_servers: int = 5,
 ) -> dict:
     """Choose which MCP server, and which of its tools, fits the current task.
 
@@ -145,6 +146,10 @@ def select_mcp_tools(
     If your client cannot send an array parameter, send the same JSON as
     `mcps_json` instead. Pass every server you are connected to: the judge can
     only choose from what it is given, and it never recommends itself.
+
+    `max_tools` caps the tool list (every tool above the judge's own threshold
+    is passed, up to this many) and `max_servers` caps how many ranked servers
+    come back. `task_file` is a saved prompt to judge alongside `task`.
 
     Read `exists` before acting on the result:
       * `answered`  - one server is the right one; use `primary` and the `tools` list.
@@ -166,12 +171,14 @@ def select_mcp_tools(
             root_dir=root_dir,
             task_file=task_file or None,
             max_tools=max_tools,
+            max_servers=max_servers,
         ),
         task=task,
         mcps=_mcp_log_summary(roster),
         root_dir=root_dir,
         task_file=task_file or None,
         max_tools=max_tools,
+        max_servers=max_servers,
     )
 
 
