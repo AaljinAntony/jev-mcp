@@ -30,6 +30,23 @@ FAMILY_CLUSTER_MIN_PROB = 0.50
 #: Hard cap on siblings added by family-prefix clustering.
 FAMILY_CLUSTER_MAX_SIBLINGS = 2
 
+#: Probability at or above which a `select_mcp_tools` result reports a server or
+#: a tool. Below it the winner is a guess, not a decision.
+MCP_TOOL_MIN_PROB = 0.12
+#: Probability at or above which a runner-up MCP is reported as a contender in
+#: an `ambiguous` verdict. Anything below is noise around a forced winner.
+MCP_CONTENDER_MIN_PROB = 0.15
+#: Gap between the top two probabilities below which the MCP choice is reported
+#: as `ambiguous` rather than `answered`.
+#:
+#: A Choice always returns a winner. With five comparably usable MCP servers the
+#: distribution is nearly flat and the winner is whichever one the model listed
+#: first, not a decision any code or agent should act on. Confidence does not
+#: catch this on its own: a flat five-way split of 0.3/0.27/0.2/0.15/0.08
+#: normalises to a *low* confidence, but a tight 0.46/0.42 split normalises to a
+#: high one while being the harder case, so the gap is checked directly.
+AMBIGUITY_GAP = 0.10
+
 #: Float-safe sum tolerance: an exact 0.01 delta can exceed 0.01 in IEEE-754.
 PROBABILITY_SUM_TOLERANCE = 0.01 + 1e-12
 #: Per-level drift allowed between a reported score and its distribution mean.

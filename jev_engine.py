@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import fnmatch
 import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -42,7 +43,12 @@ from limits import (
     MAX_CHOICE_OPTIONS,
     MAX_CONTENT_CHARS,
     MAX_DISCOVERED_FILES,
+    MAX_MCP_SERVERS,
+    MAX_MCP_SERVER_DESC_CHARS,
+    MAX_MCP_TOOL_DESC_CHARS,
+    MAX_MCP_TOOL_OPTIONS,
     MAX_PREVIEW_READS,
+    MAX_TOTAL_CRITERIA_CHARS,
     MAX_TOTAL_PREVIEW_CHARS,
     truncate_text,
 )
@@ -50,8 +56,11 @@ from mock import mock_system_one
 from policy import (
     DEFAULT_RISK_THRESHOLD,
     DEFAULT_ESCALATE_THRESHOLD,
+    AMBIGUITY_GAP,
     FAMILY_CLUSTER_MAX_SIBLINGS,
     FAMILY_CLUSTER_MIN_PROB,
+    MCP_CONTENDER_MIN_PROB,
+    MCP_TOOL_MIN_PROB,
     NONE_CONFIDENCE,
     action_from_confidence,
     confidence_from_probabilities,
@@ -60,6 +69,12 @@ from policy import (
     worst_action,
 )
 from scan_cache import ScanCache
+
+#: Identity this server advertises over MCP. `jev_mcp.py` builds
+#: `MCPServer(SERVER_NAME)` from it, and `select_mcp_tools` excludes it from its
+#: own candidate list. One constant, so "the judge is never a candidate" cannot
+#: drift away from the name the client actually sees.
+SERVER_NAME = "jev-engine"
 
 DEFAULT_SCAN_PATHS = [
     ".agents/skills",
@@ -85,6 +100,46 @@ MAX_INPUT_CHARS = 100_000
 #: the summary and the headings at the top of the document are what matter. Read
 #: head-only so a 5 MB log named `plan.md` cannot turn into a 5 MB request.
 MAX_TASK_FILE_CHARS = 8_000
+
+#: Bounds on the `ignore_mcps` setting. The list comes from
+#: `jevs_settings.json`, which a project commits, so a mistake in it must be a
+#: visible cap rather than a silently enormous filter set.
+MAX_IGNORE_MCP_PATTERNS = 64
+MAX_IGNORE_MCP_PATTERN_CHARS = 200
+
+
+def _ignore_mcp_patterns() -> List[str]:
+    """The MCP name/glob patterns `select_mcp_tools` must not offer.
+
+    Read from settings rather than hardcoded in the tool: the self-exclusion has
+    to be unconditional, and that is the job of the `SERVER_NAME*` default the
+    settings loader seeds. Everything else here is the user's, and a project
+    that names `git*` is saying "never route me to a git server".
+    """
+    raw = load_jev_settings().get("ignore_mcps") or []
+    patterns: List[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        value = entry.strip()
+        if not value or len(value) > MAX_IGNORE_MCP_PATTERN_CHARS:
+            continue
+        patterns.append(value.lower())
+    return patterns[:MAX_IGNORE_MCP_PATTERNS]
+
+
+def _is_ignored_mcp(name: str, patterns: List[str]) -> bool:
+    """True when an MCP server name matches an ignore pattern.
+
+    Case-insensitive exact name or glob (`*`, `?`, `[seq]`). `fnmatch` on
+    Windows normalises the case itself, but the patterns are lowercased by
+    `_ignore_mcp_patterns` and the name is lowercased here, so the result does
+    not depend on the host's filesystem rules.
+    """
+    lowered = name.strip().lower()
+    if not lowered:
+        return True
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in patterns)
 
 
 def _check_input_length(name: str, value: str) -> None:
@@ -288,6 +343,7 @@ def _merge_jev_settings(settings: dict, jev: dict) -> bool:
       * `models` — union of non-empty values; an explicit `""` **removes** an
         inherited tier, which is the documented way to disable one.
       * `scan_paths` — additive union against the built-in defaults, deduped.
+      * `ignore_mcps` — additive union of MCP name / glob patterns, deduped.
     """
     jev = jev or {}
     if not isinstance(jev, dict):
@@ -311,6 +367,11 @@ def _merge_jev_settings(settings: dict, jev: dict) -> bool:
         extras = [str(p) for p in scan_paths if isinstance(p, str)]
         settings["scan_paths"] = list(dict.fromkeys(list(settings["scan_paths"]) + extras))
         matched = True
+    ignore_mcps = jev.get("ignore_mcps")
+    if isinstance(ignore_mcps, list):
+        extras = [str(p).strip() for p in ignore_mcps if isinstance(p, str) and p.strip()]
+        settings["ignore_mcps"] = list(dict.fromkeys(list(settings["ignore_mcps"]) + extras))
+        matched = True
     return matched
 
 
@@ -324,6 +385,7 @@ def _snapshot(settings: dict) -> dict:
     out = dict(settings)
     out["models"] = dict(settings.get("models") or {})
     out["scan_paths"] = list(settings.get("scan_paths") or [])
+    out["ignore_mcps"] = list(settings.get("ignore_mcps") or [])
     out["sources"] = list(settings.get("sources") or [])
     return out
 
@@ -379,6 +441,10 @@ def load_jev_settings() -> dict:
         "enable_model_routing": False,
         "models": {},
         "scan_paths": list(DEFAULT_SCAN_PATHS),
+        # The judge never selects itself. `select_mcp_tools` filters this out
+        # before it builds any Choice criteria, so `jev-engine` cannot come back
+        # as a recommendation and send the agent back into this server.
+        "ignore_mcps": [f"{SERVER_NAME}*"],
         "source": None,
         "sources": [],
     }
@@ -1666,11 +1732,591 @@ def select_model_tier(task: str) -> dict:
 
 
 # ----------------------------------------------------------------------
-# 5. CLI Entry Point
+# 5. MCP Server & Tool Selection
+# ----------------------------------------------------------------------
+#: An agent holds every MCP it is connected to; this tool answers "which of
+#: them, and which of its tools, is the usable one for the work in front of me".
+#: The candidate list is supplied by the caller, not discovered here: the agent
+#: already has it, and re-deriving it from config would put two sources of truth
+#: on the same decision.
+DEFAULT_MAX_MCP_TOOLS = 20
+DEFAULT_MAX_MCP_SERVERS = 5
+
+#: Caller-supplied ceilings. A confused caller must not be able to ask for 250
+#: entries back, and these are the only two integers the tool takes.
+MAX_MAX_MCP_TOOLS = 50
+MAX_MAX_MCP_SERVERS = 20
+
+MCP_SERVER_INSTRUCTIONS = (
+    "Select the single MCP server, if any, whose tools are the right ones for the task "
+    "described in `task`. Each option's description is that server's name, what it is for, "
+    "and the tools it exposes. Choose 'none' if no supplied server has a tool the task "
+    "actually needs: the agent's own built-in tools are not in this list, so a task that "
+    "needs no external service is correctly answered with 'none'."
+)
+
+MCP_TOOL_INSTRUCTIONS = (
+    "Select the single MCP tool, if any, that most directly performs the task described in "
+    "`task`. Each option's description names the server that exposes the tool and what the "
+    "tool does. Choose 'none' if no supplied tool is needed for the task."
+)
+
+MCP_RELEVANT_INSTRUCTIONS = (
+    "Does the task actually require calling a tool on one of the supplied MCP servers, "
+    "rather than being carried out with the agent's own built-in tools?"
+)
+
+MCP_DECISIVE_INSTRUCTIONS = (
+    "Is exactly one of the supplied MCP servers the right one for the task, rather than two "
+    "or more of them being comparably usable for it?"
+)
+
+MCP_SELECTION_STATE_GOAL = (
+    "Identify which MCP server, if any, the agent should use for the task, and which of "
+    "that server's tools it should call."
+)
+
+_MCP_PRESENT_CRITERIA = {
+    "true": "At least one supplied MCP server has a tool the task genuinely needs",
+    "false": "No supplied MCP server has a tool the task genuinely needs; the top choice is a forced winner",
+}
+
+_MCP_DECISIVE_CRITERIA = {
+    "true": "One supplied server is clearly the right one; the others are worse fits",
+    "false": "Two or more supplied servers are comparably usable for this task",
+}
+
+
+def _bounded_count(value, name: str, low: int, high: int) -> int:
+    """Validate one caller-supplied count. Never silently clamped."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JevValidationError(f"Parameter '{name}' must be an integer between {low} and {high}.")
+    if value < low or value > high:
+        raise JevValidationError(f"Parameter '{name}' must be between {low} and {high} (got {value}).")
+    return value
+
+
+def _coerce_mcp_list(mcps) -> list:
+    """Accept the structured list, or a JSON string holding one.
+
+    MCP clients are not equally happy with array-typed tool parameters, and a
+    client that can only send scalars can still send the same information as a
+    JSON string. A bare object is accepted as a one-element list because a
+    single-server agent should not have to wrap it.
+    """
+    if isinstance(mcps, str):
+        text = mcps.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError) as exc:
+            raise JevValidationError(f"Parameter 'mcps' is not valid JSON: {exc}")
+        mcps = parsed
+    if isinstance(mcps, dict):
+        return [mcps]
+    if isinstance(mcps, list):
+        return mcps
+    raise JevValidationError("Parameter 'mcps' must be a list of MCP server objects, or a JSON string holding one.")
+
+
+def _normalize_mcps(mcps) -> tuple:
+    """`(servers, excluded, invalid)` from the caller's raw list.
+
+    Each server becomes `{"name", "description", "tools": [{"name", "description"}]}`.
+    Order is the caller's, and the first occurrence of a duplicate name wins.
+
+    An entry that cannot be used is dropped, not fatal, and never silently: an
+    agent that sends one malformed entry should still get a selection for the
+    rest. A list where *nothing* survives is the caller's bug, though, and that
+    is reported as a refused input rather than an empty decision.
+    """
+    servers: List[dict] = []
+    excluded: List[dict] = []
+    seen: set = set()
+    for index, entry in enumerate(_coerce_mcp_list(mcps)):
+        if not isinstance(entry, dict):
+            excluded.append({"server": f"[{index}]", "reason": "invalid"})
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            excluded.append({"server": f"[{index}]", "reason": "invalid"})
+            continue
+        name = name.strip()
+        if name in seen:
+            # A duplicate carries the same tools under a second label; keeping
+            # both would let one server occupy two options in the Choice.
+            excluded.append({"server": name, "reason": "duplicate"})
+            continue
+        seen.add(name)
+
+        description = entry.get("description")
+        description = description.strip() if isinstance(description, str) else ""
+
+        tools: List[dict] = []
+        tool_names: set = set()
+        raw_tools = entry.get("tools")
+        if isinstance(raw_tools, str):
+            try:
+                raw_tools = json.loads(raw_tools)
+            except (ValueError, TypeError):
+                raw_tools = None
+        for tool in raw_tools if isinstance(raw_tools, list) else []:
+            if isinstance(tool, str):
+                tool = {"name": tool}
+            if not isinstance(tool, dict):
+                continue
+            tool_name = tool.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            tool_name = tool_name.strip()
+            if tool_name in tool_names:
+                continue
+            tool_names.add(tool_name)
+            tool_desc = tool.get("description")
+            tools.append({
+                "name": tool_name,
+                "description": tool_desc.strip() if isinstance(tool_desc, str) else "",
+            })
+
+        servers.append({"name": name, "description": description, "tools": tools})
+    return servers, excluded
+
+
+def _apply_mcp_ignore(servers: List[dict], excluded: List[dict]) -> List[dict]:
+    """Drop this server and every configured `ignore_mcps` match.
+
+    Self-exclusion is unconditional and happens *here*, before any criteria are
+    built, so `jev-engine` can never appear in `primary`, `servers`, `tools` or
+    `ranked_tools`. A judge that recommends itself sends the agent straight back
+    into the judge, and the loop never terminates on its own.
+    """
+    self_pattern = f"{SERVER_NAME.lower()}*"
+    patterns = _ignore_mcp_patterns()
+    kept: List[dict] = []
+    for server in servers:
+        name = server["name"]
+        if fnmatch.fnmatchcase(name.lower(), self_pattern):
+            excluded.append({"server": name, "reason": "self"})
+            continue
+        if _is_ignored_mcp(name, patterns):
+            excluded.append({"server": name, "reason": "configured"})
+            continue
+        kept.append(server)
+    return kept
+
+
+def _mcp_criteria(servers: List[dict]) -> tuple:
+    """`({server: evidence}, {tool_key: evidence}, {tool_key: (server, tool)})`.
+
+    The per-candidate share is `MAX_TOTAL_CRITERIA_CHARS / len(options)`, the
+    same arithmetic `candidates.build_criteria` uses, so a 64-server roster
+    cannot blow the token budget just because every server ships a long tool
+    description. It is rebuilt here rather than reused because that helper reads
+    files and runs `markdown_preview`, which would strip the `|` and `>` a tool
+    description legitimately contains.
+
+    The owner map is built alongside the keys rather than parsed back out of
+    them: `"<server>::<tool>"` only round-trips while no server name contains
+    `::`, and nothing should depend on a caller's naming choice being that
+    polite.
+    """
+    server_share = max(96, MAX_MCP_SERVER_DESC_CHARS)
+    tool_share = max(64, min(MAX_MCP_TOOL_DESC_CHARS, MAX_TOTAL_CRITERIA_CHARS // max(1, len(servers) * 8)))
+    server_criteria: Dict[str, str] = {}
+    tool_criteria: Dict[str, str] = {}
+    owners: Dict[str, tuple] = {}
+    for server in servers:
+        lines = [server["name"]]
+        if server["description"]:
+            lines.append(server["description"])
+        for tool in server["tools"]:
+            detail = truncate_text(tool["description"], max(0, tool_share - 32)) if tool["description"] else ""
+            lines.append(f"- {tool['name']}" + (f": {detail}" if detail else ""))
+        server_criteria[server["name"]] = truncate_text("\n".join(lines), server_share)
+        for tool in server["tools"]:
+            head = f"{server['name']}.{tool['name']}"
+            key = f"{server['name']}::{tool['name']}"
+            # A tool with no description is still a real option: the name is the
+            # only evidence there is, and a Choice cannot pick a value it was
+            # never given.
+            tool_criteria[key] = (
+                truncate_text(f"{head} — {tool['description']}", MAX_MCP_TOOL_DESC_CHARS)
+                if tool["description"]
+                else head
+            )
+            owners[key] = (server["name"], tool["name"])
+    return server_criteria, tool_criteria, owners
+
+
+def _tool_owner(owners: Dict[str, tuple], key: str) -> tuple:
+    """`(server, tool)` for a `server::tool` option key, from the built map."""
+    return owners.get(key, (key.partition("::")[0], key.partition("::")[2]))
+
+
+def _mcp_result(
+    exists: str,
+    *,
+    excluded: Optional[List[dict]] = None,
+    reason_codes: Optional[List[str]] = None,
+) -> dict:
+    """The no-decision envelope, with the same keys every other branch returns."""
+    return {
+        "matched": False,
+        "exists": exists,
+        "primary": None,
+        "servers": [],
+        "tools": [],
+        "ranked_tools": [],
+        "excluded": list(excluded or []),
+        "summary": "No MCP server was selected for this task.",
+        "probability": 0.0,
+        "relevance_prob": 0.0,
+        "decisive_prob": 0.0,
+        "candidates_considered": 0,
+        "candidates_evaluated": 0,
+        "candidates_truncated": False,
+        "reason_codes": list(reason_codes or []),
+        # Nothing was judged, so there is nothing to gate: the same "auto" the
+        # other tools report when discovery found nothing at all.
+        "action": "auto",
+        "confidence": None,
+        "truncated": False,
+        "coverage": _coverage_envelope(None, _candidate_fields(True, 0, 0, 0)),
+        "model": None,
+        "usage": None,
+    }
+
+
+def select_mcp_tools(
+    task: str,
+    mcps,
+    root_dir: str = ".",
+    task_file: Optional[str] = None,
+    max_tools: int = DEFAULT_MAX_MCP_TOOLS,
+    max_servers: int = DEFAULT_MAX_MCP_SERVERS,
+) -> dict:
+    """Select the MCP server and tools best suited to the agent's current task.
+
+    One round trip, four independent questions over the same state:
+
+    * `target_server` — a Choice over the supplied server names plus `none`.
+    * `is_relevant`   — does this task need an external MCP at all?
+    * `is_decisive`   — is one server the right one, rather than several that
+      are comparably usable? A Choice always returns a winner; with a flat
+      distribution that winner is arbitrary, which is a different question from
+      the one the Choice can answer.
+    * `target_tool`   — a Choice over every supplied tool, answered speculatively
+      over all servers, because the questions in one request cannot see each
+      other's answers. Code keeps the winner's server's tools.
+
+    `exists` is the field to branch on: `answered` (one server, use its tools),
+    `ambiguous` (several servers are equally usable — decide yourself or ask),
+    `absent`/`partial` (no server is needed), `no_candidates` (nothing to choose
+    from: the list was empty, or every entry was excluded, including this
+    server, which is never a candidate).
+    """
+    root = _validate_root_dir(root_dir)
+    task = _task_text(task, root, task_file)
+    max_tools = _bounded_count(max_tools, "max_tools", 1, MAX_MAX_MCP_TOOLS)
+    max_servers = _bounded_count(max_servers, "max_servers", 1, MAX_MAX_MCP_SERVERS)
+
+    supplied, excluded = _normalize_mcps(mcps)
+    if not supplied and excluded:
+        # A roster that is empty is the honest "this agent has no MCP servers"
+        # case, which is a result. A roster where every entry was malformed is
+        # the caller's bug, and reporting it as "no candidates" would read as a
+        # decision about a list that was never usable.
+        raise JevValidationError(
+            f"No usable MCP server in 'mcps': all {len(excluded)} entries were malformed. "
+            'Each entry needs at least a "name".'
+        )
+    # The caller's list is the input budget too: a 5 MB roster must be refused
+    # before it is turned into criteria.
+    _check_input_length("mcps", json.dumps(supplied, default=str))
+    selectable = _apply_mcp_ignore(supplied, excluded)
+    considered = len(selectable)
+    invalid_count = sum(1 for entry in excluded if entry["reason"] == "invalid")
+
+    if not selectable:
+        names = ", ".join(sorted({entry["server"] for entry in excluded})) or "none"
+        result = _mcp_result(
+            "no_candidates",
+            excluded=excluded,
+            reason_codes=["no_selectable_mcp"] + ([f"invalid_entries={invalid_count}"] if invalid_count else []),
+        )
+        result["summary"] = (
+            f"No selectable MCP server: every supplied entry was excluded ({names})."
+            if excluded
+            else "No MCP servers were supplied."
+        )
+        log_event("mcp_no_candidates", considered=considered, excluded=len(excluded))
+        return result
+
+    servers, servers_truncated = bound_candidates(selectable, MAX_MCP_SERVERS)
+    if servers_truncated:
+        # The servers that never reached the model are named, not just counted.
+        kept_names = {server["name"] for server in servers}
+        excluded.extend(
+            {"server": server["name"], "reason": "over_limit"}
+            for server in selectable
+            if server["name"] not in kept_names
+        )
+
+    server_criteria, tool_criteria, tool_owners = _mcp_criteria(servers)
+    tools_total = sum(len(server["tools"]) for server in servers)
+    # One Choice holds at most 250 options, so the tool roster is capped there.
+    # What is dropped is reported, never silently: a tool that was never offered
+    # cannot be defended, and the agent may well have wanted it.
+    if len(tool_criteria) > MAX_MCP_TOOL_OPTIONS:
+        kept_keys = list(tool_criteria)[:MAX_MCP_TOOL_OPTIONS]
+        tools_skipped = len(tool_criteria) - len(kept_keys)
+        tool_criteria = {key: tool_criteria[key] for key in kept_keys}
+    else:
+        tools_skipped = 0
+    candidates_truncated = servers_truncated or bool(tools_skipped)
+
+    server_criteria["none"] = (
+        "No supplied MCP server has a tool this task needs; the agent's own built-in "
+        "tools are enough"
+    )
+    if tool_criteria:
+        tool_criteria["none"] = "No supplied MCP tool is needed for this task"
+
+    questions = {
+        "target_server": Choice(criteria=server_criteria, instructions=MCP_SERVER_INSTRUCTIONS),
+        "is_relevant": Noul(instructions=MCP_RELEVANT_INSTRUCTIONS, criteria=dict(_MCP_PRESENT_CRITERIA)),
+        "is_decisive": Noul(instructions=MCP_DECISIVE_INSTRUCTIONS, criteria=dict(_MCP_DECISIVE_CRITERIA)),
+    }
+    if tool_criteria:
+        questions["target_tool"] = Choice(criteria=tool_criteria, instructions=MCP_TOOL_INSTRUCTIONS)
+
+    state = {
+        "task": task,
+        "goal": MCP_SELECTION_STATE_GOAL,
+        "servers_evaluated": len(servers),
+        "tools_evaluated": len(tool_criteria) - (1 if "none" in tool_criteria else 0),
+        "excluded_servers": sorted({entry["server"] for entry in excluded}),
+        "recent_context": "",
+    }
+    res, fitted, cfg = _request(state, questions)
+
+    server_ans = get_answer(res, "target_server")
+    chosen = get_val(server_ans)
+    server_probs = _answer_probs(res, "target_server")
+    conf = _slot_confidence(server_ans)
+    relevance_prob = round(float(get_prob(get_answer(res, "is_relevant"))), 4)
+    decisive_prob = round(float(get_prob(get_answer(res, "is_decisive"))), 4)
+
+    tool_probs = _answer_probs(res, "target_tool") if "target_tool" in questions else {}
+    tool_ans = get_answer(res, "target_tool")
+    tool_choice = get_val(tool_ans) if tool_ans is not None else None
+
+    # The gap is checked directly rather than read off confidence: a tight
+    # 0.46/0.42 split is the harder case and still normalises to a high
+    # confidence, while a flat five-way split normalises to a low one.
+    ordered = sorted(
+        ((prob, name) for name, prob in server_probs.items() if name != "none"),
+        key=lambda item: (-item[0], item[1]),
+    )
+    gap = round(ordered[0][0] - ordered[1][0], 4) if len(ordered) > 1 else 1.0
+    relevant = bool(chosen) and chosen != "none" and relevance_prob >= NONE_CONFIDENCE
+    ambiguous = bool(
+        relevant
+        and (decisive_prob < NONE_CONFIDENCE or gap < AMBIGUITY_GAP)
+    )
+
+    if not relevant:
+        exists = _exists_verdict(chosen, conf, relevance_prob)
+    elif ambiguous:
+        exists = "ambiguous"
+    else:
+        exists = "answered"
+
+    probability = round(server_probs.get(chosen, 0.0), 4) if relevant else 0.0
+
+    servers_ranked = [
+        {"server": name, "name": name, "probability": round(prob, 4)}
+        for prob, name in ordered
+    ][:max_servers]
+    contenders = [
+        entry for entry in servers_ranked
+        if entry["probability"] >= MCP_CONTENDER_MIN_PROB
+    ] if ambiguous else []
+    if ambiguous and not contenders and servers_ranked:
+        # A flat distribution in which nothing clears the contender floor is
+        # still a tie, and an empty contender list would say less than the
+        # ranking does. The top two *are* the contenders by definition here.
+        contenders = servers_ranked[:2]
+
+    ranked_tools = sorted(
+        (
+            {
+                "server": _tool_owner(tool_owners, key)[0],
+                "tool": _tool_owner(tool_owners, key)[1],
+                "probability": round(prob, 4),
+            }
+            for key, prob in tool_probs.items()
+            if key != "none"
+        ),
+        key=lambda entry: -entry["probability"],
+    )[:MAX_MAX_MCP_TOOLS]
+
+    # Tools are the winner's server's, and every tool that cleared the
+    # threshold is returned: `max_tools` is a ceiling on the list, not a second
+    # filter applied on top of it.
+    tools_out: List[dict] = []
+    tools_considered = 0
+    if exists == "answered" and chosen and tool_probs:
+        winner_tool = tool_choice if tool_choice and tool_choice in tool_probs else None
+        if winner_tool and _tool_owner(tool_owners, winner_tool)[0] != chosen:
+            # The speculative tool question can land on another server's tool;
+            # it never overrides the server the Choice picked.
+            winner_tool = None
+        for key, prob in sorted(tool_probs.items(), key=lambda kv: -kv[1]):
+            if key == "none":
+                continue
+            server_name, tool_name = _tool_owner(tool_owners, key)
+            if server_name != chosen:
+                continue
+            is_winner = key == winner_tool
+            if not is_winner and prob < MCP_TOOL_MIN_PROB:
+                continue
+            tools_considered += 1
+            tools_out.append({
+                "server": server_name,
+                "tool": tool_name,
+                "probability": round(prob, 4),
+            })
+        if len(tools_out) > max_tools:
+            tools_out = tools_out[:max_tools]
+
+    # A list the caller cannot see in full is incomplete context, exactly like a
+    # truncated criteria budget: a tool dropped at the ceiling is one the agent
+    # was never told about, so `auto` is not available.
+    tools_capped = tools_considered > max_tools
+    action = require_complete_context(
+        action_from_confidence(conf, cfg.auto_accept, cfg.review_at),
+        fitted["truncated"] or candidates_truncated or tools_capped,
+    )
+    if exists == "ambiguous":
+        # Several servers are equally usable: the ranking is real information,
+        # but picking one of them is the caller's decision, not this tool's.
+        action = worst_action([action, "review"])
+
+    reason_codes: List[str] = []
+    if invalid_count:
+        reason_codes.append(f"invalid_entries={invalid_count}")
+    if any(entry["reason"] == "configured" for entry in excluded):
+        reason_codes.append(
+            f"excluded_configured={sum(1 for entry in excluded if entry['reason'] == 'configured')}"
+        )
+    if servers_truncated:
+        reason_codes.append("servers_truncated")
+    if tools_skipped:
+        reason_codes.append(f"tools_offered_truncated={tools_skipped}")
+    if tools_capped:
+        reason_codes.append(f"tools_truncated={tools_considered}>max_tools={max_tools}")
+    if exists == "answered" and not tools_out:
+        # The server is the right one and none of its tools cleared the floor
+        # (or the tool question landed on another server's tool). The agent
+        # still holds the roster and can read that server's tools itself, but an
+        # empty list must never look like "call nothing".
+        reason_codes.append("no_tools_above_threshold")
+    if exists == "ambiguous":
+        reason_codes.append(
+            f"is_decisive={decisive_prob:.2f}" if decisive_prob < NONE_CONFIDENCE
+            else f"ambiguous_top2_gap={gap:.2f}"
+        )
+    if fitted["truncated"]:
+        reason_codes.append("context_truncated")
+    reason_codes.extend(_confidence_reasons(relevance_prob, decisive_prob, conf, cfg))
+    if action != "auto":
+        reason_codes.append(f"action={action}")
+
+    if exists == "answered":
+        summary = (
+            f"Use MCP '{chosen}' for this task"
+            + (f"; call {', '.join(entry['tool'] for entry in tools_out)}" if tools_out else "")
+        )
+    elif exists == "ambiguous":
+        summary = (
+            "Several MCP servers are comparably usable for this task ("
+            + ", ".join(entry["server"] for entry in contenders)
+            + "); the tools are not chosen for you."
+            if contenders
+            else "No supplied MCP server stands out for this task; the tools are not chosen for you."
+        )
+    else:
+        summary = "No supplied MCP server has a tool this task needs."
+
+    coverage = _coverage_envelope(
+        fitted,
+        _candidate_fields(
+            complete=not candidates_truncated,
+            considered=considered,
+            original_chars=sum(len(v) for v in server_criteria.values())
+            + sum(len(v) for v in tool_criteria.values()),
+            evaluated_chars=sum(len(v) for v in server_criteria.values())
+            + sum(len(v) for v in tool_criteria.values()),
+            tools_considered=tools_total,
+            tools_skipped=tools_skipped,
+            servers_excluded=len(excluded),
+        ),
+    )
+
+    result = {
+        "matched": exists == "answered",
+        "exists": exists,
+        "primary": (
+            {"server": chosen, "name": chosen, "probability": probability}
+            if exists == "answered" and chosen
+            else None
+        ),
+        "servers": contenders if ambiguous else servers_ranked,
+        "tools": tools_out,
+        "ranked_tools": ranked_tools,
+        "excluded": excluded,
+        "summary": summary,
+        "probability": probability,
+        "relevance_prob": relevance_prob,
+        "decisive_prob": decisive_prob,
+        "candidates_considered": considered,
+        "candidates_evaluated": len(servers),
+        "candidates_truncated": candidates_truncated,
+        "reason_codes": reason_codes,
+        "action": action,
+        "confidence": round(conf, 4),
+        "truncated": fitted["truncated"],
+        "coverage": coverage,
+    }
+    result.update(_response_meta(res, cfg))
+    return result
+
+
+def _confidence_reasons(relevance_prob: float, decisive_prob: float, conf: float, cfg) -> List[str]:
+    """Reason codes for a decision that did not reach `auto`.
+
+    This tool reports three numbers — the server Choice's confidence and the two
+    Nouls — so the code has to name the one that failed rather than reusing the
+    guardrail's single `confidence=` line.
+    """
+    codes: List[str] = []
+    if relevance_prob < NONE_CONFIDENCE:
+        codes.append(f"relevance_prob={relevance_prob:.2f}<{NONE_CONFIDENCE:.2f}")
+    if decisive_prob < NONE_CONFIDENCE:
+        codes.append(f"is_decisive={decisive_prob:.2f}<{NONE_CONFIDENCE:.2f}")
+    if conf < cfg.auto_accept:
+        codes.append(f"confidence={conf:.2f}<{cfg.auto_accept:.2f}")
+    return codes
+
+
+# ----------------------------------------------------------------------
+# 6. CLI Entry Point
 # ----------------------------------------------------------------------
 def _cli_dispatch(argv) -> int:
     if len(argv) < 2:
-        print(json.dumps({"error": {"code": "USAGE", "message": "Usage: python jev_engine.py [verify|resource|files] [args...] (resource/files: <task> [root_dir] [task_file])", "retryable": False}}))
+        print(json.dumps({"error": {"code": "USAGE", "message": "Usage: python jev_engine.py [verify|resource|files|tier|mcps] [args...] (resource/files: <task> [root_dir] [task_file]; mcps: <task> <root_dir> <mcps-json> [task_file])", "retryable": False}}))
         return 1
     action = argv[0].lower()
     try:
@@ -1686,6 +2332,13 @@ def _cli_dispatch(argv) -> int:
             print(json.dumps(select_target_files(argv[1], root_path, task_file=task_file)))
         elif action in ["tier", "model_tier"]:
             print(json.dumps(select_model_tier(argv[1])))
+        elif action in ["mcps", "mcp"]:
+            root_path = argv[2] if len(argv) > 2 else "."
+            if len(argv) < 4:
+                print(json.dumps({"error": {"code": "USAGE", "message": "mcps needs a JSON list of MCP servers: python jev_engine.py mcps \"<task>\" \".\" '[{\"name\": \"git\", \"tools\": []}]'", "retryable": False}}))
+                return 1
+            task_file = argv[4] if len(argv) > 4 else None
+            print(json.dumps(select_mcp_tools(argv[1], argv[3], root_path, task_file=task_file)))
         else:
             print(json.dumps({"error": {"code": "USAGE", "message": f"Unknown action: {action}", "retryable": False}}))
             return 1

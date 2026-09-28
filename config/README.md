@@ -276,6 +276,7 @@ To set a project-specific default, add it back:
     "frontier": ""
   },
   "scan_paths": [],                 // extra skill dirs, appended to the defaults
+  "ignore_mcps": [],                // MCP names/globs `select_mcp_tools` never offers
   "judge_read_prompts": true,       // PLUGIN: judge a prompt file the agent reads
   "inject_agent_instructions": true // PLUGIN: state the decision points every turn
 }
@@ -295,12 +296,19 @@ To set a project-specific default, add it back:
   deleted from the server.
 - All keys optional; missing keys fall back to defaults: routing **off**, empty
   `models`, built-in `scan_paths` (`.agents/skills`, `.agents/workflows`,
-  `.agents/memory`, `.opencode/skills`, `skills`, `.agents`).
+  `.agents/memory`, `.opencode/skills`, `skills`, `.agents`) and an
+  `ignore_mcps` of `["jev-engine*"]`.
 - `scan_paths` entries are relative to the workspace root and **appended** to the
   built-in defaults, deduplicated. They union across files. A scan path that is
   already inside another configured scan path (the built-in `.agents` covers
   `.agents/skills`, `.agents/workflows` and `.agents/memory`) is collapsed to the
   ancestor, so those files are walked once instead of four times.
+- `ignore_mcps` is read by the **server** and only affects `select_mcp_tools`.
+  Entries are an exact MCP server name or a glob (`git*`, `playwright`),
+  case-insensitive, unioned across files. It is seeded with `jev-engine*` so the
+  judge is never a candidate for itself — a judge that recommends itself sends
+  the agent straight back into it — and that seed is unconditional. Every
+  excluded server is named in the tool's `excluded` list.
 - `judge_read_prompts` and `inject_agent_instructions` are read by the **plugin
   only**, are **on by default**, and are disabled only by an explicit `false` — a
   typo must not be able to switch the judge off.

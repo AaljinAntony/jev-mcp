@@ -6,6 +6,7 @@
     "frontier": ""
   },
   "scan_paths": [],
+  "ignore_mcps": [],
   "judge_read_prompts": true,
   "inject_agent_instructions": true
 }

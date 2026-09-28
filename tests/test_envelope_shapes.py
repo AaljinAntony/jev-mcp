@@ -125,6 +125,95 @@ class TestSelectTargetFilesEnvelopeKeys:
         assert res_no_candidates["confidence"] is None
 
 
+class TestSelectMcpToolsEnvelopeKeys:
+    """Five branches, one key set: nothing may be missing on the paths that
+    decided nothing."""
+
+    ROSTER = [
+        {"name": "jev-engine", "description": "Jev decision engine", "tools": [{"name": "guardrail_command", "description": "is this command safe"}]},
+        {"name": "git", "description": "git repositories", "tools": [{"name": "git_commit", "description": "create a commit"}]},
+        {"name": "github", "description": "github issues and pull requests", "tools": [{"name": "create_pr", "description": "open a pull request"}]},
+    ]
+
+    def _stub(self, monkeypatch, server_probs, tool_probs, relevance, decisive, confidence=0.9):
+        from typesafe_sdk import ChoiceAnswer, NoulAnswer, SystemOneResponse, Usage
+
+        def _fake_request(state, questions):
+            answers = {
+                "target_server": ChoiceAnswer(
+                    choice=max(server_probs, key=lambda k: server_probs[k]),
+                    probabilities=dict(server_probs),
+                    confidence=confidence,
+                ),
+                "is_relevant": NoulAnswer(noul=relevance),
+                "is_decisive": NoulAnswer(noul=decisive),
+            }
+            if "target_tool" in questions:
+                answers["target_tool"] = ChoiceAnswer(
+                    choice=max(tool_probs, key=lambda k: tool_probs[k]),
+                    probabilities=dict(tool_probs),
+                    confidence=0.9,
+                )
+            return (
+                SystemOneResponse(model="jev-test", answers=answers, usage=Usage(input_tokens=8, output_tokens=4)),
+                {"truncated": False, "coverage": {}},
+                jev_engine.get_config(),
+            )
+
+        monkeypatch.setattr(jev_engine, "_request", _fake_request)
+
+    def test_keys_identical_across_branches(self, tmp_path, monkeypatch):
+        none_prob = {"git": 0.0, "github": 0.0, "none": 1.0}
+        tools_none = {"git::git_commit": 0.0, "github::create_pr": 0.0, "none": 1.0}
+
+        # 1. Nothing to choose from: the roster is empty.
+        res_no_candidates = jev_engine.select_mcp_tools("fix a typo", [], str(tmp_path))
+        assert res_no_candidates["exists"] == "no_candidates"
+
+        # 2. The Choice declines.
+        self._stub(monkeypatch, none_prob, tools_none, relevance=0.05, decisive=0.05)
+        res_absent = jev_engine.select_mcp_tools("fix a typo", self.ROSTER, str(tmp_path))
+
+        # 3. The Choice wins among servers that do not fit.
+        forced = {"git": 0.6, "github": 0.3, "none": 0.1}
+        self._stub(monkeypatch, forced, {"git::git_commit": 0.9, "github::create_pr": 0.05, "none": 0.05}, relevance=0.2, decisive=0.9)
+        res_partial = jev_engine.select_mcp_tools("fix a typo", self.ROSTER, str(tmp_path))
+
+        # 4. Two servers are equally usable.
+        self._stub(monkeypatch, {"git": 0.45, "github": 0.45, "none": 0.1}, {"git::git_commit": 0.5, "github::create_pr": 0.5, "none": 0.0}, relevance=0.9, decisive=0.9)
+        res_ambiguous = jev_engine.select_mcp_tools("commit and open a pr", self.ROSTER, str(tmp_path))
+
+        # 5. The normal answer.
+        self._stub(monkeypatch, {"git": 0.8, "github": 0.1, "none": 0.1}, {"git::git_commit": 0.8, "github::create_pr": 0.1, "none": 0.1}, relevance=0.9, decisive=0.9)
+        res_answered = jev_engine.select_mcp_tools("commit the staged changes", self.ROSTER, str(tmp_path))
+
+        keys = {name: set(result.keys()) for name, result in [
+            ("no_candidates", res_no_candidates),
+            ("absent", res_absent),
+            ("partial", res_partial),
+            ("ambiguous", res_ambiguous),
+            ("answered", res_answered),
+        ]}
+        reference = keys["answered"]
+        for name, branch in keys.items():
+            assert branch == reference, f"{name} differs: {branch ^ reference}"
+
+        assert res_absent["exists"] == "absent"
+        assert res_partial["exists"] == "partial"
+        assert res_ambiguous["exists"] == "ambiguous"
+        assert res_answered["exists"] == "answered"
+
+        for result in (res_no_candidates, res_absent, res_partial, res_ambiguous):
+            assert result["primary"] is None
+            assert result["tools"] == []
+            assert result["matched"] is False
+        assert res_no_candidates["confidence"] is None
+        assert res_no_candidates["coverage"] is not None
+        assert res_answered["primary"]["server"] == "git"
+        assert [entry["tool"] for entry in res_answered["tools"]] == ["git_commit"]
+        assert res_ambiguous["action"] != "auto"
+
+
 class TestSelectModelTierEnvelopeKeys:
     def test_keys_identical_across_branches(self, monkeypatch, stub_choice):
         # 1. Routing off branch
