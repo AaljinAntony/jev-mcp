@@ -1,0 +1,376 @@
+[
+  {
+    "id": "commit-staged-changes",
+    "task": "commit the changes I have staged with the message from the last commit style",
+    "expected_mcp": "git",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, stashes",
+        "tools": [
+          { "name": "git_commit", "description": "create a commit from the staged changes" },
+          { "name": "git_diff", "description": "show the working tree or staged diff" },
+          { "name": "git_log", "description": "show commit history" },
+          { "name": "git_branch", "description": "list, create or switch branches" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "create_pr", "description": "open a pull request against a branch" },
+          { "name": "list_issues", "description": "search repository issues" },
+          { "name": "post_review", "description": "leave a review comment on a pull request" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "write_file", "description": "write a file to disk" },
+          { "name": "list_directory", "description": "list the entries of a directory" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "open-a-pull-request",
+    "task": "open a pull request for the feature branch against main",
+    "expected_mcp": "github",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, stashes",
+        "tools": [
+          { "name": "git_commit", "description": "create a commit from the staged changes" },
+          { "name": "git_diff", "description": "show the working tree or staged diff" },
+          { "name": "push", "description": "push commits to a remote" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "create_pr", "description": "open a pull request against a branch" },
+          { "name": "merge_pr", "description": "merge an open pull request" },
+          { "name": "list_issues", "description": "search repository issues" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "write_file", "description": "write a file to disk" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "browse-a-web-page",
+    "task": "open the pricing page on example.com and tell me what the cheapest plan costs",
+    "expected_mcp": "playwright",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "playwright",
+        "description": "drive a real browser: navigate, click, fill forms, read the rendered page",
+        "tools": [
+          { "name": "browser_navigate", "description": "open a URL in the browser" },
+          { "name": "browser_click", "description": "click an element on the page" },
+          { "name": "browser_snapshot", "description": "read the current page as text" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "write_file", "description": "write a file to disk" }
+        ]
+      },
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" },
+          { "name": "describe_table", "description": "show the columns of a table" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "query-the-users-table",
+    "task": "how many users signed up in the last 30 days, grouped by country",
+    "expected_mcp": "postgres",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" },
+          { "name": "describe_table", "description": "show the columns of a table" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "search_files", "description": "search file contents by pattern" }
+        ]
+      },
+      {
+        "name": "playwright",
+        "description": "drive a real browser: navigate, click, fill forms, read the rendered page",
+        "tools": [
+          { "name": "browser_navigate", "description": "open a URL in the browser" },
+          { "name": "browser_snapshot", "description": "read the current page as text" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "stale-branch-cleanup",
+    "task": "which local branches have not been touched in three months",
+    "expected_mcp": "git",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, stashes",
+        "tools": [
+          { "name": "git_branch", "description": "list, create or switch branches" },
+          { "name": "git_log", "description": "show commit history" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "list_branches", "description": "list the branches on the remote repository" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "slack-a-release-note",
+    "task": "post the 2.1 release note to the #releases channel in Slack",
+    "expected_mcp": "slack",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "slack",
+        "description": "read and post Slack messages, list channels",
+        "tools": [
+          { "name": "post_message", "description": "post a message to a channel" },
+          { "name": "list_channels", "description": "list the channels in the workspace" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "write_file", "description": "write a file to disk" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "create_release", "description": "publish a release" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "publish-the-release",
+    "task": "publish the release: tag the commit, then create the release on the forge",
+    "expected_mcp": "github",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, tags, stashes",
+        "tools": [
+          { "name": "git_tag", "description": "create an annotated tag on a commit" },
+          { "name": "git_push", "description": "push commits and tags to a remote" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "create_release", "description": "publish a release from a tag" },
+          { "name": "create_tag", "description": "create a tag on the remote repository" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "two-notes-apps-fit-equally",
+    "task": "add a note titled standup with the items we agreed in the meeting",
+    "expected_mcp": "notes-one",
+    "acceptable_mcps": ["notes-one", "notes-two"],
+    "expected_mcp_ambiguous": true,
+    "roster": [
+      {
+        "name": "notes-one",
+        "description": "personal notes: create, edit, search and list notes",
+        "tools": [
+          { "name": "create_note", "description": "create a note with a title and body" },
+          { "name": "search_notes", "description": "search notes by text" },
+          { "name": "list_notes", "description": "list the notes in a folder" }
+        ]
+      },
+      {
+        "name": "notes-two",
+        "description": "personal notes: create, edit, search and list notes",
+        "tools": [
+          { "name": "add_note", "description": "add a note with a title and body" },
+          { "name": "find_notes", "description": "find notes by text" },
+          { "name": "list_all_notes", "description": "list every note" }
+        ]
+      },
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "fix-a-typo",
+    "task": "fix the typo in the second line of the readme",
+    "expected_mcp": null,
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" }
+        ]
+      },
+      {
+        "name": "slack",
+        "description": "read and post Slack messages, list channels",
+        "tools": [
+          { "name": "post_message", "description": "post a message to a channel" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "explain-this-function",
+    "task": "explain what the retry decorator in this codebase actually does",
+    "expected_mcp": null,
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "playwright",
+        "description": "drive a real browser: navigate, click, fill forms, read the rendered page",
+        "tools": [
+          { "name": "browser_navigate", "description": "open a URL in the browser" }
+        ]
+      },
+      {
+        "name": "github",
+        "description": "GitHub: issues, pull requests, releases, code review comments",
+        "tools": [
+          { "name": "list_issues", "description": "search repository issues" }
+        ]
+      },
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "rename-a-local-variable",
+    "task": "rename the loop variable from i to index in that function",
+    "expected_mcp": null,
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, stashes",
+        "tools": [
+          { "name": "git_commit", "description": "create a commit from the staged changes" }
+        ]
+      },
+      {
+        "name": "slack",
+        "description": "read and post Slack messages, list channels",
+        "tools": [
+          { "name": "post_message", "description": "post a message to a channel" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "add-a-column",
+    "task": "add an index on the orders table for the customer_id column",
+    "expected_mcp": "postgres",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "postgres",
+        "description": "query a PostgreSQL database and run DDL",
+        "tools": [
+          { "name": "query", "description": "run a SQL query and return rows" },
+          { "name": "execute_ddl", "description": "run a DDL statement such as CREATE INDEX" }
+        ]
+      },
+      {
+        "name": "filesystem",
+        "description": "read, write and search files under a directory tree",
+        "tools": [
+          { "name": "read_file", "description": "read a file from disk" },
+          { "name": "search_files", "description": "search file contents by pattern" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "the-judge-is-in-the-roster",
+    "task": "commit the changes I have staged",
+    "expected_mcp": "git",
+    "expected_mcp_ambiguous": false,
+    "roster": [
+      {
+        "name": "jev-engine",
+        "description": "Jev decision engine: guardrails, skill routing, file targeting",
+        "tools": [
+          { "name": "guardrail_command", "description": "judge whether a shell command is safe" },
+          { "name": "search_agent_skills", "description": "find the agent skill that applies" }
+        ]
+      },
+      {
+        "name": "git",
+        "description": "read and write local git repositories: history, branches, commits, stashes",
+        "tools": [
+          { "name": "git_commit", "description": "create a commit from the staged changes" }
+        ]
+      }
+    ]
+  }
+]

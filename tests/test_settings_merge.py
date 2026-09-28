@@ -14,6 +14,9 @@ import pytest
 import jev_engine
 from jev_engine import (
     DEFAULT_SCAN_PATHS,
+    SERVER_NAME,
+    _ignore_mcp_patterns,
+    _is_ignored_mcp,
     _reset_settings_cache,
     _snapshot,
     load_jev_settings,
@@ -233,11 +236,42 @@ def test_mutating_a_returned_scan_paths_list_does_not_affect_the_next_load(proje
 
 
 def test_snapshot_copies_nested_containers():
-    original = {"models": {"a": 1}, "scan_paths": ["x"], "sources": ["s"], "source": "s"}
+    original = {
+        "models": {"a": 1},
+        "scan_paths": ["x"],
+        "ignore_mcps": ["git*"],
+        "sources": ["s"],
+        "source": "s",
+    }
     snap = _snapshot(original)
     assert snap == original
     assert snap["models"] is not original["models"]
     assert snap["scan_paths"] is not original["scan_paths"]
+    assert snap["ignore_mcps"] is not original["ignore_mcps"]
     assert snap["sources"] is not original["sources"]
     snap["models"]["a"] = 2
     assert original["models"]["a"] == 1
+    snap["ignore_mcps"].append("playwright")
+    assert original["ignore_mcps"] == ["git*"]
+
+
+def test_ignore_mcps_unions_across_files(project, monkeypatch):
+    """A project file adds to the inherited list rather than replacing it."""
+    project_file = project / "jevs_settings.json"
+    user_file = project / "user.json"
+    _write(user_file, {"ignore_mcps": ["git*"]})
+    _write(project_file, {"ignore_mcps": ["playwright", "git"]})
+    monkeypatch.setattr(jev_engine, "_find_settings_files", lambda: [project_file, user_file])
+    _reset_settings_cache()
+
+    settings = load_jev_settings()
+    assert set(settings["ignore_mcps"]) == {"jev-engine*", "git*", "playwright", "git"}
+    assert len(settings["ignore_mcps"]) == len(set(settings["ignore_mcps"])), "duplicates survived the union"
+
+
+def test_the_judge_is_excluded_by_default():
+    """The self-exclusion is seeded from `SERVER_NAME`, not written out twice."""
+    settings = load_jev_settings()
+    assert f"{SERVER_NAME}*" in settings["ignore_mcps"]
+    assert _is_ignored_mcp(SERVER_NAME, _ignore_mcp_patterns()) is True
+    assert _is_ignored_mcp("git", _ignore_mcp_patterns()) is False

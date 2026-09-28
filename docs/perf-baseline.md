@@ -93,6 +93,32 @@ Measured trade-off on the same fixture set (live, `search_target_files`):
 1.0 there and halving the budget costs 11 points of top-1. Lower it deliberately
 if per-call cost matters more than the last few points of top-1.
 
+## `select_mcp_tools` — measured cost
+
+The roster is the caller's, so this tool has no filesystem work at all: the
+criteria are built from strings already in the payload. Over the 13 labelled
+cases in `tests/fixtures/mcp_selection_tasks.json`, live (jev-1.13):
+
+| Metric | Value |
+|---|---|
+| input tokens / call (mean) | 978 |
+| requests / call | 1.0 |
+| top-1 accuracy | 0.90 |
+| acceptable-server rate | 1.00 |
+| false-positive rate | 0.00 |
+| times the judge selected itself | 0 |
+
+Four questions ride along in that one request, so the token figure is the whole
+cost of the verdict, not one question's. The three candidate caps are what keep
+it there: `MAX_MCP_SERVERS` 64, `MAX_MCP_TOOL_OPTIONS` 250 (the `Choice`
+ceiling) and `MAX_MCP_TOOL_DESC_CHARS` 300 per tool, with the
+`MAX_TOTAL_CRITERIA_CHARS` share applied across servers. A roster past any of them
+sets `candidates_truncated` and blocks `action: "auto"`.
+
+A 20-tool answer is ~1.5 kB of envelope: the returned entries carry
+`{server, tool, probability}` and no description, because the agent already holds
+the roster it sent.
+
 ## `bench_jev.py` — Phase 3
 
 ```

@@ -45,6 +45,23 @@ MAX_PREVIEW_READ_CHARS = 16_000
 #: before MAX_CHOICE_OPTIONS ever applied. The overflow is reported, never
 #: silently dropped: a candidate that was never offered cannot be defended.
 MAX_DISCOVERED_FILES = 5_000
+#: At most this many MCP servers are offered as `Choice` options by
+#: `select_mcp_tools`. Well under MAX_CHOICE_OPTIONS on purpose: every server
+#: option carries its own tool roster, so the server choice is the expensive
+#: one and the tool choice is separately bounded by MAX_MCP_TOOL_OPTIONS.
+MAX_MCP_SERVERS = 64
+#: At most this many tools are offered as `target_tool` options. Equal to
+#: MAX_CHOICE_OPTIONS because they land in one Choice: 250 options is the API
+#: ceiling and going past it is a request TypeSafe rejects.
+MAX_MCP_TOOL_OPTIONS = 250
+#: Per-tool evidence in the `target_tool` criteria. Tool descriptions arrive
+#: from the agent, not from this repo, so a single 6,000-character schema
+#: summary must not be able to spend the whole criteria budget.
+MAX_MCP_TOOL_DESC_CHARS = 300
+#: Per-server evidence in the `target_server` criteria: the server's own
+#: description plus its tool roster. Larger than the tool cap because the
+#: roster is the part that tells two similarly named servers apart.
+MAX_MCP_SERVER_DESC_CHARS = 1_500
 
 TRUNCATION_MARKER = "\n…[truncated]"
 

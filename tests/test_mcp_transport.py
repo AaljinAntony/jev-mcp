@@ -175,16 +175,55 @@ def _body(result):
 
 
 # 1. The advertisement
-def test_all_four_tools_are_advertised(tools):
+def test_all_five_tools_are_advertised(tools):
     assert set(tools) == {
         "guardrail_command",
         "search_agent_skills",
         "search_target_files",
+        "select_mcp_tools",
         "select_model_tier",
     }
     for name, spec in tools.items():
         assert spec.get("description"), f"{name} has no description for the model"
         assert "inputSchema" in spec, f"{name} has no input schema"
+
+
+def test_select_mcp_tools_advertises_its_roster_shape(tools):
+    """The roster is an array of objects, and a string escape hatch beside it.
+
+    An agent that cannot see the parameter shape has to guess it, and a guessed
+    shape is a malformed call this server has to refuse. `mcps` is optional
+    because a client that can only send scalars uses `mcps_json` instead, so
+    only `task` is required.
+    """
+    schema = tools["select_mcp_tools"]["inputSchema"]
+    array_branch = next(
+        branch for branch in schema["properties"]["mcps"]["anyOf"] if branch.get("type") == "array"
+    )
+    assert array_branch["items"]["type"] == "object"
+    assert schema["properties"]["mcps_json"]["type"] == "string"
+    assert schema["required"] == ["task"]
+    # Both ceilings the engine validates are reachable from the wire, or a
+    # caller has no way to set them and the validation is decoration.
+    assert schema["properties"]["max_tools"]["default"] == 20
+    assert schema["properties"]["max_servers"]["default"] == 5
+
+
+def test_the_two_ceilings_are_reachable_over_the_wire(server):
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {
+            "task": "do the thing",
+            "mcps": ROSTER,
+            "root_dir": str(REPO),
+            "max_tools": 1,
+            "max_servers": 1,
+        },
+    )
+    body = _body(result)
+    assert len(body["servers"]) <= 1
+    assert len(body["tools"]) <= 1
 
 
 # 2. A round trip per tool
@@ -229,6 +268,97 @@ def test_select_model_tier_round_trip(server):
     assert body["recommended_tier"] is None
     assert body["action"] == "review"
     assert isinstance(body["model_map"], dict)
+
+
+ROSTER = [
+    {
+        "name": "jev-engine",
+        "description": "Jev decision engine",
+        "tools": [{"name": "guardrail_command", "description": "is this command safe"}],
+    },
+    {
+        "name": "git",
+        "description": "read and write git repositories",
+        "tools": [
+            {"name": "git_commit", "description": "create a commit from staged changes"},
+            {"name": "git_diff", "description": "show the working tree diff"},
+        ],
+    },
+    {
+        "name": "github",
+        "description": "github issues, pull requests, releases",
+        "tools": [{"name": "create_pr", "description": "open a pull request"}],
+    },
+]
+
+
+def test_select_mcp_tools_round_trip(server):
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {"task": "commit my staged changes", "mcps": ROSTER, "root_dir": str(REPO)},
+    )
+    assert result.get("isError") is not True
+    body = _body(result)
+    assert body["exists"] in {"answered", "ambiguous", "absent", "partial", "no_candidates"}
+    assert body["action"] in {"auto", "review", "escalate"}
+    # The judge is in the roster the agent sent, and it still cannot come back.
+    assert "jev-engine" not in json.dumps([body["primary"], body["servers"], body["tools"]])
+    assert {"server": "jev-engine", "reason": "self"} in body["excluded"]
+    assert body["model"].endswith("+mock")
+
+
+def test_select_mcp_tools_with_only_the_judge_connected(server):
+    """The case this exists for: no MCP beyond the judge, and no round trip."""
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {"task": "do anything", "mcps": [ROSTER[0]], "root_dir": str(REPO)},
+    )
+    body = _body(result)
+    assert body["exists"] == "no_candidates"
+    assert body["matched"] is False
+    assert body["primary"] is None
+    assert body["model"] is None
+
+
+def test_a_malformed_roster_arrives_as_iserror(server):
+    """An unusable roster is the caller's bug and must not read as a decision."""
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {"task": "commit", "mcps": [{"description": "no name"}], "root_dir": str(REPO)},
+    )
+    assert result.get("isError") is True
+    body = _body(result)
+    assert body["error"]["code"] == "INVALID_INPUT"
+    assert "no usable mcp server" in body["error"]["message"].lower()
+    assert "matched" not in body
+
+
+def test_an_unparseable_json_roster_arrives_as_iserror(server):
+    """The string escape hatch is parsed by the engine, so its refusal is ours."""
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {"task": "commit", "mcps_json": "[{not json", "root_dir": str(REPO)},
+    )
+    assert result.get("isError") is True
+    body = _body(result)
+    assert body["error"]["code"] == "INVALID_INPUT"
+    assert "not valid json" in body["error"]["message"].lower()
+    assert "matched" not in body
+
+
+def test_a_json_roster_survives_the_wire(server):
+    result = _call(
+        server,
+        "select_mcp_tools",
+        {"task": "commit my staged changes", "mcps_json": json.dumps(ROSTER), "root_dir": str(REPO)},
+    )
+    body = _body(result)
+    assert body["exists"] in {"answered", "ambiguous", "absent", "partial"}
+    assert "jev-engine" not in json.dumps([body["primary"], body["servers"], body["tools"]])
 
 
 def test_select_model_tier_with_routing_enabled(routing_server):

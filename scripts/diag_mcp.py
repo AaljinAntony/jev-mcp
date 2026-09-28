@@ -9,6 +9,7 @@ Examples::
     python scripts/diag_mcp.py --tool guardrail_command --command "git status"
     python scripts/diag_mcp.py --tool search_agent_skills --task "find skills for ui bug fix" --root_dir D:\\Godot_projects\\flux-wall
     python scripts/diag_mcp.py --tool search_target_files --task "find config" --root_dir D:\\Godot_projects\\flux-wall --mock
+    python scripts/diag_mcp.py --tool select_mcp_tools --task "commit the staged changes" --mcps '[{"name":"git","tools":[{"name":"git_commit","description":"create a commit"}]}]' --mock
 
 Relevant env overrides: ``JEV_DIAG_PYTHON``, ``JEV_DIAG_SERVER``.
 """
@@ -37,6 +38,28 @@ def build_args(args):
         return {"command": args.command}
     if args.tool == "select_model_tier":
         return {"task": args.task}
+    if args.tool == "select_mcp_tools":
+        # The roster is only available on the command line for this tool, so it
+        # arrives as JSON. `--mcps @path` reads it from a file, which is the
+        # form that survives PowerShell: a JSON literal typed inline loses its
+        # double quotes on the way to a native executable.
+        # `mcps` is tried first because it is the shape a real agent sends; a
+        # client that can only pass scalars uses `mcps_json`.
+        if not args.mcps:
+            raise SystemExit("--mcps is required for select_mcp_tools (a JSON list of servers, or @file)")
+        raw = args.mcps
+        if raw.startswith("@"):
+            try:
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SystemExit(f"--mcps file could not be read: {exc}")
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise SystemExit(f"--mcps is not valid JSON: {exc}")
+        if isinstance(parsed, list):
+            return {"task": args.task, "mcps": parsed, "root_dir": args.root_dir}
+        return {"task": args.task, "mcps_json": raw, "root_dir": args.root_dir}
     if args.tool in ("search_agent_skills", "search_target_files"):
         return {"task": args.task, "root_dir": args.root_dir}
     raise SystemExit(f"Unknown tool: {args.tool}")
@@ -47,6 +70,7 @@ def main() -> int:
     ap.add_argument("--tool", required=True)
     ap.add_argument("--task")
     ap.add_argument("--command")
+    ap.add_argument("--mcps", help='JSON list of MCP servers for --tool select_mcp_tools, or @file to read it')
     ap.add_argument("--root_dir", default=".")
     ap.add_argument("--cwd", default=None)
     ap.add_argument("--mock", action="store_true")

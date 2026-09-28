@@ -1,6 +1,6 @@
 # jev-engine — Jev AI (TypeSafe AI) MCP Server
 
-A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio. It wraps the Jev AI (TypeSafe AI) deterministic decision engine so any MCP-capable model (Claude, GPT, DeepSeek, local models) can run guardrail checks, skill routing, file targeting, and model-tier selection through four JSON-RPC tools.
+A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio. It wraps the Jev AI (TypeSafe AI) deterministic decision engine so any MCP-capable model (Claude, GPT, DeepSeek, local models) can run guardrail checks, skill routing, file targeting, MCP-server selection, and model-tier selection through five JSON-RPC tools.
 
 ---
 
@@ -30,7 +30,7 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | Path | Purpose |
 |---|---|
 | `D:\mcp\jev-typesafe-mcp\jev_engine.py` | Core decision logic, config loader, CLI entry point |
-| `D:\mcp\jev-typesafe-mcp\jev_mcp.py` | MCP server: registers the 4 tools, delegates to `jev_engine` |
+| `D:\mcp\jev-typesafe-mcp\jev_mcp.py` | MCP server: registers the 5 tools, delegates to `jev_engine` |
 | `D:\mcp\jev-typesafe-mcp\jev_errors.py` | Typed errors + `error_details()` envelope mapping |
 | `D:\mcp\jev-typesafe-mcp\jev_validation.py` | Fail-closed response envelope validation |
 | `D:\mcp\jev-typesafe-mcp\policy.py` | Confidence, policy actions, thresholds |
@@ -41,7 +41,7 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 | `D:\mcp\jev-typesafe-mcp\jev_logging.py` | Filesystem logging (tool calls, provider rounds, tracebacks) |
 | `D:\mcp\jev-typesafe-mcp\scripts\diag_mcp.py` | Transport-level MCP repro client for any workspace + prompt |
 | `D:\mcp\jev-typesafe-mcp\scripts\bench_jev.py` | Offline timing/size benchmark with `--assert` regression gates |
-| `D:\mcp\jev-typesafe-mcp\scripts\eval_routing.py` | Routing accuracy/false-positive/token harness over `tests\fixtures\routing_tasks.json` |
+| `D:\mcp\jev-typesafe-mcp\scripts\eval_routing.py` | Routing accuracy/false-positive/token harness over `tests\fixtures\routing_tasks.json` **and** `tests\fixtures\mcp_selection_tasks.json` |
 | `D:\mcp\jev-typesafe-mcp\scripts\doctor.py` | Read-only installation health check (interpreter, SDKs, key, settings, allowlist, plugin drift) |
 | `D:\mcp\jev-typesafe-mcp\scripts\stub_mcp.js` | Stub stdio MCP server used by `tests\test_plugin.mjs` (no Python, no API key) |
 | `D:\mcp\jev-typesafe-mcp\tests\` | pytest: validation, policy, limits, candidates, transport, mock tools, live smoke |
@@ -68,7 +68,7 @@ A Model Context Protocol (MCP) server registered as **`jev-engine`** over stdio.
 OpenCode (or any MCP client)
    │  stdio JSON-RPC
    ▼
-jev_mcp.py  ── MCPServer("jev-engine") ── 4 tools (typed error envelopes)
+jev_mcp.py  ── MCPServer("jev-engine") ── 5 tools (typed error envelopes)
    │  delegates
    ▼
 jev_engine.py  ── execute_system_one ── TypeSafeClient.system_one(state, questions)
@@ -90,15 +90,18 @@ jevs_settings.json  (enable_model_routing, models, scan_paths)
 
 ### Decision flow
 
-1. A tool receives a prompt/task/command via MCP.
-2. For the selection tools, `candidates.py` turns each candidate path into a short
-   evidence string (a `SKILL.md` front-matter `description` where present, else
-   the head of the file), bounded by `limits.MAX_CANDIDATE_CHARS` and the total
-   preview budget. A `Choice` can only pick from the options it is given, so this
-   is what makes the options distinguishable.
+1. A tool receives a prompt/task/command/roster via MCP.
+2. For the workspace selection tools, `candidates.py` turns each candidate path
+   into a short evidence string (a `SKILL.md` front-matter `description` where
+   present, else the head of the file), bounded by
+   `limits.MAX_CANDIDATE_CHARS` and the total preview budget. A `Choice` can
+   only pick from the options it is given, so this is what makes the options
+   distinguishable. `select_mcp_tools` gets its evidence from the caller instead
+   (server name, purpose, tool roster) and bounds it the same way.
 3. `jev_engine` fits `state` to the token budget (`limits.fit_state`), calls
    `TypeSafeClient.system_one(state=..., questions=...)` (or the mock judge)
-   using `Noul` / `Choice` primitives.
+   using `Noul` / `Choice` primitives. One request per tool call, whatever the
+   number of questions.
 4. `jev_validation.validate_response` verifies the response against the
    questions **before any policy number is read**. Malformed or
    self-contradictory answers raise `JevResponseError` — they are never read
@@ -329,13 +332,88 @@ Analyzes task complexity and assigns a tier. **Gated by `jevs_settings.enable_mo
 Low-confidence or truncated judgments report `action: "escalate"` while
 keeping `recommended_tier` unchanged.
 
+### 5. `select_mcp_tools` — which MCP server, and which of its tools
+
+An agent is usually connected to several MCP servers and has no principled way
+to pick between them from descriptions it has already skimmed. This tool takes
+the roster the agent is connected to, judges it against the current task, and
+returns the server to use plus the tools to call.
+
+- **Params:** `task` (required), `mcps` (the roster), `mcps_json` (the same
+  roster as a JSON string, for a client that cannot send an array parameter),
+  `root_dir` (default `.`, only used to confine `task_file`), `task_file`
+  (optional — a saved prompt, see below), `max_tools` (default **20**)
+- **Roster shape:** `[{"name": ..., "description": ..., "tools": [{"name": ..., "description": ...}]}]`.
+  The caller supplies the candidates: the agent already holds this list, and a
+  Choice can only pick from what it is given. A tool with no description is
+  still an option — the name is all the evidence there is.
+- **Jev primitives, one request, four questions over the same state:**
+  `target_server` (`Choice` over the server names plus `none`),
+  `is_relevant` (`Noul`: does this task need an external MCP at all),
+  `is_decisive` (`Noul`: is *one* server the right one, rather than two or more
+  being comparably usable), and `target_tool` (`Choice` over
+  `"<server>::<tool>"`, answered speculatively over every server, because
+  questions in one request cannot see each other's answers — code then keeps the
+  winning server's tools).
+- **Tools returned:** the winning tool, plus every other tool of that server with
+  `p >= 0.12`, capped at `max_tools`. The cap is a ceiling, not a second filter,
+  and a list that had to be cut says so (`tools_truncated=…>max_tools=…`) and
+  blocks `action: "auto"`.
+- **The judge is never a candidate.** `SERVER_NAME` (`jev-engine`) is excluded
+  before any criteria are built, by name, by prefix and case-insensitively, so
+  `jev-engine-local` is out too. A judge that recommends itself sends the agent
+  straight back into the judge and the loop never terminates. Every excluded
+  server is named in `excluded`, never dropped silently.
+- **`ignore_mcps`** in `jevs_settings.json` removes more, by exact name or
+  glob (`git*`).
+
+```json
+{
+  "matched": true, "exists": "answered",
+  "primary": { "server": "git", "name": "git", "probability": 0.87 },
+  "servers": [ { "server": "git", "name": "git", "probability": 0.87 },
+               { "server": "github", "name": "github", "probability": 0.09 } ],
+  "tools": [ { "server": "git", "tool": "git_commit", "probability": 0.72 },
+             { "server": "git", "tool": "git_diff", "probability": 0.14 } ],
+  "ranked_tools": [ { "server": "git", "tool": "git_commit", "probability": 0.72 } ],
+  "excluded": [ { "server": "jev-engine", "reason": "self" } ],
+  "summary": "Use MCP 'git' for this task; call git_commit, git_diff",
+  "probability": 0.87, "relevance_prob": 0.91, "decisive_prob": 0.84,
+  "candidates_considered": 2, "candidates_evaluated": 2, "candidates_truncated": false,
+  "reason_codes": [], "action": "auto", "confidence": 0.81, "truncated": false,
+  "coverage": { "complete": true, "candidate_fields": { ... } },
+  "model": "jev-latest", "usage": { "input_tokens": 1169, "output_tokens": 96 }
+}
+```
+
+`exists` is the field to branch on, and it is the part a Choice cannot produce
+on its own:
+
+| `exists` | Meaning | `matched` | `tools` |
+|---|---|---|---|
+| `answered` | One server is the right one. Use `primary` and `tools`. | `true` | the winner's tools |
+| `ambiguous` | Two or more servers are comparably usable — `is_decisive` is low, or the top two probabilities are within `AMBIGUITY_GAP` (0.10). `servers` lists the contenders; no server and no tool is chosen, and `action` drops to at least `review`. Decide, or ask. | `false` | `[]` |
+| `absent` | The Choice picked `none` confidently: no supplied server has a tool this task needs. Proceed with your own built-in tools. | `false` | `[]` |
+| `partial` | A server was chosen but `is_relevant` disagreed: a confident winner among servers that do not fit. | `false` | `[]` |
+| `no_candidates` | Nothing was left to choose from — an empty roster, or every entry was excluded (including this server). **No Jev call was made.** | `false` | `[]` |
+
+The gap is checked directly rather than read off `confidence`: a tight 0.46/0.42
+split is the harder case and still normalises to a *high* confidence, while a
+flat five-way split normalises to a low one.
+
+Measured over the 13 labelled cases in `tests/fixtures/mcp_selection_tasks.json`
+(`scripts/eval_routing.py --mode live`, jev-1.13): top-1 **0.90**, acceptable
+**1.00**, false positives **0.00**, the judge never selected itself, one request
+per call, ~980 input tokens per call.
+
 ### Saved prompts as a file
 
-`search_agent_skills` and `search_target_files` take an optional `task_file`: the
-path to a prompt or plan kept on disk, which is the normal shape of a long
-task. Without it the judge is handed the *path* — "do phase 2 of
-`.agent_plans/phase_2.md`" — and has no statement of the task to reason from, so
-it ranks whatever it has at a low confidence and nothing is injected.
+`search_agent_skills`, `search_target_files` and `select_mcp_tools` take an
+optional `task_file`: the path to a prompt or plan kept on disk, which is the
+normal shape of a long task. Without it the judge is handed the *path* — "do
+phase 2 of `.agent_plans/phase_2.md`" — and has no statement of the task to
+reason from, so it ranks whatever it has at a low confidence and nothing is
+injected.
 
 ```jsonc
 // "do phase 2" + the file's text become the question that is judged
@@ -391,6 +469,7 @@ that key is part of the schema.)
     "frontier": ""
   },
   "scan_paths": [],       // <-- extra skill dirs, appended to the defaults
+  "ignore_mcps": [],      // <-- MCP names/globs `select_mcp_tools` must never offer
   "judge_read_prompts": true,         // <-- plugin only: judge a prompt file the agent reads
   "inject_agent_instructions": true   // <-- plugin only: state the decision points every turn
 }
@@ -403,6 +482,7 @@ that key is part of the schema.)
 | `enable_model_routing` | bool | Master switch. **Off** (default) = no Jev model call, opencode uses its `"model"` config / window-selected model. **On** = the plugin asks Jev the tier and **forces** the switch per task. |
 | `models` | `{fast, balanced, frontier}` | Tier → `"provider/model-id"` mapping applied by the plugin. Values **union** across files; an explicit `""` removes an inherited tier. |
 | `scan_paths` | `[relative path]` | **Additive** extras to the default skill dirs, unioned across files and deduplicated on load. |
+| `ignore_mcps` | `[name or glob]` | MCP servers `select_mcp_tools` must never offer: an exact name or a glob (`git*`, `playwright`), case-insensitive. **Additive** union, deduplicated. Seeded with `jev-engine*` so the judge is never a candidate; that seed is unconditional and is not removable from this list. |
 | `judge_read_prompts` | bool | **Plugin only.** **On** (default) = when the agent reads a prompt-shaped file in the workspace, judge it and append the ranking to the tool result. Only an explicit `false` turns it off. |
 | `inject_agent_instructions` | bool | **Plugin only.** **On** (default) = append the "where to ask Jev" rules block to the system prompt every turn. Only an explicit `false` turns it off. |
 
@@ -622,6 +702,7 @@ node tests\test_plugin.mjs
 # Routing quality: accuracy, false positives, input tokens (mock, then live)
 & .\.venv\Scripts\python.exe scripts\eval_routing.py --mode mock
 & .\.venv\Scripts\python.exe scripts\eval_routing.py --mode live
+& .\.venv\Scripts\python.exe scripts\eval_routing.py --mode live --only mcp
 
 # Installation health: interpreter, SDKs, key presence, settings, plugin drift
 & .\.venv\Scripts\python.exe scripts\doctor.py
@@ -639,6 +720,10 @@ $env:JEV_MCP_MOCK="1"; & .\.venv\Scripts\python.exe jev_engine.py verify "git st
 # Reproduce a tool call over the real MCP transport (same as opencode):
 & .\.venv\Scripts\python.exe scripts\diag_mcp.py --tool search_agent_skills --task "fix ui bug" --root_dir D:\Godot_projects\flux-wall
 
+# The new tool takes the caller's roster, so it is a file: an inline JSON literal
+# loses its double quotes on the way to a native executable under PowerShell.
+& .\.venv\Scripts\python.exe scripts\diag_mcp.py --tool select_mcp_tools --task "commit the staged changes" --mcps @roster.json --mock
+
 # Start the server (blocks on stdio, waits for an MCP client)
 & .\.venv\Scripts\python.exe jev_mcp.py
 ```
@@ -647,7 +732,7 @@ Expected outputs:
 
 ```
 py_compile OK
-394 passed, 14 skipped
+469 passed, 16 skipped
 ALL PLUGIN TESTS PASSED
 All assert gates passed.
 healthy
@@ -658,8 +743,9 @@ its wall-clock gates to mean anything — it detects this with `fit_state_trunc`
 pure in-memory row no change in this project can move, and still enforces the
 size gates. See `docs/perf-baseline.md`.
 
-A `tools/list` handshake against a running `jev_mcp.py` returns exactly four tools:
-`guardrail_command`, `search_agent_skills`, `search_target_files`, `select_model_tier`.
+A `tools/list` handshake against a running `jev_mcp.py` returns exactly five tools:
+`guardrail_command`, `search_agent_skills`, `search_target_files`,
+`select_mcp_tools`, `select_model_tier`.
 
 ### Diagnostics & logging
 
@@ -713,11 +799,17 @@ decision engine: its routing accuracy is far below live Jev (see
 - `test_validation_nan.py` — `NaN` / `inf` rejected in every numeric field, `bool`
   refused as a number, and the 7-level vs 2-level score mean tolerances.
 - `test_envelope_shapes.py` — `set(result.keys())` is identical across every
-  branch of all three deciding tools, and no `NaN` reaches the serialized
-  envelope.
+  branch of all four deciding tools (five verdicts for `select_mcp_tools`), and
+  no `NaN` reaches the serialized envelope.
+- `test_mcp_selection.py` — the judge is never offered as a candidate, suffixed
+  and differently-cased copies of it are out too, `ignore_mcps` matches names
+  and globs, a roster of only the judge costs no round trip, the ambiguous
+  verdict and its two triggers, the `0.12` tool floor, the 20-tool ceiling and
+  its reason code, and the bounds on both caller-supplied ceilings.
 - `test_mcp_transport.py` — the **real** `jev_mcp.py` over real stdio JSON-RPC:
-  `initialize`, all four tools in `tools/list`, a round trip per tool, and a
-  refused `root_dir` arriving as `isError: true` rather than as a result.
+  `initialize`, all five tools in `tools/list` (and the new tool's parameter
+  schema), a round trip per tool, and a refused `root_dir` / unusable roster
+  arriving as `isError: true` rather than as a result.
 - `test_limits.py` — `estimate_tokens` bit-identical to the original loop on a
   pinned corpus, truncation never over budget, surrogate pairs never split.
 - `test_mock_tools.py` — offline tool runs (no key): backward-compat keys, new
@@ -745,10 +837,11 @@ decision engine: its routing accuracy is far below live Jev (see
   cache, and the client pool being closed rather than leaked.
 - `test_mock_perf.py` — the offline judge's answers are pinned to a golden
   recorded before the optimization, and the state is tokenized once.
-- `test_routing_quality.py` — the labelled fixture set over
+- `test_routing_quality.py` — the labelled fixture sets over
   `scripts/eval_routing.py`: one Jev round trip per call, self-consistent
-  rankings, a bounded input budget, and (with `JEV_ROUTING_LIVE=1`) live accuracy
-  floors.
+  rankings, a bounded input budget, the judge never selecting itself, the
+  offline judge never inventing a server, and (with `JEV_ROUTING_LIVE=1`) live
+  accuracy floors for both the workspace tools and `select_mcp_tools`.
 - `test_logging.py` — `result_keys` instead of a serialized result, the opt-in
   preview, credential redaction on the result path, and exactly one traceback
   per failure.
