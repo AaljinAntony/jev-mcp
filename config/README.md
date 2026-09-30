@@ -188,15 +188,28 @@ should carry no more privilege than the session's own working directory.
 Allowed:
 
 - the process working directory, and anything under it;
-- any **ancestor** of the working directory (hosts launch the server with `cwd`
-  set to the project root or to a temp dir);
+- any **ancestor** of the working directory that sits **below your home
+  directory** — hosts launch the server with `cwd` set below the project root,
+  and a session legitimately asks about a parent of that;
 - anything under a path listed in `JEV_MCP_ALLOWED_ROOTS`.
 
 Everything else is rejected with `INVALID_INPUT`. Containment is computed with
 `Path.relative_to`, never `startswith`, so `<root>-evil` and a symlink pointing
-outside the root are both refused. The OS's own directories (`C:\Windows`,
-`C:\Program Files`, a filesystem root) are rejected by name as a second gate,
-even if you list them.
+outside the root are both refused. The OS's own directories are refused by name
+as a second gate, even if you list them: `C:\Windows`, `C:\Program Files` and a
+drive root on Windows; `/etc`, `/proc`, `/sys`, `/dev`, `/var`, `/opt`, `/srv`
+and `/root` on Linux and macOS.
+
+**The ancestor walk stops at two boundaries, and both matter.** It never reaches
+the filesystem root, because a base of `/` would make *every* absolute path on
+the machine a member. And it never reaches `$HOME` or above, because the usual
+checkout (`~/code/project`) puts your whole home directory among the
+ancestors. The working directory itself is always allowed, even when it *is*
+`$HOME` — that is the one directory the session already has.
+
+`/home` and `/Users` are deliberately not in the system-directory veto: they
+are not system trees, they are where work lives, and your checkout is normally
+under one.
 
 Most harnesses launch the server with the project as the working directory, so
 nothing is needed. **Antigravity is the exception** — it executes the MCP server
@@ -221,7 +234,7 @@ Read by the **server**:
 | `TYPESAFE_API_KEY` | *(required)* | Provider key. Missing + `JEV_MCP_MOCK=0` → `CONFIG_ERROR`. |
 | `JEV_MCP_MODEL` | `jev-latest` | Model used for `system_one` calls. |
 | `JEV_MCP_TIMEOUT_MS` | `30000` | **Total** per-tool-call budget in ms, retries and backoff included — not a per-attempt timeout. Enforced in mock mode too. |
-| `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Empty = the process CWD and its ancestors only. |
+| `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Empty = the process CWD and its ancestors below `$HOME` only. |
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_MOCK` | `0` | `1` = offline deterministic judge (tests/demos only). |

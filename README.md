@@ -121,13 +121,21 @@ If you get a harness working that is listed as ⚠️, please open a PR moving i
 
 **Requirements**
 
-- Python 3.11 or newer
+- Python 3.11 or newer. This is a real floor, not a guess: `rpds-py`, a pinned
+  transitive dependency, declares `Requires-Python >=3.11`, so on 3.10 the
+  install fails outright.
 - A [TypeSafe](https://pypi.org/project/typesafe-sdk/) API key
 - On Debian/Ubuntu: `python3-venv` (`sudo apt install python3-venv`). Ubuntu
   splits `ensurepip` into that separate package, so without it `python3 -m venv`
   fails with *"You may need to use sudo with that command"* before it creates
   anything. `virtualenv` works too: `pip install --user virtualenv`, then
   `virtualenv .venv`.
+
+**Verified on Windows and Linux** (Ubuntu 22.04): the install, the full offline
+suite, the plugin suite and the performance gates all pass on both, and CI runs
+them on `windows-latest` and `ubuntu-latest`. **macOS is untested** — the code
+takes no platform-specific path outside the documented gates, but no run has
+confirmed it.
 - `git` on `PATH` (optional; improves file discovery — the server falls back to a
   bounded filesystem walk)
 
@@ -697,7 +705,7 @@ treated as absent so the file can supply it.
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_MOCK` | `0` | `1` = offline deterministic judge. Tests and demos only. |
-| `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Empty = the process CWD and its ancestors only. |
+| `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Empty = the process CWD and its ancestors below `$HOME` only. |
 | `JEV_MCP_BREAKER_THRESHOLD` | `3` | Consecutive provider failures before the breaker opens. |
 | `JEV_MCP_BREAKER_COOLDOWN_S` | `30` | Seconds before one probe call is let through. |
 | `JEV_MCP_AUTH_COOLDOWN_S` | `300` | Longer window after a 401/403. A bad key does not fix itself in 30 seconds. |
@@ -761,14 +769,26 @@ writes, and never makes a network request except to the TypeSafe API.
 untrusted input. Allowed:
 
 - the process working directory and anything under it;
-- any **ancestor** of the working directory (hosts launch the server with `cwd`
-  set to the project root or a temp dir);
+- any **ancestor** of the working directory that sits **below your home
+  directory** — hosts launch the server with `cwd` set below the project root,
+  and a session legitimately asks about a parent of that;
 - anything under `JEV_MCP_ALLOWED_ROOTS`.
 
 Everything else is rejected with `INVALID_INPUT`. Containment uses
 `Path.relative_to`, never `startswith`, so `<root>-evil` and a symlink pointing
-outside the root are both refused. The OS's own directories (`C:\Windows`,
-`C:\Program Files`, a filesystem root) are rejected by name as a second gate.
+outside the root are both refused. The OS's own directories are refused by name
+as a second gate, even if you allowlist them — `C:\Windows`, `C:\Program Files`
+and a drive root on Windows; `/etc`, `/proc`, `/sys`, `/dev`, `/var`, `/opt`,
+`/srv` and `/root` on Linux and macOS.
+
+**The ancestor walk stops at two boundaries, and both are load-bearing.** It
+never reaches the filesystem root, because a base of `/` would make every
+absolute path on the machine a member of the allowlist. And it never reaches
+`$HOME` or above, because the usual checkout (`~/code/project`) puts your whole
+home directory among the ancestors — which is precisely why running the server
+from inside `$HOME` would otherwise let a prompt-injected `root_dir=$HOME` walk
+it. The working directory itself is always allowed, even when it is `$HOME`:
+that is the one directory your session already has.
 
 This is an **allowlist**, not a denylist, on purpose: a denylist cannot
 enumerate every sensitive path, and an LLM-supplied path should carry no more

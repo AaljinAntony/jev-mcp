@@ -36,11 +36,19 @@ prose from a model. The findings that matter:
 - `root_dir` or `task_file` resolving **outside** the allowed roots.
 - The allowlist being bypassable with `..`, a symlink or junction, a
   sibling-prefix path (`<root>-evil`), an absolute path, or a drive root.
+- Either of the two stop conditions in the ancestor walk failing to hold: the
+  walk must never reach the filesystem root, because `_is_within` uses
+  `relative_to` and a base of `/` makes every absolute path a member; and it
+  must never reach `$HOME` or above. A regression that reintroduces either one
+  exposes the whole filesystem, or the user's home directory, to an
+  LLM-supplied `root_dir`. Neither is visible from a checkout on a separate
+  Windows volume, so treat a POSIX test failure here as a real finding.
 - A `scan_paths` entry from `jevs_settings.json` escaping the workspace in the
-  OpenCode plugin — that file is documented as safe to commit and share, so it
+  OpenCode plugin - that file is documented as safe to commit and share, so it
   is untrusted input.
-- Any path reaching an OS system directory (`C:\Windows`, `C:\Program Files`,
-  a filesystem root).
+- Any path reaching an OS system directory (`C:\Windows`, `C:\Program Files`, a
+  filesystem root; `/etc`, `/proc`, `/sys`, `/dev`, `/var`, `/opt`, `/srv`,
+  `/root`).
 
 ### 3. Fail-open behaviour
 

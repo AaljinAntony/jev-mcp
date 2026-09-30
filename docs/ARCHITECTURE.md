@@ -11,6 +11,7 @@ day-to-day use see the [README](../README.md); for measurements see
 - [Response validation invariants](#response-validation-invariants)
 - [Policy: confidence and action](#policy-confidence-and-action)
 - [Bounds](#bounds)
+- [The `root_dir` allowlist](#the-root_dir-allowlist)
 - [Deadline and the circuit breaker](#deadline-and-the-circuit-breaker)
 - [Settings resolution](#settings-resolution)
 - [Candidate discovery and the scan cache](#candidate-discovery-and-the-scan-cache)
@@ -49,12 +50,14 @@ Key entry points:
 | `SERVER_NAME = "jev-engine"` | `jev_engine.py:77` |
 | `mcp = FastMCP(SERVER_NAME)` | `jev_mcp.py:31` |
 | `_run()` — the envelope wrapper | `jev_mcp.py:53` |
-| `execute_system_one` | `jev_engine.py:803` |
-| `_request` — the single network seam | `jev_engine.py:1015` |
-| `_validate_root_dir` | `jev_engine.py:283` |
-| `load_jev_settings` | `jev_engine.py:414` |
-| `_Breaker` | `jev_engine.py:712` |
-| `_cli_dispatch` | `jev_engine.py:2317` |
+| `execute_system_one` | `jev_engine.py:851` |
+| `_request` — the single network seam | `jev_engine.py:1063` |
+| `_allowed_roots` | `jev_engine.py:217` |
+| `_reject_system_dir` — the second gate | `jev_engine.py:267` |
+| `_validate_root_dir` | `jev_engine.py:325` |
+| `load_jev_settings` | `jev_engine.py:462` |
+| `_Breaker` | `jev_engine.py:760` |
+| `_cli_dispatch` | `jev_engine.py:2365` |
 | `error_details` | `jev_errors.py:90` |
 | `validate_response` | `jev_validation.py:180` |
 | `confidence_from_probabilities` | `policy.py:98` |
@@ -269,6 +272,56 @@ binary search and never splits a surrogate pair.
 
 **Known asymmetry** (`jev_engine.py:88-95`): `fit_state` truncates the state
 from the right, which can cut a candidates tail rather than the task head.
+
+---
+
+## The `root_dir` allowlist
+
+`root_dir` and `task_file` are LLM-supplied, so they are untrusted input. The
+rule is an **allowlist**, because a denylist cannot enumerate every sensitive
+path: a supplied path should carry no more privilege than the session's own
+working directory.
+
+`_allowed_roots()` (`jev_engine.py:217`) offers:
+
+- the process CWD;
+- the CWD's **ancestors, with two stop conditions**;
+- anything under `JEV_MCP_ALLOWED_ROOTS`.
+
+Ancestors are included deliberately — hosts launch the server with `cwd` set
+below the project root, and a session legitimately asks about a parent of that.
+The walk stops at:
+
+| Stops before | Why |
+|---|---|
+| the filesystem root | `_is_within` uses `relative_to`, so a base of `/` makes **every** absolute path on the machine a member. Including it turns the allowlist into no allowlist: `/etc` and `/proc` pass. Same bug on Windows, scoped to a volume, where `D:\` was a base. |
+| `$HOME` and above | the ordinary checkout is `~/code/project`, which makes the whole home directory an ancestor of the CWD. A prompt-injected `root_dir=$HOME` would otherwise walk it. Ancestors *strictly below* `$HOME` stay allowed, so `~/code/repo` can still be addressed as `~/code`. |
+
+The CWD itself is always allowed, even when it is `$HOME`: that is the one
+directory the session already has.
+
+Containment is `Path.relative_to`, never `startswith`, so `<root>-evil` and a
+symlink pointing outside the root are both refused — `Path.resolve()` follows
+the link before the comparison.
+
+`_reject_system_dir` (`jev_engine.py:267`) is a **second gate**: it vetoes
+system trees by name so an explicit `JEV_MCP_ALLOWED_ROOTS` entry cannot hand
+over the machine's configuration, and so the failure keeps a specific wording.
+
+| Platform | Vetoed |
+|---|---|
+| Windows | `C:\Windows`, a drive root, and anything under `SystemRoot`, `windir`, `ProgramFiles`, `ProgramFiles(x86)` |
+| POSIX | `/etc`, `/proc`, `/sys`, `/dev`, `/var`, `/opt`, `/srv`, `/root` |
+
+`/home` and `/Users` are deliberately **not** vetoed. They are not system
+trees, they are where work lives, and the server's own CWD is usually under one
+— vetoing them would refuse the repo itself. `$HOME` is handled by the stop
+condition above instead. `/tmp` is not vetoed either, because hosts
+legitimately launch with `cwd` set to a temporary directory.
+
+Pinned by `tests/test_root_dir_allowlist.py`, whose POSIX block is behind
+`skipif(os.name == "nt")`. A Windows-only development loop never runs it, which
+is how the `/`-as-a-base bug survived here.
 
 ---
 
