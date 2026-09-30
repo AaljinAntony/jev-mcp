@@ -28,6 +28,28 @@ BAD = "bad"
 _FAILURES = 0
 _WARNINGS = 0
 
+_WINDOWS = platform.system() == "Windows"
+
+# A health check that prints a command the user cannot run is worse than one that
+# prints nothing, so every fix string is built for the host platform. The
+# venv layout differs too: `.venv\Scripts\python.exe` on Windows,
+# `.venv/bin/python` everywhere else.
+_VENV_PY = ".\\.venv\\Scripts\\python.exe" if _WINDOWS else ".venv/bin/python"
+_PIP = f"{_VENV_PY} -m pip install -r requirements.txt"
+_PLUGIN_DEST = (
+    r"%USERPROFILE%\.config\opencode\plugins\jev-plugin.js"
+    if _WINDOWS
+    else "~/.config/opencode/plugins/jev-plugin.js"
+)
+
+
+def _copy_hint(src: str, *, force: bool = False) -> str:
+    """The command that installs a config example where the host expects it."""
+    if _WINDOWS:
+        suffix = " -Force" if force else ""
+        return f'Copy-Item {src} "{_PLUGIN_DEST}"{suffix}'
+    return f"cp {src} {_PLUGIN_DEST}"
+
 
 def report(status, check, detail="", fix=""):
     global _FAILURES, _WARNINGS
@@ -52,7 +74,7 @@ def check_interpreter():
         OK if in_venv else WARN,
         f"python {version} at {sys.executable}",
         "" if in_venv else "not running from a virtual environment",
-        fix="use the repo venv: .\\.venv\\Scripts\\python.exe scripts\\doctor.py",
+        fix=f"use the repo venv: {_VENV_PY} scripts/doctor.py",
     )
     if platform.system() == "Windows" and not in_venv:
         report(WARN, "32-bit interpreter on Windows", "the SDK wheels are 64-bit")
@@ -67,12 +89,12 @@ def check_sdk():
         client = getattr(typesafe_sdk, "TypeSafeClient", None)
         if client is None:
             report(BAD, "typesafe_sdk imports", f"version {version}, but no TypeSafeClient",
-                   fix="& .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt")
+                   fix=_PIP)
             return
         report(OK, "typesafe_sdk importable", f"version {version}")
     except Exception as e:
         report(BAD, "typesafe_sdk importable", f"{type(e).__name__}: {e}",
-               fix="& .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt")
+               fix=_PIP)
         return
 
     try:
@@ -96,19 +118,21 @@ def check_sdk():
     try:
         import jev_mcp
 
-        tools = sorted(
-            name
-            for name in dir(jev_mcp)
-            if name in {"guardrail_command", "search_agent_skills", "search_target_files", "select_model_tier"}
-        )
-        expected = {"guardrail_command", "search_agent_skills", "search_target_files", "select_model_tier"}
+        expected = {
+            "guardrail_command",
+            "search_agent_skills",
+            "search_target_files",
+            "select_mcp_tools",
+            "select_model_tier",
+        }
+        tools = sorted(name for name in dir(jev_mcp) if name in expected)
         if set(tools) == expected:
             report(OK, "jev_mcp imports", f"{len(tools)} tools registered")
         else:
-            report(BAD, "jev_mcp imports", f"registered {tools}", fix="expected all four tools")
+            report(BAD, "jev_mcp imports", f"registered {tools}", fix="expected all five tools")
     except Exception as e:
         report(BAD, "jev_mcp imports", f"{type(e).__name__}: {e}",
-               fix="run: & .\\.venv\\Scripts\\python.exe -c \"import jev_mcp\"")
+               fix=f'run: {_VENV_PY} -c "import jev_mcp"')
 
 
 def check_api_key():
@@ -267,7 +291,7 @@ def check_plugin_drift():
         return
     if not installed.is_file():
         report(WARN, "plugin installed", f"not found at {installed}",
-               fix="Copy-Item config\\jev-plugin.example.js \"$env:USERPROFILE\\.config\\opencode\\plugins\\jev-plugin.js\"")
+               fix=_copy_hint("config/jev-plugin.example.js"))
         return
 
     def _sha256(p):
@@ -279,7 +303,7 @@ def check_plugin_drift():
     else:
         report(BAD, "installed plugin matches the example",
                f"installed sha256 {installed_hash[:12]} != example {example_hash[:12]}",
-               fix="Copy-Item config\\jev-plugin.example.js \"$env:USERPROFILE\\.config\\opencode\\plugins\\jev-plugin.js\" -Force")
+               fix=_copy_hint("config/jev-plugin.example.js", force=True))
     if example.stat().st_mtime > installed.stat().st_mtime:
         report(WARN, "the example is newer than the installed plugin", "a copy is probably outstanding")
 

@@ -19,7 +19,10 @@ pydantic_core==2.46.5
 PyJWT==2.14.0
 python-dotenv==1.2.3
 python-multipart==0.0.32
-pywin32==312
+# Windows only, and not imported by any module here - present because it is part
+# of the pinned Windows lockfile. The marker keeps `pip install -r requirements.txt`
+# working on Linux and macOS, which have no pywin32 wheel.
+pywin32==312; sys_platform == "win32"
 referencing==0.37.0
 rpds-py==2026.6.3
 sse-starlette==3.4.11

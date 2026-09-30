@@ -7,8 +7,8 @@ any workspace to reproduce a tool failure with a specific ``root_dir`` and task.
 Examples::
 
     python scripts/diag_mcp.py --tool guardrail_command --command "git status"
-    python scripts/diag_mcp.py --tool search_agent_skills --task "find skills for ui bug fix" --root_dir D:\\Godot_projects\\flux-wall
-    python scripts/diag_mcp.py --tool search_target_files --task "find config" --root_dir D:\\Godot_projects\\flux-wall --mock
+    python scripts/diag_mcp.py --tool search_agent_skills --task "find skills for ui bug fix" --root_dir /path/to/your/workspace
+    python scripts/diag_mcp.py --tool search_target_files --task "find config" --root_dir /path/to/your/workspace --mock
     python scripts/diag_mcp.py --tool select_mcp_tools --task "commit the staged changes" --mcps '[{"name":"git","tools":[{"name":"git_commit","description":"create a commit"}]}]' --mock
 
 Relevant env overrides: ``JEV_DIAG_PYTHON``, ``JEV_DIAG_SERVER``.
@@ -22,7 +22,31 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PYTHON = os.environ.get("JEV_DIAG_PYTHON") or str(REPO / ".venv" / "Scripts" / "python.exe")
+
+
+def _default_python() -> str:
+    """Resolve the interpreter to launch, in order of decreasing trust.
+
+    The venv layout is platform-specific (`.venv\\Scripts\\python.exe` on Windows,
+    `.venv/bin/python` elsewhere), so probing both beats hardcoding one: this
+    script is the documented troubleshooting entry point and it has to run
+    wherever the server runs.
+    """
+    candidates = [
+        REPO / ".venv" / "Scripts" / "python.exe",
+        REPO / ".venv" / "bin" / "python",
+        REPO / ".venv" / "bin" / "python3",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    # `sys.executable` is the interpreter running this script, which is already
+    # the venv one whenever the script was launched correctly. The bare name is
+    # the last resort so PATH resolution can still find something.
+    return sys.executable or "python"
+
+
+PYTHON = os.environ.get("JEV_DIAG_PYTHON") or _default_python()
 SERVER = os.environ.get("JEV_DIAG_SERVER") or str(REPO / "jev_mcp.py")
 
 
@@ -76,8 +100,17 @@ def main() -> int:
     ap.add_argument("--mock", action="store_true")
     args = ap.parse_args()
 
-    if not os.path.exists(PYTHON):
-        print(f"Python not found: {PYTHON}", file=sys.stderr)
+    # A bare name (`python`, `python3`) is resolved through PATH by the OS at
+    # spawn time, so an existence check on it would be wrong, not merely strict.
+    if not os.path.dirname(PYTHON) or os.path.exists(PYTHON):
+        pass
+    else:
+        print(
+            f"Python not found: {PYTHON}\n"
+            "Set JEV_DIAG_PYTHON to the interpreter that has requirements.txt installed, "
+            "or create the repo venv first.",
+            file=sys.stderr,
+        )
         return 2
     if not os.path.exists(SERVER):
         print(f"Server not found: {SERVER}", file=sys.stderr)
