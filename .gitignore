@@ -1,4 +1,37 @@
+# ---------------------------------------------------------------------------
+# Secrets - never commit these
+# ---------------------------------------------------------------------------
+# The TypeSafe API key lives here. `ensure_dotenv()` loads this file relative to
+# the server module, not the working directory, so the key resolves in every
+# workspace. An injected environment variable still wins; a blank one is treated
+# as absent so this file can supply it.
+.env
+.env.*
+!.env.example
+
+# Real OpenCode / agent configs contain live API keys.
+opencode.json
+.opencode/
+config/opencode.local.json
+*.local.json
+.claude.json
+.mcp.json
+.cursor/
+.copilot/
+.codex/
+.hermes/
+.gemini/
+
+# Credential material, in case something ever generates one here.
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---------------------------------------------------------------------------
 # Python
+# ---------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,31 +39,59 @@ __pycache__/
 .eggs/
 build/
 dist/
-
-# Virtual environment
 .venv/
 venv/
 env/
+.Python
+pip-wheel-metadata/
 
-# Secrets / environment
-.env
-
-# Keep the template
-!.env.example
-
-# OpenCode real config (contains live API keys) — never commit these
-opencode.json
-.opencode/
-config/opencode.local.json
-
-# Local reference clones (not part of this repo)
-reference/
-
-# Tooling
+# Tooling caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+reports/
+
+# ---------------------------------------------------------------------------
+# Node - the plugin test suite
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Agent / editor local state
+# ---------------------------------------------------------------------------
+# Local agent planning scratch. Not part of the server.
+.agents_plans/
 .idea/
 .vscode/
-*.log
+
+# Locally installed agent skills. `search_agent_skills` scans `.agents/skills`, so
+# anything installed here changes what the judge sees and would be swept up by
+# `git add -A` unless ignored. Only the vendored TypeSafe skill belongs to this
+# repository (see THIRD_PARTY_NOTICES.md); it is already tracked, and the
+# negations below keep it that way regardless of ordering above.
+.agents/skills/*
+!.agents/skills/typesafe-ai/
+!.agents/skills/typesafe-ai/**
+
+# ---------------------------------------------------------------------------
+# Runtime output
+# ---------------------------------------------------------------------------
+# Server log (JSON lines) and its rotations. May contain redacted prompts.
 logs/
+*.log
+
+# Local reference clones of upstream jev-mcp projects, used as design
+# references only and not part of this server's runtime.
+reference/
+
+# OS
 .DS_Store
 Thumbs.db
+desktop.ini

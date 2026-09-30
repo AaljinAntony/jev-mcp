@@ -40,7 +40,7 @@ class TestLogRedaction:
         sentence = "This is a normal log message describing an operation that took place in workspace"
         assert _redact(sentence) == sentence
 
-        filepath = "d:/mcp/jev-typesafe-mcp/subdir/another/file.txt"
+        filepath = "d:/projects/some-workspace/subdir/another/file.txt"
         assert _redact(filepath) == filepath
 
         # A word that merely *ends* in a key prefix is not a key.

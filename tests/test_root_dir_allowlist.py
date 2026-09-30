@@ -3,7 +3,7 @@
 The old check named five POSIX paths and two Windows environment variables, so
 `/home/<user>`, `/var`, `/proc`, `C:\\Users\\<user>` and `C:\\ProgramData` were all
 reachable from an LLM-supplied argument — a prompt-injected agent could pass
-`root_dir="C:\\Users\\aalji"` and get a file listing plus file contents.
+`root_dir="C:\\Users\\<user>"` and get a file listing plus file contents.
 
 The invariant now: a supplied `root_dir` carries no more privilege than the
 session's own working directory. The CWD, its ancestors, and anything under

@@ -189,7 +189,7 @@ class TestRedaction:
             "a" * 41,
             "0123456789abcdef0123456789abcdef01234567",          # git sha
             "This is a normal log message describing a long operation.",
-            "d:/mcp/jev-typesafe-mcp/subdir/another/file.txt",
+            "d:/projects/some-workspace/subdir/another/file.txt",
             "git checkout -- src/very/long/path/to/a/module/that/is/deep.py",
             "disk-backup-options",
             "hello",
