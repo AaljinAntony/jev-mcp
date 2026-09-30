@@ -123,6 +123,11 @@ If you get a harness working that is listed as ⚠️, please open a PR moving i
 
 - Python 3.11 or newer
 - A [TypeSafe](https://pypi.org/project/typesafe-sdk/) API key
+- On Debian/Ubuntu: `python3-venv` (`sudo apt install python3-venv`). Ubuntu
+  splits `ensurepip` into that separate package, so without it `python3 -m venv`
+  fails with *"You may need to use sudo with that command"* before it creates
+  anything. `virtualenv` works too: `pip install --user virtualenv`, then
+  `virtualenv .venv`.
 - `git` on `PATH` (optional; improves file discovery — the server falls back to a
   bounded filesystem walk)
 

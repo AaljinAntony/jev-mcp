@@ -82,6 +82,13 @@ python -m venv .venv
 Copy-Item .env.example .env
 ```
 
+> **On Debian/Ubuntu**, `python3 -m venv .venv` fails with *"You may need to use
+> sudo with that command"* unless the separate `python3-venv` package is
+> installed (`sudo apt install python3-venv`). Ubuntu packages `ensurepip`
+> separately from Python itself. Without `sudo`, install `virtualenv` instead —
+> `pip install --user virtualenv && virtualenv .venv` — which bundles its own
+> pip and needs no system package.
+
 Edit `.env` and set `TYPESAFE_API_KEY`. Then:
 
 ```powershell

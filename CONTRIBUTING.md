@@ -12,6 +12,10 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+> Debian/Ubuntu need the separate `python3-venv` package (`sudo apt install
+> python3-venv`) or `python3 -m venv` fails on the missing `ensurepip`. With no
+> sudo, `pip install --user virtualenv && virtualenv .venv` works instead.
+
 ```powershell
 git clone https://github.com/AaljinAntony/jev-mcp.git
 cd jev-mcp
