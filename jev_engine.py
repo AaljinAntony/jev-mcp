@@ -217,12 +217,25 @@ def _is_within(candidate: Path, base: Path) -> bool:
 def _allowed_roots() -> List[Path]:
     """Directories an LLM-supplied `root_dir` may resolve inside.
 
-    The process CWD and **its ancestors**, plus anything under
-    `JEV_MCP_ALLOWED_ROOTS`. Ancestors are included deliberately: hosts launch
-    the server with `cwd` set to the project root or to a temp dir, and a
-    session legitimately asks about a subdirectory of, or a parent of, that.
-    It is still an enormous reduction from "any path on the machine" and it
-    never grants reach outside the user's own project tree.
+    The process CWD and the ancestors *below the user's home directory*, plus
+    anything under `JEV_MCP_ALLOWED_ROOTS`. Ancestors are included deliberately:
+    hosts launch the server with `cwd` set below the project root, and a session
+    legitimately asks about a parent of that.
+
+    The walk stops at two boundaries, and both are load-bearing:
+
+    * **the filesystem root.** `_is_within` uses `relative_to`, so a base of
+      `/` makes every absolute path on the machine a member. Including it meant
+      the allowlist granted the whole filesystem - `/etc` and `/proc` passed.
+    * **`$HOME` itself.** The ordinary layout is `~/code/project`, which makes
+      the user's entire home directory an ancestor of the CWD, so a
+      prompt-injected `root_dir=$HOME` would have walked it. Ancestors
+      *strictly below* `$HOME` stay allowed, so a project at `~/code/repo` can
+      still be addressed as `~/code`.
+
+    The CWD itself is always allowed, even when it is `$HOME`: the invariant is
+    that a supplied `root_dir` carries no more privilege than the session's own
+    working directory, and that is the one directory the session already has.
     """
     roots: List[Path] = []
     try:
@@ -231,7 +244,16 @@ def _allowed_roots() -> List[Path]:
         cwd = None
     if cwd is not None:
         roots.append(cwd)
-        roots.extend(cwd.parents)
+        try:
+            home = Path.home().resolve()
+        except (OSError, RuntimeError):
+            home = None
+        for parent in cwd.parents:
+            if parent == parent.parent:
+                break  # the filesystem root; see the docstring
+            if home is not None and (parent == home or parent in home.parents):
+                break  # $HOME and above; see the docstring
+            roots.append(parent)
     for entry in get_config().allowed_roots:
         try:
             candidate = Path(entry)
@@ -278,17 +300,43 @@ def _reject_system_dir(root: Path, root_dir: str) -> None:
             raise JevValidationError(
                 f"root_dir '{root_dir}' points to a filesystem drive root (system directory)."
             )
+    else:
+        # POSIX names no system trees in environment variables, so the branch
+        # above has nothing to borrow. These are refused by name so they keep the
+        # specific "system directory" wording, and so an explicit
+        # JEV_MCP_ALLOWED_ROOTS entry cannot hand the machine's configuration to a
+        # prompt-injected argument.
+        #
+        # `/home` and `/Users` are deliberately absent. They are not system
+        # trees, they are where people's work lives, and the usual checkout
+        # (`~/code/project`) puts the repo itself underneath one. Vetoing them
+        # would refuse the server's own CWD. `_allowed_roots` handles them
+        # correctly instead, by stopping its ancestor walk at `$HOME`.
+        #
+        # `/tmp` is absent for the same reason: hosts legitimately launch with
+        # cwd set to a temporary directory.
+        for tree in ("/etc", "/proc", "/sys", "/dev", "/var", "/opt", "/srv", "/root"):
+            if root_lower == tree or root_lower.startswith(tree + "/"):
+                raise JevValidationError(
+                    f"root_dir '{root_dir}' points inside a system directory ({tree})."
+                )
 
 
 def _validate_root_dir(root_dir: str) -> Path:
     """Resolve `root_dir` and confine it to an allowlist.
 
-    A denylist cannot enumerate every sensitive path — the previous five-entry
-    POSIX set left `/home`, `/var`, `/proc`, `C:\\Users` and `C:\\ProgramData`
-    reachable from an LLM-supplied argument. The invariant is instead that a
-    supplied `root_dir` carries no more privilege than the session's own working
-    directory: it must be the CWD, one of its descendants, one of its ancestors,
-    or inside `JEV_MCP_ALLOWED_ROOTS`. Everything else is rejected.
+    A denylist cannot enumerate every sensitive path, so the invariant is
+    primarily that a supplied `root_dir` carries no more privilege than the
+    session's own working directory: it must be the CWD, one of its
+    descendants, an ancestor below `$HOME`, or inside `JEV_MCP_ALLOWED_ROOTS`.
+    Everything else is rejected.
+
+    `_allowed_roots` is what makes that true, and its two stop conditions are
+    the whole security argument: without them the ancestor walk reaches `/`,
+    and since `_is_within` uses `relative_to`, a base of `/` admits every
+    absolute path on the machine. Windows never showed it because a project on
+    `D:\\` has `C:\\Users\\<user>` among its ancestors only if the project
+    itself lives in the profile — where a POSIX checkout always does.
     """
     _check_input_length("root_dir", root_dir)
     root = Path(root_dir).resolve()

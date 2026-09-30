@@ -133,13 +133,19 @@ def test_sibling_with_a_shared_prefix_is_rejected(tmp_path, monkeypatch):
 
 
 def test_symlinked_escape_is_rejected(tmp_path, monkeypatch):
-    """The case a `startswith` check on the *unresolved* path would miss."""
+    """The case a `startswith` check on the *unresolved* path would miss.
+
+    The CWD deliberately stays put (the repo root) rather than moving into
+    `tmp_path`. A `root_dir` may always be the CWD or an ancestor of it, so
+    chdir-ing to `tmp_path` would make `secret` reachable outright and the test
+    would pass or fail for the wrong reason. From the repo root, only the
+    explicitly configured workspace admits anything under `tmp_path`.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     secret = tmp_path / "secret"
     secret.mkdir()
     (secret / "private.txt").write_text("do not read me", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("JEV_MCP_ALLOWED_ROOTS", str(workspace))
     _reset_config_cache()
 
