@@ -387,24 +387,35 @@ def test_a_rejected_root_dir_arrives_as_iserror(server):
     assert body["error"]["code"] in {"INVALID_ROOT", "INVALID_INPUT", "VALIDATION_ERROR"}
 
 
-def test_a_sibling_prefix_escape_arrives_as_iserror(server):
+def test_a_sibling_prefix_escape_arrives_as_iserror(tmp_path):
     """`<allowed-root>-evil` shares a textual prefix but is not inside it.
 
-    The allowlist grants the system temp dir; this is its sibling. A
-    `startswith` check would wave it through, which is exactly the escape
-    `_is_within` exists to refuse.
+    The pair is built inside pytest's own scratch directory rather than by
+    appending `-evil` to the system temp dir. That suffix trick works on
+    Windows, where the temp dir sits inside the user profile and `Temp-evil` is
+    creatable; on POSIX it yields `/tmp-evil`, at the filesystem root, which a
+    non-root user cannot create — the test then fails in mkdir rather than
+    testing anything.
+
+    A dedicated server is needed because the module fixture grants the whole
+    temp dir, which would make *both* paths allowed and prove nothing.
     """
-    granted = Path(tempfile.gettempdir()).resolve()
-    evil = Path(str(granted).rstrip("\\/") + "-evil")
-    evil.mkdir(parents=True, exist_ok=True)
+    granted = tmp_path / "roots" / "project"
+    granted.mkdir(parents=True)
+    evil = tmp_path / "roots" / "project-evil"
+    evil.mkdir()
+    assert str(evil).startswith(str(granted))   # what a `startswith` check allows
+
+    client = _spawn(tmp_path, env_extra={"JEV_MCP_ALLOWED_ROOTS": str(granted)})
     try:
-        result = _call(server, "search_target_files", {"task": "x", "root_dir": str(evil)})
+        allowed = _call(client, "search_target_files", {"task": "x", "root_dir": str(granted)})
+        assert allowed.get("isError") is not True, _body(allowed)
+
+        result = _call(client, "search_target_files", {"task": "x", "root_dir": str(evil)})
         assert result.get("isError") is True
         assert "outside the allowed roots" in _body(result)["error"]["message"]
     finally:
-        import shutil
-
-        shutil.rmtree(evil, ignore_errors=True)
+        client.close()
 
 
 def test_error_results_never_carry_a_safety_verdict(server):

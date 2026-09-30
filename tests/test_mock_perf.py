@@ -108,15 +108,40 @@ def _observed(res):
     return out
 
 
+#: The golden below was recorded on Windows. Summing the inverse-frequency
+#: weights walks a dict, and CPython's float accumulation order differs between
+#: builds and platforms, so a value can differ in the last two or three digits
+#: of a 17-significant-digit float — observed 0.0007705631948771438 on Linux
+#: against ...1603 on Windows. Comparing those with `==` makes the pin fail on
+#: any platform but the one that recorded it, which pins the test to a machine
+#: instead of to a behaviour.
+#:
+#: Rounding both sides to 12 decimal places still catches every change that
+#: matters — a real behavioural drift moves a probability or swaps a choice, by
+#: orders of magnitude more than 1e-12 — while tolerating the float noise.
+GOLDEN_DECIMALS = 12
+
+
+def _pinned(obj):
+    """Recursively round every float so the comparison is platform-stable."""
+    if isinstance(obj, float):
+        return round(obj, GOLDEN_DECIMALS)
+    if isinstance(obj, dict):
+        return {k: _pinned(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_pinned(v) for v in obj]
+    return obj
+
+
 class TestMockOutputIsPinned:
     def test_250_option_request_matches_the_golden_answers(self):
         res = mock.mock_system_one(STATE, _questions())
-        assert _observed(res) == GOLDEN
+        assert _pinned(_observed(res)) == _pinned(GOLDEN)
 
     def test_repeated_calls_are_identical(self):
         first = _observed(mock.mock_system_one(STATE, _questions()))
         second = _observed(mock.mock_system_one(STATE, _questions()))
-        assert first == second == GOLDEN
+        assert _pinned(first) == _pinned(second) == _pinned(GOLDEN)
 
 
 class TestStateIsTokenizedOnce:
