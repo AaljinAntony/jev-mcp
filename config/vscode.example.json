@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "jev-engine": {
+      "type": "stdio",
+      "command": "<REPO_DIR>/.venv/Scripts/python.exe",
+      "args": [
+        "<REPO_DIR>/jev_mcp.py"
+      ]
+    }
+  }
+}

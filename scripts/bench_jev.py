@@ -42,7 +42,10 @@ jev_engine._reset_settings_cache()
 # Silence informational round logs during benchmark execution
 jev_logging.get_logger().setLevel(logging.WARNING)
 
-# Regression thresholds: 1.25x the medians recorded in docs/perf-baseline.md.
+# Regression thresholds: 1.25x the Phase 5 medians, which docs/perf-baseline.md
+# records as ratios (Phase 1 = 1.00x). That document deliberately carries no
+# absolute milliseconds — a wall-clock number measured here describes this host —
+# so the literals live here, next to the gate that enforces them.
 # Tighter than the 3x Phase 1 gates these replaced, so a regression is a visible
 # failure rather than a footnote. These are the Phase 5 (idle) numbers; Phase 7
 # re-measured every row on a loaded machine and did NOT move them, because the

@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile jev_engine.py jev_mcp.py jev_validation.py jev_errors.py policy.py limits.py config.py mock.py jev_logging.py candidates.py scan_cache.py scripts/diag_mcp.py scripts/bench_jev.py scripts/eval_routing.py scripts/doctor.py
+
+      - name: Import check
+        run: python -c "import jev_mcp; print('ok')"
+
+      # No API key and no network. The suite covers the tools through the
+      # deterministic mock judge in mock.py, which returns real SDK answer
+      # objects so the validation and policy layers still execute for real.
+      - name: Test suite
+        env:
+          JEV_MCP_MOCK: "1"
+        run: python -m pytest tests -q
+
+      # Drives the OpenCode plugin against a real child process spawned from
+      # scripts/stub_mcp.js. Needs Node, needs neither an API key nor OpenCode.
+      # Section 16 compares the example against the installed plugin and skips
+      # with a warning when no installed copy exists, as on CI.
+      - name: Plugin tests
+        run: node tests/test_plugin.mjs
+
+  bench:
+    name: performance gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # Exit codes: 0 pass, 1 regression, 2 machine too loaded to judge.
+      #
+      # Exit 2 is treated as a pass on purpose. The thresholds are wall-clock and
+      # calibrated on one host; a shared CI runner is routinely loaded, and
+      # bench_jev.py detects that with a pure in-memory control row rather than
+      # reporting whichever situation it happened to run in. Only exit 1 is a
+      # real regression. Size gates are enforced even on exit 2, because bytes do
+      # not depend on load. See docs/perf-baseline.md.
+      - name: Performance gates
+        id: bench
+        continue-on-error: true
+        run: python scripts/bench_jev.py --assert
+
+      - name: Report result
+        run: |
+          echo "bench_jev.py exit code: ${{ steps.bench.outcome }}"
+          if [ "${{ steps.bench.outcome }}" = "failure" ]; then
+            echo "::error::Performance regression (exit 1). Size and timing gates breached on an idle machine."
+            exit 1
+          fi
+          echo "Performance gates passed, or were inconclusive on a loaded runner."
+
+  secret-scan:
+    name: no committed credentials
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A cheap guard against the one mistake that cannot be undone by a revert.
+      # .env.example is the only file allowed to carry a credential-shaped
+      # placeholder, and the test fixtures carry known-dummy values.
+      - name: Scan tracked files for credential-shaped strings
+        run: |
+          if git grep -nIE '(apikey|sk|ts)_[A-Za-z0-9_-]{20,}' -- \
+            ':!.env.example' ':!tests/' ':!SECURITY.md' ':!THIRD_PARTY_NOTICES.md'; then
+            echo "::error::A credential-shaped string is committed. Rotate the key, then purge it from history."
+            exit 1
+          fi
+          echo "No credential-shaped strings in tracked source."
+
+      - name: Confirm .env is not tracked
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked. Remove it and rotate the key."
+            exit 1
+          fi
+          echo ".env is not tracked."

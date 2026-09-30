@@ -1,0 +1,17 @@
+# Codex CLI - append to ~/.codex/config.toml
+# Note the snake_case table name: `mcp_servers`, not `mcp-servers`.
+# The CLI and the IDE extension share this file, and a TOML syntax error breaks
+# both. Use `=`, not `:`.
+
+[mcp_servers.jev-engine]
+command = "<REPO_DIR>/.venv/Scripts/python.exe"
+args = ["<REPO_DIR>/jev_mcp.py"]
+
+# Equivalent one-liner, if you would rather not edit the file:
+#   codex mcp add jev-engine -- "<REPO_DIR>/.venv/Scripts/python.exe" "<REPO_DIR>/jev_mcp.py"
+
+# Do NOT put TYPESAFE_API_KEY here. The server loads it from <REPO_DIR>/.env,
+# relative to its own module, so the key resolves in every workspace.
+
+# Uncomment to forward it from your shell environment instead of using .env:
+# env_vars = ["TYPESAFE_API_KEY"]

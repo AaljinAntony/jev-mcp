@@ -1,0 +1,25 @@
+# Hermes Agent - append to ~/.hermes/config.yaml
+# Note the snake_case key: `mcp_servers`, not `mcpServers`.
+# Hermes also imports a Claude Code `mcpServers` block automatically
+# (`hermes import-agent claude-code`); add the entry there instead if you prefer.
+#
+# Do NOT put TYPESAFE_API_KEY here. The server loads it from <REPO_DIR>/.env,
+# relative to its own module, so the key resolves in every workspace. Hermes
+# writes credentials to ~/.hermes/.env on install; jev-engine does not use that.
+
+mcp_servers:
+  jev-engine:
+    command: <REPO_DIR>/.venv/Scripts/python.exe
+    args:
+      - <REPO_DIR>/jev_mcp.py
+
+# Equivalent one-liner:
+#   hermes mcp add jev-engine --command "<REPO_DIR>/.venv/Scripts/python.exe"
+#
+# Hermes MCP key reference (all optional):
+#   enabled                     bool          skip the server entirely when false
+#   timeout                     number        tool call timeout
+#   connect_timeout             number        initial connection timeout
+#   supports_parallel_tool_calls bool         allow concurrent tool calls
+#   tools.include / .exclude    list          per-server tool filter
+#   auth                        string        OAuth 2.1 for HTTP servers (not used here)
