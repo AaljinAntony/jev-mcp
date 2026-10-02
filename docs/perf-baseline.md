@@ -252,6 +252,327 @@ a tree with one file per directory and a clear win in a tree with many.
 
 ---
 
+# Phase 2 — token cost
+
+Measured 2026-10-02 · live, `jev-1.13.0`, harness `scripts/eval_routing.py`
+over `tests/fixtures/routing_tasks.json` (23 file cases, 13 MCP cases) and
+`tests/fixtures/mcp_selection_tasks.json`.
+
+The plugin calls `search_agent_skills` on **every user message** and again on
+**every Markdown read**, so this is the phase that decides what a session costs.
+
+## Measured result
+
+Jev is stochastic, so this is a **range over two runs after** the change against
+one run before it. The stable results are the ones that cannot move by chance:
+top-3 recall, and the token count, which is a property of the request rather than
+of the answer.
+
+| Metric | Before | After (2 runs) | Direction |
+|---|---|---|---|
+| top-1 accuracy | 0.6875 | **0.7500 – 0.8125** | up |
+| top-3 recall | 1.0000 | **1.0000 – 1.0000** | held |
+| false-positive rate | 0.1429 | 0.1429 | flat |
+| skill top-1 accuracy | 0.5000 | 0.5000 | flat |
+| **mean input tokens / call** | **12 949** | **7 807 – 7 871** | **−39%** |
+| max input tokens / call | 12 955 | 8 781 – 8 797 | −32% |
+| MCP selection input tokens | 978 | 978 | unchanged |
+
+Top-1 is quoted as a range rather than a mean because two runs is too few to
+average honestly. Both runs land above the single pre-change run, and top-3 recall
+— the metric that did not move in Phase 3 either — is unchanged at a perfect 1.0,
+which is the evidence that the narrower evidence set did not lose the answer.
+
+| Request (118-skill tree) | Before | After |
+|---|---|---|
+| `search_agent_skills` — provider `input_tokens` | ~12 900 | **8 402** |
+| `search_target_files` — provider `input_tokens` | ~12 950 | **8 047** |
+| `search_agent_skills` — estimated (chars/4) | 16 489 | 6 892 |
+| `search_target_files` — estimated (chars/4) | 12 165 | 7 439 |
+| candidate reads / call (skills) | 118, **uncapped** | 40 |
+
+Two token figures, and the gap between them is the estimator's error. `limits.
+estimate_tokens` is `chars/4`, which the provider's real tokenizer beats by ~20%
+on Markdown; the fixture harness reports the provider's own number, so that is
+the one to trust. Both are listed rather than picking the flattering one.
+
+## The envelope depends on what the judge picks
+
+Skills envelope, same 118-candidate tree, mock judge:
+
+| `max_matches` | Bytes |
+|---|---|
+| 5 (default) | 4 142 |
+| 1 | 3 819 |
+
+Live, the winning skill was a 2 733-character document and the envelope came back
+at **10 963 B**; with `max_matches: 1` it was 7 201 B. The mock picks a different
+skill than the live judge, so envelope size is a property of *the answer* as much
+as of the shape — the 4 142 figure is a floor for a short winner, not a ceiling.
+`scripts/bench_jev.py` pins a 7 422 B envelope on its 250-candidate fixture.
+
+## What changed, and what it cost
+
+**`MAX_PREVIEWED_CANDIDATES` = 40, spent by relevance.** `build_criteria` read
+every candidate — up to 250 files at 16 kB each — and then divided
+`MAX_TOTAL_CRITERIA_CHARS` by however many turned up, so a large skill tree spent
+megabytes of I/O describing files unrelated to the task. The budget now goes to
+the 40 candidates `_lexical_score` ranks highest against the task; the rest keep
+their path as evidence.
+
+**The property that makes it safe: ranking never removes an option.** A candidate
+that loses its preview keeps its path, so a Choice can still be handed it and
+still pick it on the name. A task sharing no vocabulary with any filename
+degrades to exactly the old "first N" order — pinned by
+degrades to the old "first N" order, pinned by the unrelated-task case in
+`tests/test_prefilter.py`. This trades *evidence* against
+cost, not *options*, and the distinction is the whole safety argument.
+
+**The prefilter is path-only, on purpose.** Reading every file to rank better is
+the cost being removed; the path is already in hand before a byte is opened. A
+lexical signal is weak next to a real preview, which is why the budget is 40 and
+not 10, and why lowering it needs a re-run of this harness.
+
+**Envelope de-duplication.** `primary` was byte-identical to `resources[0]` —
+2 893 of 6 957 bytes, 42% of the document. `primary` is now an identity view
+(`file`, `name`) and the body appears exactly once. This is a **breaking API
+change**: `primary["content"]` is gone, read `resources[0]["content"]`. The plugin
+was updated in the same change, and `test_resource_body_appears_exactly_once`
+pins the count at 1 where it was pinned at 2.
+
+**`max_matches` exposed and bounded (1–20).** The engine already took the
+argument; the tool did not. Each resource carries up to 6 000 characters, so an
+unbounded knob was a 1.5 MB envelope waiting to be asked for.
+
+## Under-delivered: the per-turn fixed cost
+
+| | Planned | Actual |
+|---|---|---|
+| tool schemas + rules block | −38% (~590 tok) | **−8.6% (947 → 865)** |
+
+Trimming `select_mcp_tools`' docstring and the `AGENT_DECISION_RULES` block cut
+158 characters, not the ~1 400 projected. Two reasons: the docstring prose is
+API contract rather than padding, and my own `search_agent_skills` addition for
+`max_matches` put 154 characters back. The projection was wrong about how much of
+that text was load-bearing. Recorded rather than quietly dropped — at 865 tokens
+per turn it is no longer where the money is.
+
+## Known-red, unchanged by this phase
+
+`tests/test_routing_quality.py::test_skill_routing_is_exact_in_mock_mode` asserts
+mock-judge skill top-1 = 1.0 and gets 0.5. It was 0.5 before Phase 2 and 0.5
+after: the fixture predates the `.agents/skills` tree growing to 118 candidates,
+and the keyword-scoring offline judge degrades as the tree grows. Live skill top-1
+is 0.5 on both sides of this phase too. The prefilter is not the cause.
+
+## Reproducing
+
+```bash
+# quality + token, live (needs an API key)
+python scripts/eval_routing.py --mode live
+
+# the size and timing gates, offline
+python scripts/bench_jev.py --assert
+```
+
+`MAX_PREVIEWED_CANDIDATES` is a trade, not a free win. Change it and re-run both
+harnesses; `scripts/bench_jev.py` enforces the envelope size but knows nothing
+about which file the judge picks.
+
+---
+
+# Phase 3 — reliability under concurrency, encoding, and budget
+
+Measured 2026-10-02 · no change to any hot path. Three defects that only appear
+under a condition the single-threaded suite never creates, and one budget bug.
+
+| Fix | Failure before | Failure after |
+|---|---|---|
+| `_Breaker` transitions under a lock | N concurrent half-open probes | exactly 1 |
+| `ScanCache.get` re-checks under the lock | `KeyError` out of the tool call | clean miss |
+| `load_jev_settings` reads `utf-8-sig` | BOM settings file silently ignored | read normally |
+| `MAX_TASK_CHARS` = 32 000 | task truncated mid-sentence | refused by name |
+
+## The breaker could not hold its own invariant
+
+`_Breaker`'s docstring promised that after a cooldown *exactly one* half-open probe
+is admitted. Unlocked, it could not: `allow()`'s read of `self.probing` and its
+assignment are separate bytecodes, so with concurrent tool calls — which the MCP
+runtime serves, and which the plugin provokes with `MAX_CONCURRENT_QUERIES`
+messages at once — every thread in that gap saw `False` and was admitted. An
+outage was survived by up to 12 simultaneous retries, which is the fan-out the
+half-open state exists to prevent.
+
+Pinned by `test_exactly_one_thread_is_admitted_after_a_cooldown`, which sets
+`sys.setswitchinterval(1e-6)` to make the window deterministic instead of rare.
+The lock is per-breaker and never held across a network call, so it cannot
+serialise real work.
+
+One related change: a non-provider exception used to do `breaker.probing = False`
+inline. That is now `release_probe()`, which releases the half-open slot without
+touching the failure count — the old line reached into another object's state,
+which is what made the lock awkward to introduce.
+
+## The cache could raise out of a tool call
+
+`ScanCache.get` ran `signature_fn()` outside the lock (correct — it is I/O), then
+wrote `self._entries[key].at = now` back under it. If another thread cleared the
+cache in between, that subscript raised `KeyError` — out of the cache, out of the
+tool body, and to the caller as an `INTERNAL_ERROR`. Every write now re-checks
+membership and re-reads the value under the lock.
+
+## A BOM made a valid settings file invisible
+
+Found during Phase 0, when the same trap bit `doctor.py`: Windows PowerShell's
+`Set-Content -Encoding utf8` and its `>` operator both write a BOM, and
+`json.loads` rejects one. `load_jev_settings` logged a parse error and moved on,
+so the project silently ran on defaults. Now `utf-8-sig`, which is identical to
+`utf-8` when there is no BOM. Genuinely malformed JSON is still reported and still
+contributes nothing — BOM tolerance must not become silent tolerance.
+
+## A long task was truncated rather than refused
+
+`MAX_INPUT_CHARS` was 100 000 for every string parameter, including `task`. A
+100 000-character task is ~25 000 estimated tokens, and the whole state budget is
+`MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS` (32 000) *minus* the longest question.
+Measured on this repo: a 100k task left **7 000** tokens of state budget against a
+criteria set worth ~24 000, so `fit_state` cut the candidate tail first and then
+truncated the task mid-sentence — the tool judged a question the caller never
+asked.
+
+`task` now has its own cap, `MAX_TASK_CHARS` = 32 000 (~8 000 tokens), four times
+`MAX_TASK_FILE_CHARS`, which leaves the budget for evidence. Over it, the refusal
+names `task_file`, whose head is read for exactly this case. Other parameters keep
+`MAX_INPUT_CHARS`: `task_file` is a path, and its *contents* are bounded by
+`MAX_TASK_FILE_CHARS` separately.
+
+---
+
+# Phase 4 — performance: two candidates, both rejected
+
+Measured 2026-10-02 · **no code change shipped.** Both candidates from the plan
+were measured, and neither survived contact with a real timing. Recorded because
+"we measured it and left it alone" is a result, and because the rejection is
+instructive: one of them looked like a 40% win.
+
+## 4a — the `deepcopy` in `fit_state`: rejected, too small
+
+`fit_state` deep-copied the state on every untruncated call. Measured:
+
+| State | `copy.deepcopy` |
+|---|---|
+| typical (task + goal + counts) | **0.8 µs** |
+| 40-criteria | **4.6 µs** |
+
+Against a live call of **388 ms**, that is four thousandths of one percent. Worse,
+the copy is load-bearing: `test_fit_state_defensive_copy` asserts that mutating
+the returned state cannot reach the caller's dict, and the state does reach the
+provider. Removing it to save 0.8 µs would trade a tested guarantee for nothing.
+
+Kept, unchanged.
+
+## 4b — memoizing `_dir_signature`: rejected, broke a contract
+
+`_dir_signature` stats up to 2 000 directories. On this repo that is 240 `os.stat`
+calls at ~22 µs each:
+
+| | mock, isolated |
+|---|---|
+| skill-directory signature | 5.4 ms |
+| root signature (ignored dirs) | 1.1 ms |
+| warm `search_agent_skills`, memo on | 7.7 ms |
+| warm `search_agent_skills`, memo off | 14.2 ms |
+
+A 1-second reuse window looked like **−46% on a warm call**. It was implemented,
+tested, and then removed. Two reasons:
+
+**It was 1.4% of wall clock.** Every number above is a mock-path measurement with
+no network in it. A live `search_agent_resources` is **388 ms** warm and **715 ms**
+cold, dominated by the provider round trip. The signature is 5.4 ms of that. The
+plan's "40% of the call" was an artefact of measuring only the part I could time
+cheaply — the same trap Phase 7 documents for the bench gates, hit from the other
+direction.
+
+**It broke a real contract.** Three existing tests in `test_scan_cache.py` assert
+that a directory change invalidates the cache on the *next* call:
+`test_adding_a_skill_invalidates_the_cache`,
+`test_adding_a_file_invalidates_the_git_cache`,
+`test_a_new_file_invalidates_the_walk_cache`. A reuse window makes that false for
+up to a second. Trading an immediate invalidation guarantee for 5 ms inside a
+388 ms round trip is a bad trade, and the tests were right to object.
+
+**What was kept instead:** `tests/test_dir_signature.py` pins the properties that
+made the memo unsafe — bounded depth, the entry cap, and immediate invalidation —
+including `test_there_is_no_reuse_window_to_configure`, so the next attempt meets
+the objection instead of rediscovering it.
+
+## Why Phase 4 shipped nothing
+
+Both items were on the plan as wins and neither was. The honest summary of the
+local hot path after Phases 1–3: `find_agent_resources` warm is ~14 ms against a
+388 ms live call, so **~3.6% of the request is local work**. Phase 2 already took
+the large win (−39% input tokens); what remains locally is not worth trading a
+correctness property for. If this is revisited, the honest framing is "make the
+live call faster", not "make the mock benchmark faster".
+
+---
+
+# Phase 5 — simplification: three deletions, one rejection
+
+Measured 2026-10-02 · **−25 lines.** Dead code only; no behaviour change, verified
+by comparing every tool's envelope key set against `HEAD` (17 / 13 / 21 keys,
+identical).
+
+| Deleted | Was | Evidence |
+|---|---|---|
+| `limits._stringify_json` | 6 lines | byte-identical to `stringify_state`; 1 occurrence repo-wide |
+| `limits.longest_question_tokens` | 8 lines | never called; 1 occurrence repo-wide |
+| `policy.min_confidence` | 6 lines | no production caller, only `test_policy.py` |
+| `TestMinConfidence` | 9 lines | tested the above, so it goes with it |
+
+Also removed: the now-unused `List` from `policy.py`'s typing import.
+
+**This is 0.5% of the 6 142 lines of engine and script code.** Worth doing because
+dead code is a maintenance cost rather than a performance one — nobody can reason
+about a second copy of a function that has one caller-less definition — but it is
+not a simplification of the design, and it should not be reported as one.
+
+## 5d — collapsing the no-decision envelopes: rejected
+
+The plan proposed routing the two hand-rolled empty envelopes through the existing
+`_mcp_result` helper. Measured the actual overlap first:
+
+| Envelope | Keys | Tool-specific |
+|---|---|---|
+| `find_agent_resources` | 16 | 9 |
+| `select_target_files` | 10 | 3 |
+| `_mcp_result` | 21 | 14 |
+
+**Seven keys are shared** — `action`, `candidates_truncated`, `confidence`,
+`coverage`, `model`, `truncated`, `usage`. A helper returning seven keys would
+force each call site to merge the rest, turning one literal into two places and
+adding a merge point where a key can be forgotten. The three envelopes are
+different *shapes*, and `tests/test_envelope_shapes.py` asserts each tool returns
+the same key set across all of its own branches — a property a shared builder
+would make harder to see, not easier.
+
+Rejected. The three branches stay explicit, which is also why they are cheap to
+read: each one tells you exactly what that tool returns when it decided nothing.
+
+## Where the codebase actually stands
+
+| | Lines |
+|---|---|
+| engine modules | 4 644 |
+| `scripts/` | 1 498 |
+| tests | 7 757 |
+
+Tests are **1.26×** the code. For a security-sensitive judge whose whole argument
+is that it fails closed on invalid input, that ratio is the feature rather than
+the problem — and every phase in this document added to it.
+
+---
+
 # Phase 6 — the plugin as a stdio MCP client
 
 Measured 2026-09-26 · Phase 6

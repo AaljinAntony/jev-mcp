@@ -31,15 +31,15 @@ No package, no `pyproject.toml` — the modules are flat at the repo root and
 
 | Module | Lines | Role |
 |---|---|---|
-| `jev_mcp.py` | 186 | The MCP server. Registers the 5 tools, wraps every body in `_run`, maps exceptions to a JSON error envelope, logs `server_start` / `server_stop`. |
+| `jev_mcp.py` | 193 | The MCP server. Registers the 5 tools, wraps every body in `_run`, maps exceptions to a JSON error envelope, logs `server_start` / `server_stop`. |
 | `jev_engine.py` | 2 354 | The engine: settings, discovery, client/retry/breaker, the 5 tool bodies, the CLI. |
 | `config.py` | 216 | Env parsing and validation, cached in a frozen `JevConfig`. `.env` loaded as a fallback only. |
-| `policy.py` | 176 | Pure decision arithmetic: confidence → action, threshold validation, combining. |
+| `policy.py` | 168 | Pure decision arithmetic: confidence → action, threshold validation, combining. |
 | `jev_validation.py` | 225 | Fail-closed validation of a `system_one` response, before any policy number is read. |
 | `jev_errors.py` | 171 | Exception taxonomy and `error_details()` → `{code, message, retryable}`. |
-| `limits.py` | 227 | Every size cap constant, token estimation, truncation, budget fitting. |
-| `candidates.py` | 191 | Turns a file path into short evidence for a `Choice` option. |
-| `scan_cache.py` | 76 | mtime/signature-keyed + TTL cache for the two filesystem scanners. Caches **paths only**. |
+| `limits.py` | 220 | Every size cap constant, token estimation, truncation, budget fitting. |
+| `candidates.py` | 232 | Turns a file path into short evidence for a `Choice` option. |
+| `scan_cache.py` | 84 | mtime/signature-keyed + TTL cache for the two filesystem scanners. Caches **paths only**. |
 | `mock.py` | 322 | Deterministic offline judge for `JEV_MCP_MOCK=1`; returns real SDK answer objects. |
 | `jev_logging.py` | 167 | Rotating-file + stderr JSON-lines logging, credential redaction. |
 
@@ -262,16 +262,22 @@ least `review` (`jev_engine.py:2202`).
 | `MAX_MCP_TOOL_DESC_CHARS` | 300 |
 | `MAX_MCP_SERVER_DESC_CHARS` | 1 500 |
 
-In `jev_engine.py`: `MAX_INPUT_CHARS` = 100 000, `MAX_TASK_FILE_CHARS` = 8 000,
-`MAX_MAX_MCP_TOOLS` = 50, `MAX_MAX_MCP_SERVERS` = 20.
+In `jev_engine.py`: `MAX_INPUT_CHARS` = 100 000, `MAX_TASK_CHARS` = 32 000,
+`MAX_TASK_FILE_CHARS` = 8 000, `MAX_MAX_MCP_TOOLS` = 50,
+`MAX_MAX_MCP_SERVERS` = 20, `MAX_MAX_MATCHES` = 20.
 
 `estimate_tokens` is `ceil(ascii/4 + non_ascii)`. `fit_state` truncates the
 state to fit and returns `{state, truncated, coverage}`; questions that alone
 exceed the budget raise `JevBudgetError` → `INPUT_TOO_LARGE`. Truncation uses a
 binary search and never splits a surrogate pair.
 
-**Known asymmetry** (`jev_engine.py:88-95`): `fit_state` truncates the state
-from the right, which can cut a candidates tail rather than the task head.
+**`task` has a lower cap than the other parameters, on purpose.** `fit_state`
+truncates the *state* from the right, and `task` is the largest key in it: at the
+generic 100 000-character limit a task is ~25 000 estimated tokens against a state
+budget of 32 000 minus the longest question, so the truncation landed inside the
+task and the tool judged a question the caller never asked. `MAX_TASK_CHARS` =
+32 000 keeps that budget for evidence, and the refusal names `task_file`, whose
+head is read head-only for exactly this case.
 
 ---
 
@@ -343,7 +349,12 @@ when the three knobs change:
 - opens after `JEV_MCP_BREAKER_THRESHOLD` **consecutive** failures; a success
   resets the counter and closes it;
 - after the cooldown exactly **one** half-open probe is admitted; concurrent
-  callers are rejected meanwhile;
+  callers are rejected meanwhile. Every transition is under a per-breaker lock,
+  which is what makes that hold: the MCP runtime serves concurrent tool calls and
+  the plugin runs several messages at once, so without it every caller in the
+  read-then-write gap saw `probing == False` and was admitted. The lock is never
+  held across a network call, so it cannot serialise real work
+  (`tests/test_concurrency_and_encoding.py`);
 - cooldown is `JEV_MCP_BREAKER_COOLDOWN_S` for retryable failures (5xx/408/429/
   connection) and the longer `JEV_MCP_AUTH_COOLDOWN_S` for 401/403, because a bad
   key does not fix itself in 30 seconds. A malformed response body is recorded as
@@ -405,10 +416,49 @@ entries are resolved against the workspace and deduplicated on load.
 and `read_head`. `bound_candidates` returns `(kept, truncated)` so a caller can
 never silently lose options.
 
+### The prefilter
+
+`MAX_PREVIEWED_CANDIDATES` (40) bounds how many candidates are *read* and turned
+into preview text. `limits.MAX_TOTAL_CRITERIA_CHARS` then divides what is left
+among them, and everyone else contributes their path alone.
+
+`jev_engine._lexical_score` decides who gets the budget, from the **path only** ?
+reading every file to rank better is the cost being removed, and a path is already
+in hand before a byte is opened. camelCase, `snake_case`, `kebab-case` and
+extensions all split to the same terms, and generic directory names (`src`,
+`docs`, `reference`, `.agents`, ?) are ignored so a deep tree does not score every
+file it contains.
+
+Two properties make the bound safe rather than lossy, and both are tested:
+
+- **Ranking never removes an option.** A candidate that loses its preview keeps
+  its path as evidence, so the Choice can still be handed it and pick it on the
+  name. The bound narrows *evidence*, not *options* ? a Choice cannot select a
+  value it was never given.
+- **It degrades to the old behaviour.** A task sharing no vocabulary with any
+  filename produces the old "first N" order exactly, so the worst case is the
+  pre-prefilter cost, not a worse answer.
+
+Measured live over `tests/fixtures/routing_tasks.json`: top-1 0.6875 ? 0.7500 ?
+0.8125, top-3 recall held at 1.0, mean input tokens 12 949 ? ~7 840 (?39%). See
+the Phase 2 section of `docs/perf-baseline.md`.
+
 Discovery uses `git ls-files` with a 5-second timeout when a git repo is
 available, falling back to a bounded walk. Discovery itself is capped at
 `MAX_DISCOVERED_FILES`. Excluded directories: `.git`, `.godot`, `.import`,
 `.venv`, `node_modules`, `dist`, `build`, plus media/binary extensions.
+
+**All three discovery paths refuse symlinks** (`candidates.is_link`): `git
+ls-files`, the bounded walk, and the `rglob` over the skill directories. The
+allowlist above cannot cover this case, because it checks the *string* an LLM
+supplied while a link's target is invisible in its path — `Path.is_file()`
+follows it, so a repository can track a link to `~/.ssh/id_rsa`, pass every
+textual check, and have its content read into the Choice criteria and sent to
+the provider. The check sits at discovery rather than in the reader because
+resolving each candidate to compare it against the root measured ~30 ms per call
+at 118 candidates on Windows (38% of the whole `search_agent_skills` request)
+against ~3 ms for `is_symlink`, paid once per cached walk.
+`tests/test_symlink_containment.py` pins all three paths agreeing.
 
 `scan_cache.ScanCache` caches **paths only**, never content:
 
@@ -417,6 +467,10 @@ available, falling back to a bounded walk. Discovery itself is capped at
 - the `git ls-files` result is additionally keyed on HEAD, the ref, the index
   mtime and `.gitignore`;
 - `DEFAULT_TTL_S` = 5 s sliding window bounds staleness for a paused sequence;
+- the signature is recomputed on **every** call ? never memoized. Reusing it for
+  1 s was measured and rejected: 5.4 ms saved against a 388 ms live call (1.4%),
+  in exchange for breaking immediate invalidation. See Phase 4 in
+  `docs/perf-baseline.md` and `tests/test_dir_signature.py`;
 - a file edited *in place* does not invalidate the cache, and does not need to —
   the preview is rebuilt from a fresh read on every call.
 
@@ -606,7 +660,7 @@ only `len=N sha256=<12 hex>` (`describeText`, `jev-plugin.example.js:145`).
 
 | Script | Purpose |
 |---|---|
-| `scripts/doctor.py` | read-only install health: interpreter, both SDKs, key *presence*, settings resolution + `sources`, `root_dir` allowlist, log writability, `review_at <= auto_accept`, plugin SHA256 drift. Exit 0/1, `--json` |
+| `scripts/doctor.py` | read-only install health: interpreter, both SDKs, key *presence*, settings resolution + `sources`, `root_dir` allowlist, log writability, `review_at <= auto_accept`, the OpenCode MCP config (both config shapes, `command` paths, unsubstituted `<REPO_DIR>`, shape vs installed version), plugin SHA256 drift. Exit 0/1, `--json` |
 | `scripts/diag_mcp.py` | spawns `jev_mcp.py` and runs one tool call over stdio, against any `root_dir`. `--mock`, `--mcps @file` |
 | `scripts/bench_jev.py` | deterministic offline benchmark; `--json`, `--assert`. Exit 0 pass / 1 regression / 2 machine too loaded |
 | `scripts/eval_routing.py` | labelled routing quality over both fixture sets; `--mode mock\|live`, `--only mcp` |
@@ -650,6 +704,10 @@ discovery, validation and policy still run for real.
 | `test_deadline.py` | `JEV_MCP_TIMEOUT_MS` really bounds a call; the retry policy carries the total budget and does not retry timeouts |
 | `test_breaker.py` | opens after N failures, admits one probe after the cooldown, short-circuits auth failures for longer |
 | `test_root_dir_allowlist.py` | allowed/denied `root_dir`, sibling-prefix and symlink escapes, `JEV_MCP_ALLOWED_ROOTS` |
+| `test_doctor.py` | the MCP config check: both OpenCode config shapes, placeholder and missing-path detection, enable-key and `codemode` validity, BOM tolerance |
+| `test_symlink_containment.py` | all three discovery paths refusing symlinks, and agreeing |
+| `test_prefilter.py` | term splitting, path scoring, ranking degradation, and that the preview bound narrows evidence without removing options |
+| `test_concurrency_and_encoding.py` | the single half-open probe under real threads, the `ScanCache` eviction race, BOM'd settings files, and the `task` length cap |
 | `test_settings_merge.py` | per-key merge, `""` clears a tier, post-read re-stat, the defensive snapshot, `opencode.json` not a source |
 | `test_client_cache.py` | the cached client is closed on invalidation and keyed on everything the SDK reads |
 | `test_scan_cache.py` | a warm call never re-walks or forks `git ls-files`, a new file invalidates, nested default scan paths collapse, `MAX_DISCOVERED_FILES` blocks `auto` |

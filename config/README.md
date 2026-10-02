@@ -95,12 +95,25 @@ Edit `.env` and set `TYPESAFE_API_KEY`. Then:
 & .\.venv\Scripts\python.exe scripts\doctor.py
 ```
 
-`doctor.py` is read-only — no child process, no API call. It checks the
+`doctor.py` is read-only — it writes nothing and makes no API call. Its one child
+process is `opencode --version`, and only so the MCP config can be checked against
+the schema your installed version actually uses; that step is skipped when
+opencode is not on `PATH`. It checks the
 interpreter, both SDKs, key *presence* (length and a 4-character suffix only,
 never the value), settings resolution and their `sources`, the `root_dir`
 allowlist against the current directory, log-directory writability,
 `review_at <= auto_accept`, and whether the installed plugin matches the
-example by SHA256. Exits 0 when healthy, 1 otherwise, with a one-line fix per
+example by SHA256.
+
+It also validates the **OpenCode MCP config** itself: it finds the config the
+host would load, reads the `jev-engine` entry out of either OpenCode config
+shape, checks that the `command` paths exist and contain no unsubstituted
+`<REPO_DIR>` placeholder, and — when `opencode` is on `PATH` — checks the config
+shape against the installed version. That last step exists because this failure
+is silent: a config the running version does not accept makes the server vanish
+from the tool list instead of raising.
+
+Exits 0 when healthy, 1 otherwise, with a one-line fix per
 finding. **Run it before reading any other trace.**
 
 ### 2. Your harness
@@ -109,14 +122,29 @@ Copy the example for your dialect, replace `<REPO_DIR>` with the absolute path t
 the clone, and place it where the table above says. Forward slashes are safest
 inside JSON on every platform.
 
-OpenCode:
+OpenCode — this substitutes `<REPO_DIR>` for you:
 
 ```powershell
-Copy-Item config\opencode.example.json $env:USERPROFILE\.config\opencode\opencode.json
+$repo = (Resolve-Path .).Path.Replace('\', '/')
+(Get-Content config\opencode.example.json -Raw).Replace('<REPO_DIR>', $repo) |
+  Set-Content "$env:USERPROFILE\.config\opencode\opencode.json"
 ```
 
+```bash
+repo=$(pwd | sed 's|\\|/|g')
+sed "s|<REPO_DIR>|$repo|g" config/opencode.example.json \
+  > ~/.config/opencode/opencode.json
+```
+
+> **Both commands replace the whole file.** If you already have an
+> `opencode.json` — a provider block, other MCP servers — merge the `mcp` entry by
+> hand instead of running this. A plain `Copy-Item` of the example, with
+> `<REPO_DIR>` left in place, is the single most likely way to end up with no
+> server at all: the spawn fails and OpenCode drops the entry without saying so.
+> `scripts/doctor.py` names both problems explicitly — run it from step 1.
+
 Claude Code, Cursor, Antigravity, VS Code, Codex CLI and Hermes Agent all use the
-same two commands with a different source and destination — see the table.
+same two steps with a different source and destination — see the table.
 
 Then restart the harness. OpenCode, Cursor and Antigravity read config at
 startup; VS Code shows a **Start** button in `.vscode/mcp.json`; Codex and

@@ -306,12 +306,67 @@ support.
 ```
 
 Install to `~/.config/opencode/opencode.json`. Note `command` is an **array**
-here, unlike every other format, and the server key is `type: "local"`.
+here, unlike every other format, and the server key is `type: "local"`. The block
+above is POSIX; the shipped template uses the Windows `.venv/Scripts/python.exe`
+path. `scripts/doctor.py` checks whichever you ended up with.
+
+**The `environment` block is optional.** Every `JEV_MCP_*` value shown above is
+also the code default, so a config that omits the block runs with exactly those
+settings. Include it to pin them against a future change; leave it out and the
+only thing you must supply is `TYPESAFE_API_KEY`, which the server also reads
+from the repo `.env`.
 
 > **OpenCode's config schema is strict** (`additionalProperties: false`). An
 > unknown top-level key, a `jev_settings` block for instance, invalidates the
 > entire file and the MCP server silently disappears from the server list. Jev
 > settings go in `jevs_settings.json`, never in `opencode.json`.
+
+#### OpenCode 2.x
+
+The example above is the **1.x** shape. 2.x moved server names under
+`mcp.servers` and swapped the toggle:
+
+| | 1.x | 2.x |
+|---|---|---|
+| placement | `"mcp": { "jev-engine": { … } }` | `"mcp": { "servers": { "jev-engine": { … } } }` |
+| toggle | `"enabled": true` | `"disabled": false` |
+| tools | on the model's tool list | behind **Code Mode** unless `"codemode": false` |
+
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "jev-engine": {
+        "type": "local",
+        "command": ["<REPO_DIR>/.venv/bin/python", "<REPO_DIR>/jev_mcp.py"],
+        "codemode": false,   // this server's tools are called by name
+        "disabled": false
+      }
+    }
+  }
+}
+```
+
+Set `codemode: false`. Under the 2.x default the five tools are reached through
+Code Mode instead of sitting on the model's own tool list, which is the opposite
+of what this server is for — the agent is told to call them at named decision
+points. The plugin reads both shapes, so it keeps working either way.
+`scripts/doctor.py` reports a shape mismatch against the installed version.
+
+#### `JEV_MCP_ALLOWED_ROOTS`
+
+Unset by default, which confines an LLM-supplied `root_dir` to the process CWD
+and its ancestors below `$HOME`. Set it to widen that, OS-path-separator
+separated (`;` on Windows, `:` on POSIX):
+
+```bash
+JEV_MCP_ALLOWED_ROOTS=D:/work/other-project;D:/work/shared
+```
+
+> Put it in the **`environment` block or the process environment, not the repo
+> `.env`**, unless you mean it everywhere. `ensure_dotenv()` resolves `.env`
+> relative to the *server module*, not the working directory, so a value there
+> applies to every workspace that launches this server — not just this project.
 
 Template: [`config/opencode.example.json`](config/opencode.example.json)
 
@@ -435,7 +490,7 @@ the winning Markdown, inlined up to 6 000 characters per resource.
 {
   "matched": true,
   "count": 2,
-  "primary": { "name": "godot-ui-theme", "file": ".agents/skills/godot-ui-theme/SKILL.md", "content": "..." },
+  "primary": { "name": "godot-ui-theme", "file": ".agents/skills/godot-ui-theme/SKILL.md" },
   "resources": [ { "name": "...", "file": "...", "content": "..." } ],
   "summary": "Found 2 relevant agent resource(s): godot-ui-theme, godot-ui-layout",
   "primary_probability": 0.91,
@@ -451,8 +506,15 @@ the winning Markdown, inlined up to 6 000 characters per resource.
 }
 ```
 
-`primary` **is** `resources[0]`. `ranked` is the full ranking, not just the
-winner.
+`primary` names the winner; `resources[0]` carries its text. They were
+byte-identical, so every call serialized the same up-to-6 000-character blob
+twice — read `resources[0]["content"]`, and note that `primary["content"]` no
+longer exists. `ranked` is the full ranking, not just the winner.
+
+`max_matches` (1–20, default 5) caps how many resources come back. Only the
+candidates that match the task get preview text; the rest keep their path as
+evidence, so every option stays selectable — see
+[`docs/perf-baseline.md`](docs/perf-baseline.md) for the measured trade.
 
 Each `Choice` option carries the document's own summary, and a `SKILL.md`
 contributes its front-matter `description`. Not its filename: options that all
