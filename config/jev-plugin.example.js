@@ -179,21 +179,40 @@ function isInside(root, target) {
 /**
  * Locate the `[python, server]` argv for jev-engine.
  *
- * `opencode.json`'s `mcp["jev-engine"].command` is authoritative — a host that
- * launches the server that way is the same host the plugin must reuse. Only the
- * server script must exist on disk; the interpreter may legitimately be a bare
- * `python` resolved through PATH.
+ * `opencode.json`'s MCP entry is authoritative — a host that launches the server
+ * that way is the same host the plugin must reuse. Only the server script must
+ * exist on disk; the interpreter may legitimately be a bare `python` resolved
+ * through PATH.
+ *
+ * Both config shapes are read. OpenCode 1.x keeps server names directly under
+ * `mcp`; 2.x nests them under `mcp.servers`, states outright that it "does not
+ * place server names directly under `mcp`" and that it has no `enabled` field,
+ * and rejects a config that does not match the running version. Reading one shape
+ * only would mean that on the other version this resolver finds nothing and
+ * silently falls back to `REPO_ROOT` — which, for an installed plugin, is
+ * `~/.config/opencode` and has no `.venv` there.
  */
 function resolveServerCommand(configPaths) {
   for (const p of configPaths) {
     if (!p || !fs.existsSync(p)) continue;
-    const cmd = readJson(p)?.mcp?.["jev-engine"]?.command;
+    const mcp = readJson(p)?.mcp;
+    const entry = mcp?.["jev-engine"] ?? mcp?.servers?.["jev-engine"];
+    const cmd = entry?.command;
+    if (entry && !Array.isArray(cmd)) {
+      // A bare string command cannot be split into interpreter + script without
+      // guessing, so the bundled server is used and the reason is logged.
+      pluginLog(
+        `${p}: jev-engine.command is ${cmd === undefined ? "absent" : typeof cmd}, not an array; ` +
+          `using the bundled server`
+      );
+      continue;
+    }
     if (!Array.isArray(cmd) || cmd.length < 2) continue;
     const [pythonPath, serverPath] = cmd;
     if (typeof pythonPath !== "string" || typeof serverPath !== "string") continue;
     if (!pythonPath || !serverPath) continue;
     if (fs.existsSync(serverPath)) return { pythonPath, serverPath };
-    pluginLog(`opencode.json mcp["jev-engine"].command points at a missing server: ${serverPath}`);
+    pluginLog(`opencode.json jev-engine.command points at a missing server: ${serverPath}`);
   }
 
   const fallbacks = [
