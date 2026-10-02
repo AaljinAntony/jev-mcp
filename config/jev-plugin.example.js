@@ -929,7 +929,11 @@ function applyTier(tierRes, settings, output) {
  */
 function injectSkill(skillsRes, cwd, output) {
   const primary = skillsRes?.primary;
-  if (!primary?.file || typeof primary.content !== "string") {
+  // `primary` is an identity view — which file won — and the text lives on the
+  // full record in `resources[0]`. The two were byte-identical, so every message
+  // serialized the same up-to-6,000-character blob twice.
+  const record = Array.isArray(skillsRes?.resources) ? skillsRes.resources[0] : null;
+  if (!primary?.file || !record || typeof record.content !== "string") {
     // A confident `auto` with no primary is a real outcome: the model picked
     // `none`, so there is nothing to inject. Say so, or it reads as a silent
     // no-op in the log.
@@ -955,7 +959,7 @@ function injectSkill(skillsRes, cwd, output) {
     return false;
   }
 
-  let content = primary.content;
+  let content = record.content;
   if (content.length > MAX_INJECT_CHARS) {
     content = content.slice(0, MAX_INJECT_CHARS) + "\n…[truncated]";
     pluginLog(`truncated skill ${primary.file} to ${MAX_INJECT_CHARS} chars`);

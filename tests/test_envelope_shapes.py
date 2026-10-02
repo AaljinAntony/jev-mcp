@@ -49,9 +49,11 @@ class TestFindAgentResourcesEnvelopeKeys:
 class TestSkillEnvelopeHasNoDuplicates:
     """The 6,000-character resource body must be serialized once, not four times.
 
-    `primary` is `resources[0]`, and the old flat `file`/`content` keys were two
-    more copies of the same blob in the same JSON document. Phase 1 measured
-    44,198 bytes for this envelope (docs/perf-baseline.md).
+    It was four: the flat `file`/`content` keys, plus `primary` and
+    `resources[0]` as byte-identical copies of each other. Removing the flat keys
+    left two (Phase 1, docs/perf-baseline.md); `primary` is now an identity view —
+    which file won — so the body appears exactly once. Measured 6,957 → 4,142
+    bytes on the live 118-skill workspace.
     """
 
     def _workspace(self, tmp_path):
@@ -70,7 +72,14 @@ class TestSkillEnvelopeHasNoDuplicates:
         assert "file" not in res
         assert "content" not in res
         assert res["primary"]["file"] == res["resources"][0]["file"]
-        assert res["primary"]["content"] == res["resources"][0]["content"]
+        assert res["primary"]["name"] == res["resources"][0]["name"]
+
+    def test_primary_carries_no_content(self, tmp_path):
+        """The identity view is the whole point: a `content` key here would put
+        the body back a second time in the same document."""
+        res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
+        assert "content" not in res["primary"], "primary must not duplicate resources[0]"
+        assert res["resources"][0]["content"], "the body still has to reach the caller"
 
     def test_envelope_is_under_60_percent_of_the_phase_1_size(self, tmp_path):
         res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
@@ -79,11 +88,11 @@ class TestSkillEnvelopeHasNoDuplicates:
         assert res["primary"], "expected a winning resource to measure"
         assert size < phase_1_bytes * 0.6, f"{size} bytes is not under 60% of {phase_1_bytes}"
 
-    def test_resource_body_appears_exactly_twice(self, tmp_path):
+    def test_resource_body_appears_exactly_once(self, tmp_path):
         res = jev_engine.find_agent_resources("alpha helpers", str(self._workspace(tmp_path)))
         dumped = json.dumps(res, default=str)
-        # Once in `primary`, once in `resources[0]` — the two documented places.
-        assert dumped.count("ALPHA-UNIQUE-BODY-LINE") == 2
+        # Once, in `resources[0]` - the single documented place.
+        assert dumped.count("ALPHA-UNIQUE-BODY-LINE") == 1
 
 
 class TestSelectTargetFilesEnvelopeKeys:

@@ -23,6 +23,7 @@ from jev_engine import (
     select_target_files,
     select_mcp_tools as _engine_select_mcp_tools,
     select_model_tier as _engine_select_model_tier,
+    _bounded_count,
 )
 from jev_errors import JevToolError, error_details
 from jev_logging import log_tool_call, log_event, log_exception, log_path
@@ -77,15 +78,25 @@ def guardrail_command(command: str) -> dict:
     return _run("guardrail_command", lambda: verify_command(command), command=command)
 
 
+#: Caller-supplied ceiling on how many resources come back. Each one carries up to
+#: `limits.MAX_CONTENT_CHARS` of content, so an unbounded knob is a 1.5 MB
+#: envelope waiting to be asked for.
+MAX_MAX_MATCHES = 20
+
+
 @mcp.tool()
-def search_agent_skills(task: str, root_dir: str = ".", task_file: str = "") -> dict:
+def search_agent_skills(task: str, root_dir: str = ".", task_file: str = "", max_matches: int = 5) -> dict:
     """Find and retrieve relevant agent skills, workflows, and memory markdown files for a given task.
 
     `task_file` is an optional path to a file holding the real prompt (a saved
     prompt or a plan); its head is read and judged alongside `task`. It is
     confined to the same allowlist as `root_dir`.
+
+    `max_matches` caps how many resources come back (1-20, default 5). Read
+    `primary` for which file won and `resources[0]["content"]` for its text.
     """
-    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir, task_file=task_file or None), task=task, root_dir=root_dir, task_file=task_file or None)
+    bounded = _bounded_count(max_matches, "max_matches", 1, MAX_MAX_MATCHES)
+    return _run("search_agent_skills", lambda: find_agent_resources(task=task, root_dir=root_dir, task_file=task_file or None, max_matches=bounded), task=task, root_dir=root_dir, task_file=task_file or None, max_matches=bounded)
 
 
 @mcp.tool()
@@ -147,20 +158,16 @@ def select_mcp_tools(
     `mcps_json` instead. Pass every server you are connected to: the judge can
     only choose from what it is given, and it never recommends itself.
 
-    `max_tools` caps the tool list (every tool above the judge's own threshold
-    is passed, up to this many) and `max_servers` caps how many ranked servers
-    come back. `task_file` is a saved prompt to judge alongside `task`.
+    `max_tools` caps the returned tool list and `max_servers` the ranked servers;
+    `task_file` is a saved prompt judged alongside `task`.
 
-    Read `exists` before acting on the result:
-      * `answered`  - one server is the right one; use `primary` and the `tools` list.
-      * `ambiguous` - several servers are comparably usable; `servers` lists them
-        and no tool is chosen for you. Decide, or ask.
-      * `absent` / `partial` - no supplied server has a tool this task needs; proceed
-        with your own built-in tools.
-      * `no_candidates` - nothing was left to choose from (`excluded` says why).
+    Branch on `exists`: `answered` (use `primary` and `tools`), `ambiguous`
+    (comparably usable servers in `servers`; you decide), `absent`/`partial`
+    (no server needed; use your own tools), `no_candidates` (nothing to choose
+    from; `excluded` says why).
 
-    `action` is `auto` / `review` / `escalate`; below `auto` treat the selection as
-    a hint rather than an instruction.
+    `action` is `auto` / `review` / `escalate`; below `auto` treat it as a hint
+    rather than an instruction.
     """
     roster = mcps if mcps else (mcps_json or None)
     return _run(

@@ -32,9 +32,20 @@ MAX_RANK_CANDIDATES = 5_000
 #: budget: 96k ASCII chars is ~24k estimated tokens, which leaves headroom under
 #: both MAX_TOTAL_TOKENS and MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS.
 MAX_TOTAL_CRITERIA_CHARS = 96_000
-#: At most this many candidates get a preview built (select_target_files); the
-#: remainder fall back to the path alone. Bounds per-call filesystem work.
+#: At most this many files are *opened* per call. Bounds filesystem work, and is
+#: the hard ceiling a prefiltered set can ask for.
 MAX_PREVIEW_READS = 120
+#: At most this many candidates get a preview built, chosen from the whole set by
+#: relevance to the task. The remainder keep their path alone, which is still
+#: selectable evidence, so this trades token cost against how much text the judge
+#: sees — not against what it can choose.
+#:
+#: 40 is where the measured trade sits. On this repo's 118-skill tree it took
+#: `search_agent_skills` from 16,489 to ~4,800 estimated input tokens with no
+#: measurable top-1 loss (scripts/eval_routing.py, live, before/after in
+#: docs/perf-baseline.md). Below ~24 the recall starts to go, so do not lower it
+#: without re-running that harness.
+MAX_PREVIEWED_CANDIDATES = 40
 #: Total preview characters sent for one request, shared round-robin.
 MAX_TOTAL_PREVIEW_CHARS = 40_000
 #: Bytes read from the head of a file to derive its preview. Previews are capped
@@ -108,24 +119,6 @@ def truncate_text(text: str, max_chars: int) -> str:
     if end > 0 and len(text) > end - 1 and 0xD800 <= ord(text[end - 1]) <= 0xDBFF:
         end -= 1
     return text[:end] + marker
-
-
-def _stringify_json(value) -> str:
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return ""
-    return json.dumps(value, default=str)
-
-
-def longest_question_tokens(questions) -> int:
-    """Largest estimated token count across all questions."""
-    if not questions or not hasattr(questions, "items"):
-        return 0
-    longest = 0
-    for value in questions.values():
-        longest = max(longest, estimate_tokens(value))
-    return longest
 
 
 def fit_state(state, questions) -> dict:

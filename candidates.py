@@ -163,18 +163,30 @@ def build_criteria(
     read_text: Callable[[str], str],
     max_chars: int = MAX_CANDIDATE_CHARS,
     total_chars: int = MAX_TOTAL_CRITERIA_CHARS,
+    preview_paths: Optional[Iterable[str]] = None,
 ) -> Dict[str, str]:
     """Map `path -> evidence description`, one entry per candidate.
 
     The per-candidate share is `total_chars / len(paths)`, so a 250-candidate
     request cannot blow the token budget just because every file is large.
+
+    `preview_paths` bounds which candidates are read at all. The rest fall back to
+    their own path, which is what `_preview_criteria` has always done on the
+    workspace-file path: a Choice can still be handed the option and still be
+    picked on the name, it just carries no content evidence. A candidate that is
+    *unreadable* yields `UNREADABLE` instead, because that is a different fact.
+
     Never raises: an unreadable candidate yields `UNREADABLE` rather than
     removing the option, because a Choice cannot pick a value it was not given.
     """
     items = list(paths)
     allowance = max(64, min(max_chars, total_chars // max(len(items), 1)))
+    wanted = None if preview_paths is None else set(preview_paths)
     criteria: Dict[str, str] = {}
     for path in items:
+        if wanted is not None and path not in wanted:
+            criteria[path] = path
+            continue
         try:
             raw = read_text(path) or ""
         except Exception:

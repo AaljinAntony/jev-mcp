@@ -564,6 +564,47 @@ await test("resolveServerCommand falls back when the config points at a missing 
   assert.ok(!resolved.serverPath.includes("nope.py"), "did not trust the broken command");
   assert.ok(resolved.serverPath.endsWith("jev_mcp.py"), "fell back to the bundled server");
 });
+await test("resolveServerCommand also reads the opencode 2.x mcp.servers shape", () => {
+  // 1.x keeps server names directly under `mcp`; 2.x nests them under
+  // `mcp.servers`. Reading only one shape means the plugin silently falls back to
+  // a REPO_ROOT that an installed plugin does not have a .venv in.
+  const dir = tmpDir("cmd-v2");
+  const python = path.join(dir, "python.exe");
+  const server = path.join(dir, "jev_mcp.py");
+  fs.writeFileSync(python, "");
+  fs.writeFileSync(server, "");
+  const cfg = path.join(dir, "opencode.json");
+  fs.writeFileSync(
+    cfg,
+    JSON.stringify({ mcp: { servers: { "jev-engine": { type: "local", command: [python, server] } } } })
+  );
+  assert.deepStrictEqual(P.resolveServerCommand([cfg]), { pythonPath: python, serverPath: server });
+});
+await test("resolveServerCommand prefers the 1.x shape when a file has both", () => {
+  const dir = tmpDir("cmd-both");
+  const v1Python = path.join(dir, "v1.exe");
+  const v1Server = path.join(dir, "v1.py");
+  const v2Server = path.join(dir, "v2.py");
+  for (const f of [v1Python, v1Server, v2Server]) fs.writeFileSync(f, "");
+  const cfg = path.join(dir, "opencode.json");
+  fs.writeFileSync(
+    cfg,
+    JSON.stringify({
+      mcp: {
+        "jev-engine": { command: [v1Python, v1Server] },
+        servers: { "jev-engine": { command: [v1Python, v2Server] } },
+      },
+    })
+  );
+  assert.deepStrictEqual(P.resolveServerCommand([cfg]), { pythonPath: v1Python, serverPath: v1Server });
+});
+await test("resolveServerCommand ignores a non-array command and says so", () => {
+  const dir = tmpDir("cmd-string");
+  const cfg = path.join(dir, "opencode.json");
+  fs.writeFileSync(cfg, JSON.stringify({ mcp: { "jev-engine": { command: "jev.exe" } } }));
+  const resolved = P.resolveServerCommand([cfg]);
+  assert.ok(resolved.serverPath.endsWith("jev_mcp.py"), "a bare string is not split, so it falls back");
+});
 await test("loadSettings reads jevs_settings.json without touching .env", () => {
   const dir = tmpDir("settings");
   fs.writeFileSync(
@@ -650,11 +691,14 @@ await test("no recommended tier or no configured model => not switched", () => {
 
 console.log("--- 9. injectSkill decision table ---");
 const injectCwd = tmpDir("inject-cwd");
+// Mirrors the real envelope: `primary` is an identity view of `resources[0]`,
+// which is where the text lives. The two used to be byte-identical, so every
+// message serialized the same blob twice.
 const confidentSkills = (content) => ({
   action: "auto",
   confidence: 0.82,
-  primary: { name: "demo", file: ".agents/skills/demo/SKILL.md", content },
-  resources: [],
+  primary: { name: "demo", file: ".agents/skills/demo/SKILL.md" },
+  resources: [{ name: "demo", file: ".agents/skills/demo/SKILL.md", content }],
 });
 const textOutput = () => ({ parts: [{ id: "prt_1", type: "text", text: "do the thing" }] });
 
@@ -696,17 +740,28 @@ await test("an out-of-workspace file is refused", () => {
     const output = textOutput();
     const res = {
       ...confidentSkills("SECRET"),
-      primary: { name: "evil", file: bad, content: "SECRET" },
+      primary: { name: "evil", file: bad },
+      resources: [{ name: "evil", file: bad, content: "SECRET" }],
     };
     assert.strictEqual(P.injectSkill(res, injectCwd, output), false, bad);
     assert.strictEqual(output.parts[0].text, "do the thing");
   }
 });
-await test("no primary or no content => not injected", () => {
+await test("no primary, no record, or a record with no text => not injected", () => {
   const output = textOutput();
   assert.strictEqual(P.injectSkill({ action: "auto", confidence: 0.9, primary: null }, injectCwd, output), false);
+  // A primary with no matching record: the identity alone is not enough, and the
+  // plugin must not fall back to injecting a path with no text.
   assert.strictEqual(
-    P.injectSkill({ action: "auto", confidence: 0.9, primary: { file: "a.md" } }, injectCwd, output),
+    P.injectSkill({ action: "auto", confidence: 0.9, primary: { file: "a.md" }, resources: [] }, injectCwd, output),
+    false
+  );
+  assert.strictEqual(
+    P.injectSkill(
+      { action: "auto", confidence: 0.9, primary: { file: "a.md" }, resources: [{ file: "a.md" }] },
+      injectCwd,
+      output
+    ),
     false
   );
   assert.strictEqual(P.injectSkill(undefined, injectCwd, output), false);
@@ -950,7 +1005,7 @@ await test("reading a prompt file appends the ranking to the tool result", async
   const decision = {
     action: "review",
     confidence: 0.83,
-    primary: { file: ".agents/skills/audio/SKILL.md", content: "x" },
+    primary: { file: ".agents/skills/audio/SKILL.md" },
     resources: [],
     ranked: [{ file: ".agents/skills/audio/SKILL.md", probability: 0.6 }],
   };

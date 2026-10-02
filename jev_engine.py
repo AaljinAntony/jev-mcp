@@ -48,6 +48,7 @@ from limits import (
     MAX_MCP_SERVER_DESC_CHARS,
     MAX_MCP_TOOL_DESC_CHARS,
     MAX_MCP_TOOL_OPTIONS,
+    MAX_PREVIEWED_CANDIDATES,
     MAX_PREVIEW_READS,
     MAX_TOTAL_CRITERIA_CHARS,
     MAX_TOTAL_PREVIEW_CHARS,
@@ -1300,8 +1301,23 @@ def find_agent_resources(
 
     # One read per candidate, reused for both the criteria preview and the
     # resource content returned below.
+    #
+    # The preview budget goes to the candidates the task actually mentions. This
+    # path had no cap at all: `build_criteria` read every one of up to 250
+    # candidates, each up to `MAX_PREVIEW_READ_CHARS` of file, and then divided
+    # `MAX_TOTAL_CRITERIA_CHARS` by however many turned up — so a 250-skill tree
+    # spent 4 MB of I/O and ~16k estimated tokens to describe files that had
+    # nothing to do with the task. The rest keep their path alone and stay
+    # selectable, so this costs evidence, not options.
     text_cache, read_text = read_text_cache(root)
-    criteria_map = build_criteria(options, read_text)
+    preview_order = _rank_candidates(options, task)
+    preview_set = set(
+        sorted(preview_order, key=lambda p: preview_order[p])[:MAX_PREVIEWED_CANDIDATES]
+    )
+    criteria_map = build_criteria(
+        options, read_text, preview_paths=preview_set
+    )
+    previews_skipped = len(options) - len(preview_set)
     if candidates_truncated:
         criteria_map["none"] = (
             "None of the supplied agent resources addresses the task; a further "
@@ -1407,18 +1423,29 @@ def find_agent_resources(
         _candidate_fields(
             complete=not candidates_truncated,
             considered=len(options_all),
-            original_chars=sum(len(text_cache.get(o, "")) for o in options),
+            # Only the previewed candidates were ever read, so counting the rest as
+            # unread would report a budget that was never spent. Count the reads
+            # that happened and name the ones that did not.
+            original_chars=sum(len(text_cache.get(o, "")) for o in options if o in preview_set),
             evaluated_chars=sum(len(v) for v in criteria_map.values()),
+            previews_built=len(preview_set),
+            previews_skipped=previews_skipped,
         ),
     )
 
     result = {
         "matched": len(resources) > 0,
         "count": len(resources),
-        # `primary` is `resources[0]`. The old flat `file`/`content` keys were a
-        # third and fourth copy of the same up-to-6,000-character blob, and the
-        # MCP runtime serialized every copy on every call.
-        "primary": resources[0] if resources else None,
+        # `primary` is an identity view of `resources[0]`, not a second copy of
+        # it. The full record carries up to MAX_CONTENT_CHARS of content, so the
+        # two used to be byte-identical and 42% of this envelope was the same blob
+        # serialized twice on every call. Read `resources[0]["content"]` for the
+        # text; `primary` answers only "which file".
+        "primary": (
+            {"name": resources[0]["name"], "file": resources[0]["file"]}
+            if resources
+            else None
+        ),
         "resources": resources,
         "summary": f"Found {len(resources)} relevant agent resource(s): {summary_names}",
         "primary_probability": round(primary_prob, 4) if primary_val else None,
@@ -1635,7 +1662,96 @@ def _discover_candidates(
     return list(candidates)
 
 
-def _preview_criteria(root: Path, candidates: List[str]):
+#: Path segments that carry no signal about a file's subject. A candidate is
+#: never *excluded* by this — it only stops a generic directory name from
+#: scoring every file underneath it, which would make the ranking a no-op on a
+#: tree with a deep `src/` or `reference/` spine.
+_GENERIC_SEGMENTS = frozenset({
+    "agents", "opencode", "config", "docs", "doc", "src", "lib", "dist", "build",
+    "tests", "test", "scripts", "script", "tools", "bin", "www", "static", "assets",
+    "reference", "references", "examples", "example", "node_modules", "venv",
+    "workflows", "memory", "skills", "plugins", "code", "app", "packages", "shared",
+    "common", "utils", "util", "core", "main", "misc", "tmp", "temp", "data",
+})
+
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+#: Separators between terms. The dot matters as much as the rest: without it
+#: `limits.py` yields the single term `limits.py` and never matches a task that
+#: says "limits".
+_TERM_SPLIT = re.compile(r"[\\/\-_.]+")
+
+
+def _terms(text: str) -> set:
+    """Lowercase word set for matching, splitting camelCase and every separator.
+
+    `readHead`, `read_head`, `read-head` and `read/head` all have to reach the same
+    terms, or a camelCase file name scores zero against a task that says
+    "read head".
+    """
+    out = set()
+    for chunk in _TERM_SPLIT.sub(" ", text).split():
+        out.add(chunk.lower())
+        for part in _CAMEL.split(chunk):
+            if part:
+                out.add(part.lower())
+    return out
+
+
+def _lexical_score(path: str, task_terms: set) -> int:
+    """How many task terms appear in a candidate's path.
+
+    Deliberately only the path. Reading every file to build a better signal is the
+    cost this is trying to remove, and the path is free: it is already in hand
+    before a single byte is opened. A file whose name says nothing about the task
+    scores 0 and keeps its path alone as evidence, which is still selectable.
+    """
+    if not task_terms:
+        return 0
+    score = 0
+    for segment in path.replace("\\", "/").split("/"):
+        # Strip leading dots before the extension, so `.agents` reduces to
+        # `agents` and is recognised as generic. Score the stem rather than
+        # `name.py`, since the extension is noise that would glue itself to the
+        # last term and stop it matching anything.
+        name = segment.lstrip(".")
+        name = name.rsplit(".", 1)[0] if "." in name else name
+        lowered = name.lower()
+        if lowered in _GENERIC_SEGMENTS or lowered in {"skill", "readme", "index"}:
+            continue
+        score += len(_terms(name) & task_terms)
+    return score
+
+
+def _rank_candidates(candidates: List[str], task: str) -> Dict[str, int]:
+    """`{candidate: rank}` by task relevance, best first, ties in discovery order.
+
+    Scored candidates always sort ahead of unscored ones, which is what makes the
+    prefilter safe: a task that shares no vocabulary with any filename degrades to
+    exactly the old "first N" behaviour rather than to an arbitrary subset.
+    """
+    task_terms = _terms(task) if task else set()
+    if not task_terms:
+        return {cand: index for index, cand in enumerate(candidates)}
+
+    scored = []
+    for index, cand in enumerate(candidates):
+        score = _lexical_score(cand, task_terms)
+        if score:
+            scored.append((-score, index, cand))
+    scored.sort()
+
+    order = {}
+    for rank, (_, _, cand) in enumerate(scored):
+        order[cand] = rank
+    next_rank = len(scored)
+    for index, cand in enumerate(candidates):
+        if cand not in order:
+            order[cand] = next_rank
+            next_rank += 1
+    return order
+
+
+def _preview_criteria(root: Path, candidates: List[str], task: str = ""):
     """Criteria for the workspace files: `path`, then a preview of its head.
 
     Three bounds keep this honest on a 250-candidate tree: at most
@@ -1645,9 +1761,11 @@ def _preview_criteria(root: Path, candidates: List[str]):
     keep their path alone, which is still selectable evidence. Binary or empty
     heads fall back to the path rather than sending noise.
 
-    A deterministic lexical prefilter would beat "first N" here: it could spend
-    the read budget on the candidates that actually mention the task. That is
-    deliberately left to the scan-cache phase; this bound is cheap and safe.
+    The read budget is spent on the candidates `task` actually mentions, ranked by
+    `_lexical_score`, rather than on the first N in discovery order. This is the
+    prefilter the old docstring here deferred: on a tree where the first 120
+    entries are `reference/**` clones and the answer is a file near the end, "first
+    N" spent the whole budget on paths that cannot be the answer.
     """
     total = len(candidates)
     remaining = MAX_TOTAL_PREVIEW_CHARS
@@ -1656,8 +1774,19 @@ def _preview_criteria(root: Path, candidates: List[str]):
     previews_skipped = 0
     original_chars = 0
 
+    # Rank once, then walk the ranking. `order` maps candidate -> position, so a
+    # scored candidate always takes its read before an unscored one; ties keep
+    # discovery order, which is stable and cheap to reason about.
+    order = _rank_candidates(candidates, task)
+
+    preview_budget = min(MAX_PREVIEWED_CANDIDATES, MAX_PREVIEW_READS)
+
     for index, cand in enumerate(candidates):
-        if previews_built >= MAX_PREVIEW_READS or remaining <= 0:
+        if (
+            previews_built >= preview_budget
+            or remaining <= 0
+            or order[cand] >= preview_budget
+        ):
             previews_skipped += 1
             criteria[cand] = cand
             continue
@@ -1715,7 +1844,9 @@ def select_target_files(
     # preview bytes are both bounded. Anything past the bound keeps its path
     # only — still a selectable option, just without content evidence.
     candidates_truncated = len(candidates) >= MAX_CHOICE_OPTIONS
-    criteria, previews_built, previews_skipped, original_chars = _preview_criteria(root, candidates)
+    criteria, previews_built, previews_skipped, original_chars = _preview_criteria(
+        root, candidates, task
+    )
     criteria["none"] = "None of the supplied workspace files must be inspected or edited for this task."
 
     questions = {
