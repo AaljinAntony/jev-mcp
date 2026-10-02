@@ -6,7 +6,7 @@ unit-testable; nothing here touches the network.
 """
 
 import math
-from typing import Iterable, List, Literal
+from typing import Iterable, Literal
 
 from jev_errors import JevValidationError
 
@@ -144,14 +144,6 @@ def worst_action(actions: Iterable[PolicyAction]) -> PolicyAction:
 def require_complete_context(action: PolicyAction, truncated: bool) -> PolicyAction:
     """Truncated input is incomplete context; it never permits ``auto``."""
     return "review" if (truncated and action == "auto") else action
-
-
-def min_confidence(values: List) -> float:
-    """Minimum present numeric confidence; 0 when none are present."""
-    present = [float(v) for v in values if isinstance(v, (int, float))]
-    if not present:
-        return 0.0
-    return min(present)
 
 
 def guardrail_safe(

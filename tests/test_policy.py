@@ -9,7 +9,6 @@ from policy import (
     action_from_confidence,
     confidence_from_probabilities,
     guardrail_safe,
-    min_confidence,
     require_complete_context,
     score_mean_tolerance,
     validate_policy_thresholds,
@@ -98,14 +97,6 @@ class TestRequireCompleteContext:
 
     def test_complete_unchanged(self):
         assert require_complete_context("auto", False) == "auto"
-
-
-class TestMinConfidence:
-    def test_missing_values_zero(self):
-        assert min_confidence([]) == 0.0
-
-    def test_min_of_present(self):
-        assert min_confidence([0.9, None, 0.4]) == pytest.approx(0.4)
 
 
 class TestGuardrailSafe:
