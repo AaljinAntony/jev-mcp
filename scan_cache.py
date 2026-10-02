@@ -58,14 +58,16 @@ class ScanCache:
             signature = signature_fn()
         except OSError:
             return None
-        if signature != entry.signature:
-            with self._lock:
-                self._entries.pop(key, None)
-            return None
         with self._lock:
+            current = self._entries.get(key)
+            if current is None or current is not entry:
+                return None      # evicted or replaced while the signature ran
+            if signature != entry.signature:
+                self._entries.pop(key, None)
+                return None
             # Sliding TTL: an actively used entry is not expired while in use.
-            self._entries[key].at = now
-        return entry.value
+            entry.at = now
+            return entry.value
 
     def put(self, key, signature: tuple, value: Any) -> None:
         with self._lock:

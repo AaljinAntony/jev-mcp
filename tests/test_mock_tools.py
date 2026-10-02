@@ -190,16 +190,17 @@ class TestSearchAgentSkills:
         assert seen["criteria"][".agents/skills/beta/SKILL.md"] == "sqlite index tuning"
         assert seen["state"]["task"] == "tune the database index"
         assert seen["state"]["candidates_considered"] == 2
-        # The flat `file`/`content` duplicates were removed: `primary` and
-        # `resources[0]` are the only copies of the winning resource.
+        # The flat `file`/`content` duplicates were removed, and `primary` is now
+        # an identity view, so `resources[0]` is the only copy of the body.
         assert "file" not in result
         assert "content" not in result
+        assert "content" not in result["primary"]
         assert result["primary"]["file"] == ".agents/skills/beta/SKILL.md"
         assert result["primary"]["file"] == result["resources"][0]["file"]
         assert result["primary_probability"] == 0.9
         assert [r["file"] for r in result["ranked"]][0] == ".agents/skills/beta/SKILL.md"
         # one read per candidate: the returned content is the cached text
-        assert "sqlite index tuning" in result["primary"]["content"]
+        assert "sqlite index tuning" in result["resources"][0]["content"]
 
     def test_candidate_truncation_reported_and_degrades_action(self, tmp_path, monkeypatch):
         skills = tmp_path / ".agents" / "skills"
@@ -481,7 +482,7 @@ class TestEvidenceBudget:
         assert result["primary"]["file"] == ".agents/skills/alpha/SKILL.md"
         assert len(opens) == len(set(opens)), "a candidate was read more than once"
         # the returned content is the cached text, not a second read
-        assert "body line" in result["primary"]["content"]
+        assert "body line" in result["resources"][0]["content"]
 
     def test_target_file_previews_are_bounded(self, tmp_path, monkeypatch):
         names = [f"mod_{i:03d}.py" for i in range(200)]
@@ -603,10 +604,13 @@ class TestInputLengthGuardrails:
         assert "too long" in str(exc_info.value)
 
     def test_find_agent_resources_oversized_task_rejected(self, tmp_path):
-        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        # `task` has its own, much lower cap: past MAX_TASK_CHARS the state budget
+        # truncates the task mid-sentence instead of judging it.
+        huge = "a" * (jev_engine.MAX_TASK_CHARS + 1)
         with pytest.raises(JevValidationError) as exc_info:
             jev_engine.find_agent_resources(huge, str(tmp_path))
         assert "task" in str(exc_info.value)
+        assert "task_file" in str(exc_info.value), "the error must name the way through"
 
     def test_find_agent_resources_oversized_root_dir_rejected(self):
         huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
@@ -615,16 +619,18 @@ class TestInputLengthGuardrails:
         assert "root_dir" in str(exc_info.value)
 
     def test_select_target_files_oversized_task_rejected(self, tmp_path):
-        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        huge = "a" * (jev_engine.MAX_TASK_CHARS + 1)
         with pytest.raises(JevValidationError) as exc_info:
             jev_engine.select_target_files(huge, str(tmp_path))
         assert "task" in str(exc_info.value)
+        assert "task_file" in str(exc_info.value), "the error must name the way through"
 
     def test_select_model_tier_oversized_task_rejected(self):
-        huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)
+        huge = "a" * (jev_engine.MAX_TASK_CHARS + 1)
         with pytest.raises(JevValidationError) as exc_info:
             jev_engine.select_model_tier(huge)
         assert "task" in str(exc_info.value)
+        assert "task_file" in str(exc_info.value), "the error must name the way through"
 
     def test_mcp_tool_oversized_returns_error_envelope(self):
         huge = "a" * (jev_engine.MAX_INPUT_CHARS + 1)

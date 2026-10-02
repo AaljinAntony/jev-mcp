@@ -86,15 +86,29 @@ DEFAULT_SCAN_PATHS = [
     ".agents",
 ]
 
-#: Maximum allowed length for any single tool parameter string.
-#: NOTE: this is a cap, not a fit. A 100k-character task is ~25k estimated
-#: tokens, which on its own can exceed MAX_STATE_PLUS_LONGEST_QUESTION_TOKENS once
-#: the Choice criteria are large — and `fit_state` then truncates the state from
-#: the *right*, cutting the `candidates` tail rather than the task head. Truncating
-#: the task head-first would be better; it is left alone because no test has shown
-#: the head being lost, and a half-implemented truncation is worse than a
-#: documented one.
+#: Maximum allowed length for any single tool parameter string. This is a
+#: backstop for the inputs that have no smaller cap of their own (`command`,
+#: `mcps_json`); `task` is capped far below it — see `MAX_TASK_CHARS`.
 MAX_INPUT_CHARS = 100_000
+
+#: Maximum length of the `task` string itself.
+#:
+#: The cap exists because of what happens past it. `limits.fit_state` fits the
+#: *state* by budget and truncates it from the right, and `task` is the first key
+#: in the state dict but by far the largest — so a 100 000-character task
+#: (~25 000 estimated tokens) is larger than the whole state budget once the
+#: Choice criteria are counted (32 000 minus the longest question), and the
+#: truncation lands inside the task. Measured on this repo: a 100k task left
+#: 7 000 tokens of state budget against a criteria set worth ~24 000, so the
+#: candidate tail was dropped first and the task was then cut mid-sentence.
+#:
+#: 32 000 characters is ~8 000 estimated tokens: four times `MAX_TASK_FILE_CHARS`,
+#: comfortable for any prompt written to be pasted, and it keeps the state budget
+#: for evidence rather than for the question restating itself. Anything longer is
+#: refused by name with the fix attached, because a silently half-read task is the
+#: failure mode worth avoiding — `task_file` already reads a saved prompt's head
+#: for exactly this case.
+MAX_TASK_CHARS = 32_000
 
 #: Head-only read cap for `task_file`. A saved prompt or plan supplies the
 #: *question*, not the evidence: the judge reads the candidate files itself, so
@@ -151,6 +165,21 @@ def _check_input_length(name: str, value: str) -> None:
         )
 
 
+def _check_task_length(task: str) -> None:
+    """Refuse a `task` too long to be judged whole.
+
+    Separate from `_check_input_length` because the limit and the reason are
+    different: this is not a size backstop, it is what stops `fit_state` from
+    truncating the question it is supposed to answer. See `MAX_TASK_CHARS`.
+    """
+    if isinstance(task, str) and len(task) > MAX_TASK_CHARS:
+        raise JevValidationError(
+            f"Parameter 'task' is too long ({len(task):,} chars, limit {MAX_TASK_CHARS:,}). "
+            "A task this long would be truncated mid-sentence rather than judged. "
+            "Pass the prompt as 'task_file' instead - its head is read for you."
+        )
+
+
 def _resolve_task_file(task_file: str, root: Path) -> Path:
     """Resolve `task_file` under the same allowlist that governs `root_dir`.
 
@@ -187,7 +216,7 @@ def _task_text(task: str, root: Path, task_file: Optional[str] = None) -> str:
     the same normaliser used for candidate evidence, so YAML front matter and
     syntax noise do not spend question budget.
     """
-    _check_input_length("task", task)
+    _check_task_length(task)
     if not task_file:
         return task
     path = _resolve_task_file(task_file, root)
@@ -502,7 +531,12 @@ def load_jev_settings() -> dict:
     # the user and neither silently discards the other.
     for cfg in reversed(settings_files):
         try:
-            raw = json.loads(cfg.read_text(encoding="utf-8"))
+            # utf-8-sig, not utf-8: Windows PowerShell's `Set-Content -Encoding
+            # utf8` and its `>` operator both write a BOM, and a BOM makes
+            # json.loads raise. `doctor.py` reads configs the same way. Without
+            # this a perfectly good settings file is silently discarded and the
+            # project quietly runs on defaults.
+            raw = json.loads(cfg.read_text(encoding="utf-8-sig"))
         except Exception as e:
             log_event("settings_parse_error", file=str(cfg), error=str(e))
             sys.stderr.write(f"jev_engine: failed reading {cfg}: {e}\n")
@@ -771,6 +805,15 @@ class _Breaker:
     After a cooldown exactly one half-open probe is admitted; anything that
     arrives while the probe is in flight is rejected, so a burst of callers
     cannot fan back out at once.
+
+    **Every transition is under `_lock`.** That single-probe invariant is the
+    whole point of the half-open state, and it cannot be held without it: the MCP
+    runtime serves concurrent tool calls, and the plugin runs up to
+    `MAX_CONCURRENT_QUERIES` messages at once. Unlocked, `allow()` reads
+    `self.probing` as False for every thread in the gap before it assigns True,
+    so an outage was survived by *N* concurrent probes rather than one — exactly
+    the fan-out the state exists to prevent. The lock is deliberately per-breaker
+    and never held across a network call, so it cannot serialise real work.
     """
 
     def __init__(self, threshold: int, cooldown_s: float, auth_cooldown_s: float) -> None:
@@ -781,40 +824,56 @@ class _Breaker:
         self.opened_at = 0.0
         self.opened_cooldown = cooldown_s
         self.probing = False
+        self._lock = threading.Lock()
 
     def cooldown_for(self, retryable: bool) -> float:
         """A bad API key does not fix itself in 30 seconds; a 5xx might."""
         return self.cooldown_s if retryable else self.auth_cooldown_s
 
     def allow(self) -> bool:
-        if self.failures < self.threshold:
-            return True
-        if self.probing:
+        with self._lock:
+            if self.failures < self.threshold:
+                return True
+            if self.probing:
+                return False
+            if time.monotonic() - self.opened_at >= self.opened_cooldown:
+                self.probing = True   # half-open: exactly one probe gets through
+                return True
             return False
-        if time.monotonic() - self.opened_at >= self.opened_cooldown:
-            self.probing = True   # half-open: exactly one probe gets through
-            return True
-        return False
 
     def record_success(self) -> None:
         """A success closes the circuit and clears the consecutive-failure count."""
-        self.failures = 0
-        self.opened_at = 0.0
-        self.opened_cooldown = self.cooldown_s
-        self.probing = False
+        with self._lock:
+            self.failures = 0
+            self.opened_at = 0.0
+            self.opened_cooldown = self.cooldown_s
+            self.probing = False
 
     def record_failure(self, retryable: bool) -> None:
-        self.failures += 1
-        self.probing = False
-        if self.failures >= self.threshold:
-            self.opened_at = time.monotonic()
-            # A 401 must not park the breaker in a 30s window, but it must still
-            # short-circuit: a bad key does not fix itself in 30 seconds.
-            self.opened_cooldown = self.cooldown_for(retryable)
+        with self._lock:
+            self.failures += 1
+            self.probing = False
+            if self.failures >= self.threshold:
+                self.opened_at = time.monotonic()
+                # A 401 must not park the breaker in a 30s window, but it must still
+                # short-circuit: a bad key does not fix itself in 30 seconds.
+                self.opened_cooldown = self.cooldown_for(retryable)
+
+    def release_probe(self) -> None:
+        """Give the half-open slot back without judging the outcome.
+
+        A caller that raised something other than a provider error has told us
+        nothing about whether TypeSafe is healthy, so the failure count and the
+        cooldown are left exactly as they were. It does not re-open the circuit:
+        an unrelated exception is not evidence of an outage.
+        """
+        with self._lock:
+            self.probing = False
 
     def remaining(self) -> float:
         """Seconds until the next probe is allowed."""
-        return max(0.0, self.opened_cooldown - (time.monotonic() - self.opened_at))
+        with self._lock:
+            return max(0.0, self.opened_cooldown - (time.monotonic() - self.opened_at))
 
 
 _cached_breaker: Optional[_Breaker] = None
@@ -915,8 +974,11 @@ def execute_system_one(
         raise
     except Exception:
         # A local programming error is not provider failure; do not open the
-        # circuit on it.
-        breaker.probing = False
+        # circuit on it. `record_success` would be wrong here — it also clears the
+        # consecutive-failure count — and `record_failure` would be worse: it
+        # opens the circuit on a bug in this process. All that is wanted is to
+        # release the half-open probe slot.
+        breaker.release_probe()
         raise
     breaker.record_success()
     return res
@@ -1748,7 +1810,7 @@ def select_model_tier(task: str) -> dict:
     Gated by `jevs_settings.enable_model_routing`. Low-confidence or truncated
     judgments report `action: "escalate"` while keeping `recommended_tier`.
     """
-    _check_input_length("task", task)
+    _check_task_length(task)
     settings = load_jev_settings()
     result = {
         "enabled": settings["enable_model_routing"],
