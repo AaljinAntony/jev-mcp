@@ -45,6 +45,12 @@ class ScanCache:
         on-disk state (mtimes, sizes, a git HEAD). Cheap beats exact: a
         directory mtime changes when entries are added or removed, which covers
         the overwhelming majority of edits.
+
+        `signature_fn` runs outside the lock, so the entry read at the top may be
+        evicted by the time the signature comes back. Every write below therefore
+        re-checks membership instead of assuming it, and re-reads the value under
+        the lock: `self._entries[key].at = now` on a key another thread had already
+        popped raised `KeyError` out of the cache and out of the tool call.
         """
         now = time.monotonic()
         with self._lock:

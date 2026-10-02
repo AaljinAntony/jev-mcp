@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -628,6 +629,13 @@ def _dir_signature(
     `SKILL.md`, `src` / `components` / `*.py`); anything deeper than that is
     deliberately not tracked, which is why this stays bounded rather than
     becoming a second full walk.
+
+    Recomputed on every call, deliberately. Reusing it for even a second was
+    measured and rejected: it saves 5.4 ms of 5.4 ms locally, and a live call is
+    388 ms — so the signature is ~1.4% of wall clock. In exchange it broke the
+    contract that a directory change invalidates the cache immediately, which is
+    what `tests/test_scan_cache.py` asserts. See the Phase 4 section of
+    `docs/perf-baseline.md`.
     """
     ignored = ignore_dirs or set()
     entries: List[tuple] = []
@@ -665,6 +673,12 @@ def _discover_markdown(root: Path, search_dirs: List[Path]):
     Bounded at `MAX_DISCOVERED_FILES`: `rglob` has no depth limit, so one deep
     vendored tree under `.agents` was fully traversed before the cap applied.
     Overflow is reported to the caller instead of being dropped silently.
+
+    Symlinks are refused, as on the other two discovery paths. `rglob` yields a
+    tracked link as an ordinary file, and this is the path that feeds
+    `search_agent_skills` — where every candidate's content is returned to the
+    caller as well as judged, so a link here is both a leak and a read of
+    something the workspace does not own.
     """
     search_dirs = _minimal_scan_dirs(search_dirs)
     key = ("md", str(root), tuple(str(d) for d in search_dirs))

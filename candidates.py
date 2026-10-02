@@ -10,8 +10,8 @@ injected reader so nothing here needs a filesystem.
 """
 
 import re
-from pathlib import PurePosixPath
-from typing import Callable, Dict, Iterable, List, Sequence, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from limits import (
     MAX_CANDIDATE_CHARS,
