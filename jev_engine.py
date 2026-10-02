@@ -21,6 +21,7 @@ from config import get_config
 from candidates import (
     build_criteria,
     bound_candidates,
+    is_link,
     looks_binary,
     markdown_preview,
     read_head,
@@ -644,6 +645,8 @@ def _discover_markdown(root: Path, search_dirs: List[Path]):
     truncated = False
     for sdir in search_dirs:
         for p in sdir.rglob("*.md"):
+            if is_link(p):
+                continue
             if not p.is_file():
                 continue
             try:
@@ -1392,7 +1395,12 @@ def _discover_files_git(
     max_count: int,
     ignore_dirs: Optional[set] = None,
 ) -> Optional[List[str]]:
-    """Use git ls-files for fast, .gitignore-aware file discovery. Returns None if not a git repo."""
+    """Use git ls-files for fast, .gitignore-aware file discovery. Returns None if not a git repo.
+
+    Symlinks are refused, as on every other discovery path — see
+    `candidates.is_link` for why a link reaching the criteria is a leak rather
+    than a loop.
+    """
     import subprocess
 
     if not (root / ".git").exists():
@@ -1418,7 +1426,10 @@ def _discover_files_git(
                 continue
             if p.suffix.lower() in ignore_exts:
                 continue
-            if (root / p).is_file():
+            target = root / p
+            if is_link(target):
+                continue
+            if target.is_file():
                 candidates.append(line.replace("\\", "/"))
             if len(candidates) >= max_count:
                 break
@@ -1510,8 +1521,8 @@ def _walk_files(root: Path, ignore_exts: set, ignore_dirs: set, max_count: int, 
             if fname.startswith("."):
                 continue
             p = Path(dirpath) / fname
-            if p.is_symlink():
-                continue  # skip symlinks to prevent loops
+            if is_link(p):
+                continue
             if p.suffix.lower() not in ignore_exts:
                 candidates.append(p.relative_to(root).as_posix())
                 if len(candidates) >= max_count:

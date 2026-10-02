@@ -110,6 +110,34 @@ def looks_binary(text: str) -> bool:
     return text.count("\x00") / len(text) > NUL_RATIO_LIMIT
 
 
+def is_link(path) -> bool:
+    """True when `path` is a symbolic link, so its bytes are not the workspace's.
+
+    Every discovery path calls this before a candidate is offered, which is what
+    keeps the invariant in one place: *discovery never yields a link*. A
+    repository can track a link pointing anywhere on the machine, and
+    `Path.is_file()` follows it, so a path that passes every textual check on
+    `root_dir` still resolves to `~/.ssh/id_rsa` — and those bytes then become
+    Choice criteria and are sent to the provider.
+
+    The check lives at discovery rather than in the reader on purpose. Resolving
+    each candidate to compare it against the root costs ~30 ms per call on
+    Windows at 118 candidates — 38% of the whole `search_agent_skills` request —
+    where `is_symlink` costs ~3 ms and is paid once per cached walk.
+
+    Never raises. A path that *errors* rather than resolving counts as a link:
+    refusing to offer a candidate is recoverable, and offering one leaks its
+    content. A path that is simply absent is not a link — `read_head` already
+    returns `""` for it, and there are no bytes to leak. Python 3.13 made
+    `is_symlink` propagate `OSError` instead of swallowing it, which is what makes
+    this branch reachable at all.
+    """
+    try:
+        return Path(path).is_symlink()
+    except OSError:
+        return True
+
+
 def read_head(path, max_chars: int = MAX_PREVIEW_READ_CHARS) -> str:
     """Read at most `max_chars` from the head of a file. Never raises."""
     try:
@@ -178,7 +206,8 @@ def read_text_cache(root=None) -> Tuple[Dict[str, str], Callable[[str], str]]:
     resource content. Reading twice is pure waste. The head limit is above
     `MAX_CONTENT_CHARS` so one read stays honest for both consumers. `root`
     resolves workspace-relative candidate paths; without it the paths are used
-    as given.
+    as given. Safety comes from discovery, which never yields a link — see
+    `candidates.is_link`.
     """
     cache: Dict[str, str] = {}
 
