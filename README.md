@@ -483,8 +483,22 @@ Which skill, workflow or memory file applies to this task?
 | `task_file` | string | `""` | no |
 
 Scans `.agents/skills`, `.agents/workflows`, `.agents/memory`, `.opencode/skills`,
-`skills` and `.agents`, plus any `scan_paths` from `jevs_settings.json`. Returns
-the winning Markdown, inlined up to 6 000 characters per resource.
+`skills` and `.agents`, plus any `scan_paths` from `jevs_settings.json`, plus the
+current user's global skill directories — `~/.agents/skills`,
+`~/.agents/workflows`, `~/.agents/memory` and `~/.config/opencode/skills`, resolved
+from the home directory so they follow the machine rather than a configured path
+(add more with `JEV_MCP_GLOBAL_SCAN_PATHS`). Returns the winning Markdown, inlined
+up to 6 000 characters per resource.
+
+A skill outside the workspace is reported under a `~/`-shortened path when it is
+under the home directory, and under its absolute path otherwise:
+
+```json
+"resources": [
+  { "name": "godot-ui-theme", "file": ".agents/skills/godot-ui-theme/SKILL.md", "content": "..." },
+  { "name": "find-skills", "file": "~/.agents/skills/find-skills/SKILL.md", "content": "..." }
+]
+```
 
 ```json
 {
@@ -740,6 +754,7 @@ treated as absent so the file can supply it.
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_MOCK` | `0` | `1` runs an offline deterministic judge. Tests and demos only. |
 | `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | Extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Note 2. |
+| `JEV_MCP_GLOBAL_SCAN_PATHS` | *(empty)* | Extra directories of globally installed skills, added to the per-user ones the server always scans. Note 4. |
 | `JEV_MCP_BREAKER_THRESHOLD` | `3` | Consecutive provider failures before the breaker opens. |
 | `JEV_MCP_BREAKER_COOLDOWN_S` | `30` | Seconds before one probe call is let through. |
 | `JEV_MCP_AUTH_COOLDOWN_S` | `300` | Longer window after a 401/403. A bad key does not fix itself in 30 seconds. |
@@ -754,6 +769,13 @@ only the process working directory and its ancestors below `$HOME`.
 
 Note 3: off by default, because the result is serialized twice and a skill
 result carries kilobytes.
+
+Note 4: `os.pathsep`-separated. The per-user directories
+(`~/.agents/{skills,workflows,memory}` and `~/.config/opencode/skills`) are always
+scanned and are derived from the home directory, so they follow the machine; this
+variable is only for global skills kept elsewhere. Unlike `JEV_MCP_ALLOWED_ROOTS`
+it does not widen `root_dir` — these are operator-owned directories, read because
+the operator put them in settings or installed them, not because a model asked.
 
 `.env.example` documents all of these inline.
 

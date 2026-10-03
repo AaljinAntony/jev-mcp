@@ -25,6 +25,23 @@ if str(REPO) not in sys.path:
 sys.path.insert(0, str(REPO / "scripts"))
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _no_machine_global_skills():
+    """Hide the machine's installed skills from the harness runs below.
+
+    `conftest`'s equivalent stub is function-scoped and never reaches these
+    module-scoped fixtures, so without this the developer's real
+    `~/.agents/skills` would enter every candidate set and the accuracy floors
+    would measure the machine rather than the judge.
+    """
+    import jev_engine
+
+    original = jev_engine._global_scan_dirs
+    jev_engine._global_scan_dirs = lambda: []
+    yield
+    jev_engine._global_scan_dirs = original
+
+
 @pytest.fixture(scope="module")
 def harness():
     import eval_routing

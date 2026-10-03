@@ -138,17 +138,29 @@ class TestSearchAgentSkills:
         assert result["count"] == 0
         assert result["resources"] == []
 
-    def test_mock_search_outside_root_skipped(self, tmp_path, monkeypatch):
+    def test_mock_search_outside_root_is_keyed_not_dropped(self, tmp_path, monkeypatch):
+        """A scan dir outside `root_dir` is read, keyed by where the file lives.
+
+        This used to be the opposite: the file was discovered and then dropped
+        for not being under `root_dir`, which is why globally installed skills
+        were invisible to `search_agent_skills`. The trust boundary is unchanged
+        — `root_dir` is the LLM-supplied argument and stays allowlist-confined,
+        while scan dirs come from the operator's own settings — so what changes
+        is only which key the file is reported under.
+        """
         outside = tmp_path / "outside"
         outside.mkdir()
-        (outside / "test.md").write_text("# Outside\nnot in root", encoding="utf-8")
+        (outside / "test.md").write_text("# Outside\noutside-root evidence", encoding="utf-8")
         root = tmp_path / "root"
         root.mkdir()
         monkeypatch.setattr(jev_engine, "get_scan_paths", lambda r: [outside])
-        result = jev_engine.find_agent_resources("test", str(root))
-        assert result["matched"] is False
-        assert result["count"] == 0
-        assert result["resources"] == []
+        result = jev_engine.find_agent_resources("outside root evidence", str(root))
+        assert result["matched"] is True
+        # The key's spelling depends on where the temp dir sits relative to the
+        # user's home (`~/`-shortened or absolute); the file it names does not.
+        # `tests/test_global_scan.py` pins that spelling.
+        assert result["primary"]["file"].endswith("outside/test.md")
+        assert "outside-root evidence" in result["resources"][0]["content"]
 
     def test_single_question_and_front_matter_evidence(self, tmp_path, monkeypatch):
         skills = tmp_path / ".agents" / "skills"

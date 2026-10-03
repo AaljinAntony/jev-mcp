@@ -188,6 +188,16 @@ def run_benchmarks(runs=5):
         os.environ["JEV_MCP_ALLOWED_ROOTS"] = tempfile.gettempdir()
         config._reset_config_cache()
 
+        # Pin the scan set to this synthetic workspace. The server also scans the
+        # current user's global skill directories, so without this the numbers
+        # below would measure whatever the machine running the benchmark has
+        # installed — the thresholds were calibrated against 250 workspace
+        # skills and nothing else.
+        bench_home = Path(tmp_dir) / "bench-home"
+        bench_home.mkdir(exist_ok=True)
+        os.environ["USERPROFILE"] = str(bench_home)
+        os.environ["HOME"] = str(bench_home)
+
         # Seed 250 .md skills with realistic group prefix and content
         skills_dir = Path(tmp_dir) / ".agents" / "skills"
         for i in range(250):

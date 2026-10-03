@@ -76,6 +76,13 @@ def _spawn(tmp_path, env_extra=None, cwd=None):
     # its ancestors. `tmp_path` lives under the system temp dir, which is
     # therefore granted explicitly — the same grant tests/conftest.py makes.
     env["JEV_MCP_ALLOWED_ROOTS"] = tempfile.gettempdir()
+    # The child resolves `~` to an empty temp dir, so the global skill
+    # directories it scans are absent and a candidate count here is this file's
+    # fixtures rather than whatever the machine running the suite has installed.
+    empty_home = tmp_path / "no-global-skills"
+    empty_home.mkdir(exist_ok=True)
+    env["USERPROFILE"] = str(empty_home)
+    env["HOME"] = str(empty_home)
     if env_extra:
         env.update(env_extra)
     proc = subprocess.Popen(

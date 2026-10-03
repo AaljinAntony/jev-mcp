@@ -571,6 +571,38 @@ def get_scan_paths(root: Path) -> List[Path]:
     return paths
 
 
+#: Per-user skill locations, relative to the home directory. A machine that
+#: keeps its global skills elsewhere is covered by `JEV_MCP_GLOBAL_SCAN_PATHS`
+#: instead — nothing here names a user or a drive, so the defaults follow the
+#: profile of whoever runs the server.
+GLOBAL_SCAN_RELS = (
+    ".agents/skills",
+    ".agents/workflows",
+    ".agents/memory",
+    ".config/opencode/skills",
+)
+
+
+def _global_scan_dirs() -> List[Path]:
+    """Existing global skill directories for the current user.
+
+    Always on, and inert where they do not exist: only `is_dir()` entries are
+    returned, so a machine with no global skills sees exactly the scan set it saw
+    before this existed.
+
+    These are outside `root_dir` by construction, which is what made them
+    invisible until `_candidate_key` started keeping outside-root files. The
+    directories are the user's own agent configuration — the same content the
+    host already injects into its own system prompt — not workspace data.
+    """
+    home = os.path.expanduser("~")
+    dirs = [Path(home) / rel for rel in GLOBAL_SCAN_RELS] if home else []
+    for piece in (os.getenv("JEV_MCP_GLOBAL_SCAN_PATHS") or "").split(os.pathsep):
+        if piece.strip():
+            dirs.append(Path(piece.strip()).expanduser())
+    return [p for p in dirs if p.is_dir()]
+
+
 # ----------------------------------------------------------------------
 # Workspace scanners
 #
@@ -667,12 +699,42 @@ def _dir_signature(
     return tuple(entries)
 
 
+def _candidate_key(p: Path, root: Path) -> str:
+    """The key a discovered file is known by: workspace-relative, `~/`, absolute.
+
+    A file under `root` keeps the relative key it has always had. A file outside
+    it — a global skill directory, see `_global_scan_dirs` — used to be dropped
+    here, so globally installed skills were invisible unless the whole call was
+    pointed at them with `root_dir`. They are kept instead, and keyed `~/`-
+    shortened where possible: the key is also a Choice option label the judge
+    reads, and `~/.agents/skills/x/SKILL.md` costs a fraction of the same key
+    spelled out in full.
+
+    `os.path.expanduser("~")` rather than `Path.home()`: it reads
+    `USERPROFILE`/`HOME` at call time instead of raising when home cannot be
+    determined, and that is the only failure the fallback below covers.
+    """
+    try:
+        return p.relative_to(root).as_posix()
+    except ValueError:
+        pass
+    home = os.path.expanduser("~")
+    if home:
+        try:
+            return "~/" + p.relative_to(Path(home)).as_posix()
+        except ValueError:
+            pass
+    return p.as_posix()  # outside the workspace and outside home; nothing to shorten
+
+
 def _discover_markdown(root: Path, search_dirs: List[Path]):
-    """Return `(rel_path -> Path, discovery_truncated)` for `*.md` candidates.
+    """Return `(candidate_key -> Path, discovery_truncated)` for `*.md` files.
 
     Bounded at `MAX_DISCOVERED_FILES`: `rglob` has no depth limit, so one deep
     vendored tree under `.agents` was fully traversed before the cap applied.
-    Overflow is reported to the caller instead of being dropped silently.
+    Overflow is reported to the caller instead of being dropped silently. Search
+    dirs are walked in order, so workspace skills are kept ahead of global ones
+    when the cap bites.
 
     Symlinks are refused, as on the other two discovery paths. `rglob` yields a
     tracked link as an ordinary file, and this is the path that feeds
@@ -698,11 +760,7 @@ def _discover_markdown(root: Path, search_dirs: List[Path]):
                 continue
             if not p.is_file():
                 continue
-            try:
-                rel = p.relative_to(root).as_posix()
-            except ValueError:
-                continue  # path is outside root, skip it
-            found[rel] = p
+            found[_candidate_key(p, root)] = p
             if len(found) >= MAX_DISCOVERED_FILES:
                 truncated = True
                 break
@@ -1271,7 +1329,12 @@ def find_agent_resources(
 ) -> dict:
     root = _validate_root_dir(root_dir)
     task = _task_text(task, root, task_file)
+    # Workspace dirs first: the discovery cap is applied in this order, so a full
+    # tree of project skills still displaces the global ones rather than the
+    # other way round.
     search_dirs = get_scan_paths(root)
+    seen = {str(p).lower() for p in search_dirs}
+    search_dirs += [p for p in _global_scan_dirs() if str(p).lower() not in seen]
 
     candidate_files, discovery_truncated = _discover_markdown(root, search_dirs)
 

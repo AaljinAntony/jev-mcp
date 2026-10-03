@@ -80,6 +80,22 @@ def _grant_tempdir_as_allowed_root(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_machine_global_skills(monkeypatch):
+    """Keep the suite independent of the skills installed on the machine.
+
+    `find_agent_resources` now scans the current user's global skill
+    directories (see `jev_engine._global_scan_dirs`). Without this, a
+    developer's real `~/.agents/skills` enters every candidate count and every
+    offline-judge ranking, and the suite's verdicts depend on which machine ran
+    it. Tests that exercise the global scan restore the real function
+    themselves — see `tests/test_global_scan.py`.
+    """
+    import jev_engine
+
+    monkeypatch.setattr(jev_engine, "_global_scan_dirs", lambda: [])
+
+
+@pytest.fixture(autouse=True)
 def _reset_module_caches():
     """Clear the module-level config/client/settings/breaker/scan caches around every test.
 

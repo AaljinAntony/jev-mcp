@@ -218,14 +218,23 @@ def read_text_cache(root=None) -> Tuple[Dict[str, str], Callable[[str], str]]:
     resource content. Reading twice is pure waste. The head limit is above
     `MAX_CONTENT_CHARS` so one read stays honest for both consumers. `root`
     resolves workspace-relative candidate paths; without it the paths are used
-    as given. Safety comes from discovery, which never yields a link — see
-    `candidates.is_link`.
+    as given.
+
+    A candidate outside the workspace carries a `~/`-shortened or absolute key
+    (see `jev_engine._candidate_key`), so those are resolved here rather than
+    being prefixed with `root`. Safety comes from discovery, which never yields
+    a link — see `candidates.is_link`.
     """
     cache: Dict[str, str] = {}
 
     def read_text(path: str) -> str:
         if path not in cache:
-            target = f"{root}/{path}" if root else path
+            if path.startswith("~"):
+                target = str(Path(path).expanduser())
+            elif Path(path).is_absolute():
+                target = path
+            else:
+                target = f"{root}/{path}" if root else path
             cache[path] = read_head(target)
         return cache[path]
 

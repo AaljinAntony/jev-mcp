@@ -192,6 +192,29 @@ def check_settings():
     )
 
 
+def check_global_scan_paths():
+    """Report the per-user skill directories that are searched on every call."""
+    print("global skill scan")
+    from jev_engine import GLOBAL_SCAN_RELS, _global_scan_dirs
+
+    try:
+        dirs = _global_scan_dirs()
+    except Exception as e:
+        report(BAD, "global scan dirs resolve", f"{type(e).__name__}: {e}")
+        return
+    if dirs:
+        report(OK, "global skill directories", f"{len(dirs)} in use")
+        for d in dirs:
+            print(f"        - {d}")
+    else:
+        report(
+            WARN,
+            "global skill directories",
+            "none exist; only the workspace is searched",
+            fix="install skills under one of: " + ", ".join(GLOBAL_SCAN_RELS),
+        )
+
+
 def check_root_allowlist():
     print("root_dir allowlist")
     import jev_engine
@@ -533,6 +556,7 @@ def main():
         check_sdk,
         check_api_key,
         check_settings,
+        check_global_scan_paths,
         check_root_allowlist,
         check_log_dir,
         check_thresholds,

@@ -263,6 +263,7 @@ Read by the **server**:
 | `JEV_MCP_MODEL` | `jev-latest` | Model used for `system_one` calls. |
 | `JEV_MCP_TIMEOUT_MS` | `30000` | **Total** per-tool-call budget in ms, retries and backoff included — not a per-attempt timeout. Enforced in mock mode too. |
 | `JEV_MCP_ALLOWED_ROOTS` | *(empty)* | `os.pathsep`-separated extra directories an LLM-supplied `root_dir` / `task_file` may resolve inside. Empty = the process CWD and its ancestors below `$HOME` only. |
+| `JEV_MCP_GLOBAL_SCAN_PATHS` | *(empty)* | `os.pathsep`-separated extra directories of globally installed skills, **added** to the per-user ones the server always scans. Entries that do not exist are ignored. |
 | `JEV_MCP_AUTO_ACCEPT` | `0.8` | Confidence at or above which a decision is `auto`. |
 | `JEV_MCP_REVIEW_AT` | `0.5` | Confidence below which a decision `escalate`s. |
 | `JEV_MCP_MOCK` | `0` | `1` = offline deterministic judge (tests/demos only). |
@@ -320,7 +321,16 @@ fails fast with a `CONFIG_ERROR` envelope instead of silently mis-routing.
 - `scan_paths` entries are relative to the workspace root and **appended** to the
   built-in defaults, deduplicated. A scan path already inside another configured
   scan path is collapsed to the ancestor, so those files are walked once instead
-  of four times.
+  of four times. An **absolute** entry is read as-is, which is how a project points
+  at a directory outside itself.
+- Independently of `scan_paths`, the per-user directories `~/.agents/skills`,
+  `~/.agents/workflows`, `~/.agents/memory` and `~/.config/opencode/skills` are
+  scanned on every call, plus anything in `JEV_MCP_GLOBAL_SCAN_PATHS`. They are
+  derived from the home directory, so nothing machine-specific goes in a settings
+  file and a new machine needs no edit. Files from these directories are reported
+  under a `~/`-shortened key when they live under home, and under their absolute
+  path otherwise. Workspace scan paths are walked first, so the discovery cap
+  keeps project skills in preference to global ones.
 - `ignore_mcps` is read by the **server** and only affects `select_mcp_tools`.
   Entries are an exact MCP server name or a glob (`git*`, `playwright`),
   case-insensitive. It is seeded with `jev-engine*` so the judge is never a
